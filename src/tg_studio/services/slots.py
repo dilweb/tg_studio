@@ -82,18 +82,28 @@ async def get_available_slots(
             Booking.status.in_(BUSY_STATUSES),
         )
     )
-    booked_intervals: set[datetime] = {
-        s.starts_at.replace(tzinfo=TZ) for s in booked_result.scalars().all()
-    }
+    # Интервалы занятых слотов в локальной TZ (многочасовой слот занимает весь диапазон)
+    booked_ranges: list[tuple[datetime, datetime]] = []
+    for s in booked_result.scalars().all():
+        start = s.starts_at.astimezone(TZ) if s.starts_at.tzinfo else s.starts_at.replace(tzinfo=TZ)
+        end = s.ends_at.astimezone(TZ) if s.ends_at.tzinfo else s.ends_at.replace(tzinfo=TZ)
+        booked_ranges.append((start, end))
+
+    def _overlaps(s_start: datetime, s_end: datetime) -> bool:
+        for b_start, b_end in booked_ranges:
+            if s_start < b_end and s_end > b_start:
+                return True
+        return False
 
     # 3. Генерируем слоты по расписанию и фильтруем занятые
+    now = datetime.now(TZ)
     available = []
     current_date = from_date
     while current_date <= to_date:
         schedule = schedules_by_weekday.get(current_date.weekday())
         if schedule:
             for starts_at, ends_at in _generate_day_slots(master_id, current_date, schedule):
-                if starts_at not in booked_intervals and starts_at > datetime.now(TZ):
+                if not _overlaps(starts_at, ends_at) and starts_at > now:
                     available.append({
                         "starts_at": starts_at.isoformat(),
                         "ends_at": ends_at.isoformat(),

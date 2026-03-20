@@ -13,7 +13,7 @@ from fastapi.responses import PlainTextResponse
 from sqlalchemy import select
 
 from tg_studio.api.deps import SessionDep
-from tg_studio.db.models import Booking, BookingStatus, Master, Payment, PaymentStatus, TimeSlot
+from tg_studio.db.models import Booking, BookingStatus, Master, Payment, PaymentStatus, Service, ServiceType, TimeSlot
 from tg_studio.services.payment import _build_freedom_pay_sig
 
 logger = logging.getLogger(__name__)
@@ -89,7 +89,15 @@ async def freedompay_callback(request: Request, session: SessionDep):
         payment.status = PaymentStatus.paid
         payment.paid_at = datetime.now(timezone.utc)
         if booking:
-            booking.status = BookingStatus.confirmed
+            # Project: после оплаты — в работу; appointment: подтверждённая запись
+            service_result = await session.execute(
+                select(Service).where(Service.id == booking.service_id)
+            )
+            service = service_result.scalar_one_or_none()
+            if service and service.service_type == ServiceType.project:
+                booking.status = BookingStatus.in_progress
+            else:
+                booking.status = BookingStatus.confirmed
 
         await session.commit()
 

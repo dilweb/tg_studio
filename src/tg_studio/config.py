@@ -10,6 +10,7 @@ class Settings(BaseSettings):
 
     # Telegram
     bot_token: str
+    bot_username: str = ""  # без @, для ссылки регистрации мастера (t.me/bot_username?start=...)
     miniapp_url: str = "https://localhost:3000"
 
     # Database

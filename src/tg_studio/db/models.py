@@ -79,6 +79,8 @@ class Master(Base):
     business_id: Mapped[int] = mapped_column(ForeignKey("businesses.id"), nullable=False)
     telegram_id: Mapped[int | None] = mapped_column(BigInteger, unique=True)
     full_name: Mapped[str] = mapped_column(String(256), nullable=False)
+    # Одноразовая ссылка для привязки Telegram: t.me/bot?start=master_<token>
+    registration_token: Mapped[str | None] = mapped_column(String(64), unique=True, nullable=True)
     description: Mapped[str | None] = mapped_column(Text)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
 
@@ -179,6 +181,20 @@ class Booking(Base):
     slot: Mapped["TimeSlot | None"] = relationship(back_populates="booking")
     service: Mapped["Service"] = relationship(back_populates="bookings")
     payment: Mapped["Payment | None"] = relationship(back_populates="booking")
+    chat_messages: Mapped[list["BookingChatMessage"]] = relationship(back_populates="booking")
+
+
+class BookingChatMessage(Base):
+    """Сообщение в чате клиент–мастер по брони (после оплаты)."""
+    __tablename__ = "booking_chat_messages"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    booking_id: Mapped[int] = mapped_column(ForeignKey("bookings.id"), nullable=False)
+    sender_type: Mapped[str] = mapped_column(String(16), nullable=False)  # "client" | "master"
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+    booking: Mapped["Booking"] = relationship(back_populates="chat_messages")
 
 
 class Payment(Base):

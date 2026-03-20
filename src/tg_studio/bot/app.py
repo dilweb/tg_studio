@@ -6,7 +6,7 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.fsm.storage.memory import MemoryStorage
 
-from tg_studio.bot.handlers import admin, start
+from tg_studio.bot.handlers import admin, client_chat, start
 from tg_studio.bot.handlers import booking_flow
 from tg_studio.config import settings
 
@@ -33,6 +33,7 @@ async def main():
     dp.include_router(start.router)
     dp.include_router(booking_flow.router)
     dp.include_router(admin.router)
+    dp.include_router(client_chat.router)
 
     logger.info("Starting bot polling...")
     await dp.start_polling(bot)

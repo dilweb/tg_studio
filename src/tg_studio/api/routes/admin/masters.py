@@ -1,9 +1,12 @@
+import secrets
+
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from sqlalchemy import delete, select
 
 from tg_studio.api.deps import SessionDep
 from tg_studio.api.routes.admin.deps import OwnerBusinessDep
+from tg_studio.config import settings
 from tg_studio.db.models import Master, MasterService, Service
 
 router = APIRouter(prefix="/masters", tags=["admin • masters"])
@@ -203,6 +206,34 @@ async def attach_service(
     service_ids = await _load_service_ids(session, master_id)
     master = await _get_own_master(session, master_id, business.id)
     return _to_response(master, service_ids)
+
+
+@router.post("/{master_id}/registration-link", status_code=200)
+async def create_registration_link(
+    master_id: int,
+    session: SessionDep,
+    business: OwnerBusinessDep,
+):
+    """
+    Сгенерировать одноразовую ссылку для регистрации мастера в боте.
+    Мастер переходит по ссылке → в боте нажимает Start → привязывается telegram_id.
+    """
+    master = await _get_own_master(session, master_id, business.id)
+    token = secrets.token_urlsafe(24)
+    master.registration_token = token
+    await session.commit()
+
+    payload = f"master_{token}"
+    full_link = (
+        f"https://t.me/{settings.bot_username}?start={payload}"
+        if settings.bot_username
+        else None
+    )
+    return {
+        "payload": payload,
+        "link": full_link,
+        "hint": "Отправьте ссылку мастеру. Он откроет её в Telegram и нажмёт «Запустить» — после этого аккаунт привяжется.",
+    }
 
 
 @router.delete("/{master_id}/services/{service_id}", status_code=204)

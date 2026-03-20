@@ -36,7 +36,7 @@ class BookingAdminResponse(BaseModel):
 async def list_bookings(
     session: SessionDep,
     business: OwnerBusinessDep,
-    status: str | None = Query(default=None, description="pending | confirmed | in_progress | cancelled | completed"),
+    status: str | None = Query(default=None, description="pending | paid | in_progress | cancelled | completed"),
     master_id: int | None = Query(default=None),
     from_date: date | None = Query(default=None, description="YYYY-MM-DD"),
     to_date: date | None = Query(default=None, description="YYYY-MM-DD"),
@@ -108,7 +108,12 @@ async def mark_completed(
     session: SessionDep,
     business: OwnerBusinessDep,
 ):
-    """Отметить запись как выполненную."""
+    """
+    Отметить запись как выполненную (завершить заказ).
+
+    Работает для записей со статусом confirmed (оплаченная запись на слот)
+    или in_progress (проект взят в работу). После вызова статус → completed.
+    """
     result = await session.execute(
         select(Booking)
         .join(Master, Master.id == Booking.master_id)
@@ -133,7 +138,12 @@ async def mark_in_progress(
     session: SessionDep,
     business: OwnerBusinessDep,
 ):
-    """Взять проект в работу (только для project-типа)."""
+    """
+    Взять проект в работу (только для project-типа).
+
+    Вызывать при необходимости вручную перевести проект из confirmed в in_progress.
+    После оплаты project уже приходит в in_progress автоматически.
+    """
     result = await session.execute(
         select(Booking, Service)
         .join(Service, Service.id == Booking.service_id)

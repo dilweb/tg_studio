@@ -12,7 +12,8 @@ FSM-диалог записи на сеанс.
 """
 
 import logging
-from datetime import date, datetime, timedelta
+import random
+from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from aiogram import F, Router
@@ -30,6 +31,7 @@ from tg_studio.bot.keyboards.booking import (
     confirm_kb,
     dates_kb,
     duration_kb,
+    duration_range_kb,
     masters_kb,
     services_kb,
     times_kb,
@@ -211,20 +213,58 @@ async def on_date_chosen(call: CallbackQuery, callback_data: DateCB, state: FSMC
 
 # ─── Шаг 4: время ──────────────────────────────────────────────────────────────
 
+def _consecutive_slot_ranges(slots: list[dict], chosen_time: str) -> list[tuple[str, str, int]]:
+    """
+    Слоты на один день, отсортированы по starts_at.
+    Найти слот с началом chosen_time (HH:MM) и вернуть диапазоны:
+    от него до первого занятого — (start, end, hours) для 1, 2, 3, ... слотов.
+    """
+    time_part = lambda s: s["starts_at"][11:16]  # "HH:MM"
+    idx = None
+    for i, s in enumerate(slots):
+        if time_part(s) == chosen_time:
+            idx = i
+            break
+    if idx is None:
+        return []
+    ranges = []
+    for k in range(1, len(slots) - idx + 1):
+        start_s = slots[idx]["starts_at"]
+        end_s = slots[idx + k - 1]["ends_at"]
+        start_dt = datetime.fromisoformat(start_s)
+        end_dt = datetime.fromisoformat(end_s)
+        hours = max(1, int(round((end_dt - start_dt).total_seconds() / 3600)))
+        ranges.append((time_part(slots[idx]), end_s[11:16], hours))
+    return ranges
+
+
 @router.callback_query(BookingFlow.choosing_time, TimeCB.filter())
 async def on_time_chosen(call: CallbackQuery, callback_data: TimeCB, state: FSMContext):
-    await state.update_data(chosen_time=callback_data.value)
+    data = await state.get_data()
+    chosen_date = data["chosen_date"]
+    chosen_time = callback_data.value
+
+    async with async_session_factory() as session:
+        slots = await get_available_slots(
+            session, data["master_id"], date.fromisoformat(chosen_date), date.fromisoformat(chosen_date)
+        )
+
+    ranges = _consecutive_slot_ranges(slots, chosen_time)
+    if not ranges:
+        await call.answer("Это время больше недоступно. Выберите другое.", show_alert=True)
+        return
+
+    await state.update_data(chosen_time=chosen_time)
     await state.set_state(BookingFlow.choosing_duration)
 
-    data = await state.get_data()
-    date_label = date.fromisoformat(data["chosen_date"]).strftime("%d.%m.%Y")
+    date_label = date.fromisoformat(chosen_date).strftime("%d.%m.%Y")
     await call.message.edit_text(
         f"Мастер: <b>{data['master_name']}</b>\n"
         f"Услуга: <b>{data['service_name']}</b>\n"
         f"Дата: <b>{date_label}</b>\n"
-        f"Время: <b>{callback_data.value}</b>\n\n"
-        f"На сколько часов?",
-        reply_markup=duration_kb(),
+        f"Время начала: <b>{chosen_time}</b>\n\n"
+        f"Выберите конец (свободные слоты до первого занятого):",
+        reply_markup=duration_range_kb(ranges),
     )
     await call.answer()
 
@@ -306,6 +346,8 @@ async def on_confirm(call: CallbackQuery, state: FSMContext):
                     starts_at - timedelta(hours=data["cancel_deadline_hours"]),
                     now,
                 )
+                # БД хранит TIMESTAMP WITHOUT TIME ZONE — передаём naive UTC
+                cancel_deadline_at = cancel_deadline_at.astimezone(timezone.utc).replace(tzinfo=None)
 
                 # Повторная проверка пересечений (мог кто-то занять пока выбирали)
                 overlap = await session.execute(
@@ -378,44 +420,75 @@ async def on_confirm(call: CallbackQuery, state: FSMContext):
             session.add(booking)
             await session.flush()
 
-            # Создать заказ Freedom Pay
-            desc = f"Предоплата: {data['service_name']}"
-            if data.get("duration_hours"):
-                desc += f" x{data['duration_hours']}ч"
-            fp_order = await freedom_pay_service.create_order(
-                session,
-                business_id=master.business_id,
-                booking_id=booking.id,
-                amount=data["prepayment_amount"],
-                description=desc,
-                user_phone=client.phone,
-            )
+            # Создать заказ Freedom Pay (заглушка: 90% — оплата подтверждена)
+            # desc = f"Предоплата: {data['service_name']}"
+            # if data.get("duration_hours"):
+            #     desc += f" x{data['duration_hours']}ч"
+            # fp_order = await freedom_pay_service.create_order(
+            #     session,
+            #     business_id=master.business_id,
+            #     booking_id=booking.id,
+            #     amount=data["prepayment_amount"],
+            #     description=desc,
+            #     user_phone=client.phone,
+            # )
+            # payment = Payment(
+            #     booking_id=booking.id,
+            #     gateway_order_id=fp_order["order_id"],
+            #     gateway="freedompay",
+            #     amount=data["prepayment_amount"],
+            #     status=PaymentStatus.pending,
+            # )
+            # session.add(payment)
+            # await session.commit()
+            # booking_id = booking.id
 
+            payment_confirmed = random.random() < 0.9
             payment = Payment(
                 booking_id=booking.id,
-                gateway_order_id=fp_order["order_id"],
+                gateway_order_id=f"stub-{booking.id}",
                 gateway="freedompay",
                 amount=data["prepayment_amount"],
-                status=PaymentStatus.pending,
+                status=PaymentStatus.paid if payment_confirmed else PaymentStatus.pending,
             )
             session.add(payment)
+            if payment_confirmed:
+                # Project: после оплаты — в работу; appointment: подтверждённая запись
+                booking.status = BookingStatus.in_progress if is_project else BookingStatus.confirmed
             await session.commit()
 
             booking_id = booking.id
 
-        # Запланировать автоотмену через 30 минут
-        from tg_studio.tasks.expire_payment import PAYMENT_TIMEOUT_SECONDS, expire_pending_payment
-        expire_pending_payment.apply_async(args=[booking_id], countdown=PAYMENT_TIMEOUT_SECONDS)
+        # Запланировать автоотмену через 30 минут (только если оплата не подтверждена)
+        if not payment_confirmed:
+            from tg_studio.tasks.expire_payment import PAYMENT_TIMEOUT_SECONDS, expire_pending_payment
+            expire_pending_payment.apply_async(args=[booking_id], countdown=PAYMENT_TIMEOUT_SECONDS)
 
         await state.clear()
-        await call.message.edit_text(
-            f"Запись создана!\n\n"
-            f"Для подтверждения оплатите предоплату:\n"
-            f"<b>{int(data['prepayment_amount'])} тг</b>\n\n"
-            f"Ссылка для оплаты:\n{fp_order['payment_url']}\n\n"
-            f"После оплаты вы получите подтверждение в этом чате.\n"
-            f"Ссылка действительна 30 минут."
-        )
+        # Сообщение: со скольки до скольки и общая длительность (для почасовой записи)
+        if not is_project and "starts_at" in data and data.get("duration_hours"):
+            starts_at = datetime.fromisoformat(data["starts_at"])
+            start_str = starts_at.strftime("%H:%M")
+            end_str = (starts_at + timedelta(hours=data["duration_hours"])).strftime("%H:%M")
+            duration_str = f"{data['duration_hours']} ч"
+            time_range_line = f"С {start_str} до {end_str}, общая длительность {duration_str}.\n\n"
+        else:
+            time_range_line = ""
+
+        if payment_confirmed:
+            await call.message.edit_text(
+                f"Запись создана!\n\n{time_range_line}Оплата получена. Ждём вас!\n\n"
+                f"Вы можете продолжить общение с мастером в этом чате — просто напишите сообщение."
+            )
+        else:
+            await call.message.edit_text(
+                f"Запись создана!\n\n{time_range_line}"
+                f"Для подтверждения оплатите предоплату:\n"
+                f"<b>{int(data['prepayment_amount'])} тг</b>\n\n"
+                f"Ссылка для оплаты (заглушка): не выдаётся.\n\n"
+                f"После оплаты вы получите подтверждение в этом чате.\n"
+                f"Ссылка действительна 30 минут."
+            )
 
     except Exception:
         logger.exception("Ошибка при создании брони для tg_id=%s", tg_user.id)

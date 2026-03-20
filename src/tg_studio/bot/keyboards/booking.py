@@ -68,6 +68,22 @@ def duration_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+def duration_range_kb(ranges: list[tuple[str, str, int]]) -> InlineKeyboardMarkup:
+    """
+    ranges: список (start_time "HH:MM", end_time "HH:MM", hours).
+    Кнопки вида "10:00–12:00" с callback hours.
+    """
+    buttons = [
+        InlineKeyboardButton(
+            text=f"{start}–{end}",
+            callback_data=DurationCB(hours=hours).pack(),
+        )
+        for start, end, hours in ranges
+    ]
+    rows = [buttons[i:i+4] for i in range(0, len(buttons), 4)]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 def dates_kb(dates: list[str]) -> InlineKeyboardMarkup:
     """dates — список строк "YYYY-MM-DD"."""
     from datetime import date
