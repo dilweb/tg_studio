@@ -1,21 +1,29 @@
 from .base import Base
-from .models import Booking, BookingChatMessage, BookingStatus, Business, Client, Master, MasterService, Payment, PaymentStatus, Service, ServiceType, TimeSlot, WorkSchedule
+from .models import (
+    AIConversation,
+    AIMessage,
+    Business,
+    Client,
+    Master,
+    MasterService,
+    Service,
+    User,
+    UserRole,
+    WorkSchedule,
+)
 from .session import async_session_factory, engine, get_session
 
 __all__ = [
+    "AIConversation",
+    "AIMessage",
     "Base",
-    "Booking",
-    "BookingChatMessage",
-    "BookingStatus",
     "Business",
     "Client",
     "Master",
     "MasterService",
-    "Payment",
-    "PaymentStatus",
     "Service",
-    "ServiceType",
-    "TimeSlot",
+    "User",
+    "UserRole",
     "WorkSchedule",
     "async_session_factory",
     "engine",

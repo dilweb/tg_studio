@@ -10,3 +10,4 @@ node_modules/
 frontend/dist/
 celerybeat-schedule
 *.db
+client_secret_*.json

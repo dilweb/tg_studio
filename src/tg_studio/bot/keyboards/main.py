@@ -1,7 +1,6 @@
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
 
 from tg_studio.config import settings
-from tg_studio.db.models import ServiceType
 
 
 def get_main_keyboard() -> InlineKeyboardMarkup:
