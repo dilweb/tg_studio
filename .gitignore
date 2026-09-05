@@ -11,3 +11,4 @@ frontend/dist/
 celerybeat-schedule
 *.db
 client_secret_*.json
+credentials.json
