@@ -1,0 +1,54 @@
+# Pipeline без деплоя: линт + тесты (как в типичном Python/FastAPI проекте).
+# Требует GitLab Runner с Docker или Kubernetes executor (по умолчанию на GitLab.com).
+
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "main"
+    - if: $CI_COMMIT_BRANCH == "master"
+    - if: $CI_COMMIT_BRANCH == "dev"
+    - if: $CI_COMMIT_BRANCH == "develop"
+
+default:
+  image: python:3.12-slim
+  interruptible: true
+
+variables:
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  PYTHONDONTWRITEBYTECODE: "1"
+  POETRY_VERSION: "2.3.2"
+
+stages:
+  - lint
+  - test
+
+.poetry_job:
+  before_script:
+    - pip install --user "poetry==${POETRY_VERSION}"
+    - export PATH="${HOME}/.local/bin:${PATH}"
+    - poetry --version
+    - poetry config virtualenvs.in-project true
+    - poetry install --with dev --no-interaction --no-ansi
+  cache:
+    key:
+      files:
+        - poetry.lock
+    paths:
+      - .venv/
+
+ruff:
+  extends: .poetry_job
+  stage: lint
+  script:
+    - export PATH="${HOME}/.local/bin:${PATH}"
+    - poetry run ruff check src tests
+
+pytest:
+  extends: .poetry_job
+  stage: test
+  variables:
+    BOT_TOKEN: "0000000000:AAHci_test_token_placeholder"
+    DEBUG: "true"
+  script:
+    - export PATH="${HOME}/.local/bin:${PATH}"
+    - poetry run pytest tests/ -v --tb=short

@@ -4,6 +4,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message
 from sqlalchemy import select
 
+from tg_studio.config import settings
 from tg_studio.db.models import Master
 from tg_studio.db.session import async_session_factory
 
@@ -12,11 +13,17 @@ router = Router(name="start")
 REGISTRATION_PREFIX = "master_"
 
 
-def _main_kb() -> InlineKeyboardMarkup:
+def _master_menu():
+    """Клавиатура для зарегистрированного мастера."""
     return InlineKeyboardMarkup(
-        inline_keyboard=[[
-            InlineKeyboardButton(text="Записаться на сеанс", callback_data="book:start"),
-        ]]
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="📋 Открыть Mini App",
+                    web_app={"url": settings.miniapp_url},
+                ),
+            ],
+        ]
     )
 
 
@@ -48,8 +55,8 @@ async def cmd_start(message: Message, state: FSMContext):
                 if master.telegram_id == telegram_id:
                     await message.answer(
                         f"Вы уже зарегистрированы как мастер {master.full_name}.\n\n"
-                        "Команды: /bookings — ваши записи, /help — помощь.",
-                        reply_markup=_main_kb(),
+                        "Команды: /help — помощь.",
+                        reply_markup=_master_menu(),
                     )
                     return
                 # Один Telegram — один мастер
@@ -70,13 +77,13 @@ async def cmd_start(message: Message, state: FSMContext):
                 await session.commit()
             await message.answer(
                 f"Вы зарегистрированы как мастер <b>{master.full_name}</b>.\n\n"
-                "Теперь вам будут приходить уведомления о новых записях. "
-                "Команды: /bookings — ваши записи, /help — помощь.",
-                reply_markup=_main_kb(),
+                "Используйте Mini App для управления проектами:",
+                reply_markup=_master_menu(),
             )
             return
 
     await message.answer(
-        "Привет! Здесь вы можете записаться на сеанс и оплатить предоплату.",
-        reply_markup=_main_kb(),
+        "👋 Добро пожаловать в TG Studio!\n\n"
+        "Открой Mini App, чтобы управлять проектами:",
+        reply_markup=_master_menu(),
     )
