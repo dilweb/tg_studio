@@ -229,9 +229,16 @@ async def resend_verification(body: ResendVerificationRequest, session: SessionD
 
 
 @router.get("/me", response_model=UserResponse)
-async def me(user: CurrentUserDep):
+async def me(user: CurrentUserDep, session: SessionDep):
+    master_id = None
+    if user.role == UserRole.master:
+        result = await session.execute(
+            select(Master.id).where(Master.user_id == user.id, Master.is_active.is_(True))
+        )
+        master_id = result.scalar_one_or_none()
     return UserResponse(
         id=user.id,
+        master_id=master_id,
         email=user.email,
         telegram_id=user.telegram_id,
         phone=user.phone,

@@ -11,7 +11,7 @@ const router = useRouter()
 const me = computed(() => authStore.me)
 const sections = computed(() => (me.value ? sectionsFor(me.value.role) : []))
 
-const roleLabel = computed(() => (me.value?.role === 'admin' ? 'Админ' : 'Мастер'))
+const roleLabel = computed(() => (me.value?.role === 'owner' ? 'Владелец' : 'Мастер'))
 
 function logout() {
   authStore.logout()

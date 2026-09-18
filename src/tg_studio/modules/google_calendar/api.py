@@ -11,11 +11,13 @@ from fastapi import APIRouter, HTTPException, Query
 
 from tg_studio.api.admin_deps import OwnerBusinessDep
 from tg_studio.api.deps import SessionDep
+from tg_studio.db.models import Master
 from tg_studio.modules.google_calendar.client import (
+    create_calendar,
+    credentials_to_storage_json,
     exchange_code,
     get_auth_url,
     get_calendar_email,
-    credentials_to_storage_json,
 )
 from tg_studio.modules.google_calendar.schemas import (
     GoogleCalendarAuthUrlResponse,
@@ -92,3 +94,33 @@ async def disconnect_google_calendar(
     business.google_calendar_credentials_json = None
     business.google_calendar_email = None
     await session.commit()
+
+
+@router.post("/masters/{master_id}/calendar", status_code=201)
+async def create_master_calendar(
+    master_id: int,
+    session: SessionDep,
+    business: OwnerBusinessDep,
+):
+    """
+    Create a dedicated secondary calendar for a master, within the business's
+    connected Google account, and store its ID on the master.
+
+    Requires the business to already be connected (POST .../callback first).
+    """
+    if not business.google_calendar_credentials_json:
+        raise HTTPException(status_code=400, detail="Google Calendar не подключен для этого бизнеса")
+
+    master = await session.get(Master, master_id)
+    if master is None or master.business_id != business.id:
+        raise HTTPException(status_code=404, detail="Мастер не найден")
+
+    calendar_id = await create_calendar(
+        business.google_calendar_credentials_json, summary=master.full_name
+    )
+    if not calendar_id:
+        raise HTTPException(status_code=502, detail="Не удалось создать календарь в Google")
+
+    master.google_calendar_id = calendar_id
+    await session.commit()
+    return {"master_id": master.id, "google_calendar_id": calendar_id}

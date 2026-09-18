@@ -10,7 +10,7 @@ const route = useRoute()
 const sectionTitle = computed(() => route.meta.title ?? 'Панель')
 const me = computed(() => authStore.me)
 
-const roleLabel = computed(() => (me.value?.role === 'admin' ? 'Админ' : 'Мастер'))
+const roleLabel = computed(() => (me.value?.role === 'owner' ? 'Владелец' : 'Мастер'))
 </script>
 
 <template>

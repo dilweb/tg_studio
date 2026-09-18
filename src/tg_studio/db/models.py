@@ -91,11 +91,15 @@ class Master(Base):
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     password_hash: Mapped[str | None] = mapped_column(String(256), nullable=True)
 
+    # Google Calendar — secondary calendar within Business.google_calendar_credentials_json's
+    # account. NULL means "not set up yet", callers fall back to "primary".
+    google_calendar_id: Mapped[str | None] = mapped_column(String(256), nullable=True)
+
     user: Mapped["User | None"] = relationship(back_populates="master")
     services: Mapped[list["MasterService"]] = relationship(back_populates="master")
     business: Mapped["Business"] = relationship(back_populates="masters")
     schedules: Mapped[list["WorkSchedule"]] = relationship(back_populates="master")
-    projects: Mapped[list["TattooProject"]] = relationship(back_populates="master")
+    works: Mapped[list["TattooWork"]] = relationship(back_populates="master")
 
 
 class Service(Base):
@@ -148,7 +152,9 @@ class AIConversation(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     business_id: Mapped[int] = mapped_column(ForeignKey("businesses.id"), nullable=False)
-    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False, index=True)
+    # Ровно одно из двух: user_id — владелец в аналитическом чате, client_id — клиент в чате записи
+    user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True, index=True)
+    client_id: Mapped[int | None] = mapped_column(ForeignKey("clients.id"), nullable=True, index=True)
     summary: Mapped[str | None] = mapped_column(Text, nullable=True)
     awaiting_confirmation: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
@@ -220,6 +226,12 @@ class TimeSlot(Base):
     is_available: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
 
 
+class TattooWorkStatus(str, enum.Enum):
+    in_progress = "in_progress"  # ещё будут сеансы
+    completed = "completed"
+    cancelled = "cancelled"
+
+
 class TattooProjectStatus(str, enum.Enum):
     planned = "planned"
     in_progress = "in_progress"
@@ -227,40 +239,74 @@ class TattooProjectStatus(str, enum.Enum):
     cancelled = "cancelled"
 
 
-class TattooProject(Base):
+class TattooWork(Base):
     """
-    Проект татуировки, создаваемый мастером через Mini App.
+    Тату целиком — то, что видит клиент как один заказ.
 
-    Поля: размер, сложность, место нанесения, дата сеанса, стоимость.
-    Привязывается к мастеру и синхронизируется с Google Calendar.
+    Может состоять из нескольких сеансов (TattooSession).
     """
 
-    __tablename__ = "tattoo_projects"
+    __tablename__ = "tattoo_works"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    client_id: Mapped[int] = mapped_column(ForeignKey("clients.id"), nullable=False, index=True)
     master_id: Mapped[int] = mapped_column(ForeignKey("masters.id"), nullable=False, index=True)
     business_id: Mapped[int] = mapped_column(ForeignKey("businesses.id"), nullable=False, index=True)
 
-    # Основные поля
     size: Mapped[str] = mapped_column(String(64), nullable=False)  # маленький, средний, большой
     complexity: Mapped[str] = mapped_column(String(64), nullable=False)  # низкая, средняя, высокая
-    placement: Mapped[str] = mapped_column(String(256), nullable=False)  # место нанесения
-    session_date: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
-    cost: Mapped[float] = mapped_column(Numeric(10, 2), nullable=False)
+    style: Mapped[str] = mapped_column(String(64), nullable=False)
+    placement: Mapped[str] = mapped_column(String(256), nullable=False)
 
-    # Статус проекта
-    status: Mapped[TattooProjectStatus] = mapped_column(
-        Enum(TattooProjectStatus), nullable=False, default=TattooProjectStatus.planned
+    status: Mapped[TattooWorkStatus] = mapped_column(
+        Enum(TattooWorkStatus), nullable=False, default=TattooWorkStatus.in_progress
     )
 
-    # Google Calendar event ID
-    google_event_id: Mapped[str | None] = mapped_column(String(256), nullable=True)
-
-    # Временные метки
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime, server_default=func.now(), onupdate=func.now()
     )
 
-    # Relationships
-    master: Mapped["Master"] = relationship(back_populates="projects")
+    master: Mapped["Master"] = relationship(back_populates="works")
+    sessions: Mapped[list["TattooSession"]] = relationship(back_populates="work")
+
+
+class TattooSession(Base):
+    """
+    Один сеанс в рамках TattooWork.
+
+    Эскиз хранится здесь, а не на TattooWork — между сеансами он может меняться.
+    Синхронизируется с Google Calendar.
+    """
+
+    __tablename__ = "tattoo_sessions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    work_id: Mapped[int] = mapped_column(ForeignKey("tattoo_works.id"), nullable=False, index=True)
+
+    session_date: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    quoted_cost: Mapped[float | None] = mapped_column(Numeric(10, 2))  # озвучено клиенту до/на сеансе
+    cost: Mapped[float] = mapped_column(Numeric(10, 2), nullable=False)  # фактически взято
+    status: Mapped[TattooProjectStatus] = mapped_column(
+        Enum(TattooProjectStatus), nullable=False, default=TattooProjectStatus.planned
+    )
+    google_event_id: Mapped[str | None] = mapped_column(String(256), nullable=True)
+
+    sketch_file_id: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    result_file_id: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    is_final_session: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+
+    # LLM-валидация результата сеанса
+    llm_verdict: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    llm_observed_size: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    llm_observed_color: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    llm_observed_style: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    llm_notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    alert_sent_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now(), onupdate=func.now()
+    )
+
+    work: Mapped["TattooWork"] = relationship(back_populates="sessions")

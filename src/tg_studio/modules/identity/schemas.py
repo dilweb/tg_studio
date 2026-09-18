@@ -42,6 +42,7 @@ class CookieAuthResponse(BaseModel):
 
 class UserResponse(BaseModel):
     id: int
+    master_id: int | None = None
     email: str | None
     telegram_id: int | None
     phone: str | None

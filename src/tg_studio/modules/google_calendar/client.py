@@ -5,6 +5,7 @@ Handles OAuth2 token lifecycle and provides a thin wrapper
 around the google-api-python-client for calendar operations.
 """
 import json
+from datetime import datetime
 from pathlib import Path
 
 from google.auth.transport.requests import Request
@@ -110,9 +111,15 @@ async def create_event(
     end_datetime: str,
     timezone: str = "Asia/Almaty",
     attendees: list[str] | None = None,
+    calendar_id: str = "primary",
+    extended_properties: dict[str, str] | None = None,
 ) -> str | None:
     """
     Create a calendar event and return its event ID.
+
+    `extended_properties` is stored as private metadata on the event (not visible
+    in the Google Calendar UI) — used to read structured booking data back via
+    list_events without a local DB table.
 
     Returns None on failure.
     """
@@ -140,8 +147,10 @@ async def create_event(
 
         if attendees:
             event_body["attendees"] = [{"email": a} for a in attendees]
+        if extended_properties:
+            event_body["extendedProperties"] = {"private": extended_properties}
 
-        created_event = service.events().insert(calendarId="primary", body=event_body).execute()
+        created_event = service.events().insert(calendarId=calendar_id, body=event_body).execute()
         return created_event.get("id")
 
     except HttpError:
@@ -157,6 +166,7 @@ async def update_event(
     end_datetime: str,
     timezone: str = "Asia/Almaty",
     attendees: list[str] | None = None,
+    calendar_id: str = "primary",
 ) -> bool:
     """Update an existing calendar event."""
     creds = _load_credentials(credentials_json)
@@ -184,14 +194,14 @@ async def update_event(
         if attendees:
             event_body["attendees"] = [{"email": a} for a in attendees]
 
-        service.events().update(calendarId="primary", eventId=event_id, body=event_body).execute()
+        service.events().update(calendarId=calendar_id, eventId=event_id, body=event_body).execute()
         return True
 
     except HttpError:
         return False
 
 
-async def cancel_event(credentials_json: str, event_id: str) -> bool:
+async def cancel_event(credentials_json: str, event_id: str, calendar_id: str = "primary") -> bool:
     """Delete a calendar event by its ID."""
     creds = _load_credentials(credentials_json)
     if not creds:
@@ -201,10 +211,96 @@ async def cancel_event(credentials_json: str, event_id: str) -> bool:
 
     try:
         service = build("calendar", "v3", credentials=creds)
-        service.events().delete(calendarId="primary", eventId=event_id).execute()
+        service.events().delete(calendarId=calendar_id, eventId=event_id).execute()
         return True
     except HttpError:
         return False
+
+
+async def get_busy_periods(
+    credentials_json: str,
+    time_min: str,
+    time_max: str,
+    calendar_id: str = "primary",
+) -> list[tuple[datetime, datetime]]:
+    """
+    Query Google Calendar free/busy for the given calendar in [time_min, time_max].
+
+    Returns [] if there are no credentials or the API call fails — callers should
+    treat that as "no known busy periods", not as an error.
+    """
+    creds = _load_credentials(credentials_json)
+    if not creds:
+        return []
+
+    refresh_if_expired(creds)
+
+    try:
+        service = build("calendar", "v3", credentials=creds)
+        result = service.freebusy().query(
+            body={
+                "timeMin": time_min,
+                "timeMax": time_max,
+                "items": [{"id": calendar_id}],
+            }
+        ).execute()
+        busy = result["calendars"][calendar_id]["busy"]
+        return [
+            (datetime.fromisoformat(b["start"]), datetime.fromisoformat(b["end"]))
+            for b in busy
+        ]
+    except HttpError:
+        return []
+
+
+async def list_events(
+    credentials_json: str,
+    time_min: str,
+    time_max: str,
+    calendar_id: str = "primary",
+) -> list[dict]:
+    """
+    List events on a calendar in [time_min, time_max]. Returns [] on failure —
+    callers should treat that as "no known bookings", not as an error.
+    """
+    creds = _load_credentials(credentials_json)
+    if not creds:
+        return []
+
+    refresh_if_expired(creds)
+
+    try:
+        service = build("calendar", "v3", credentials=creds)
+        result = service.events().list(
+            calendarId=calendar_id,
+            timeMin=time_min,
+            timeMax=time_max,
+            singleEvents=True,
+            orderBy="startTime",
+        ).execute()
+        return result.get("items", [])
+    except HttpError:
+        return []
+
+
+async def create_calendar(credentials_json: str, summary: str) -> str | None:
+    """
+    Create a new secondary calendar in the connected account and return its ID.
+
+    Returns None on failure.
+    """
+    creds = _load_credentials(credentials_json)
+    if not creds:
+        return None
+
+    refresh_if_expired(creds)
+
+    try:
+        service = build("calendar", "v3", credentials=creds)
+        created = service.calendars().insert(body={"summary": summary}).execute()
+        return created.get("id")
+    except HttpError:
+        return None
 
 
 def credentials_to_storage_json(creds: Credentials) -> str:

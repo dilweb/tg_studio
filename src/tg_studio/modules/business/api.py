@@ -67,6 +67,7 @@ def _master_to_response(m: Master, service_ids: list[int]) -> MasterResponse:
         telegram_id=m.telegram_id,
         is_active=m.is_active,
         service_ids=service_ids,
+        google_calendar_id=m.google_calendar_id,
     )
 
 

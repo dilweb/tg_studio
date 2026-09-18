@@ -69,8 +69,10 @@ class ConversationNotFoundError(Exception):
 async def _load_or_create_conversation(
     session: AsyncSession,
     business_id: int,
-    user_id: int,
     conversation_id: int | None,
+    *,
+    user_id: int | None = None,
+    client_id: int | None = None,
 ) -> AIConversation:
     if conversation_id:
         conv = await session.get(
@@ -78,13 +80,18 @@ async def _load_or_create_conversation(
             conversation_id,
             options=[selectinload(AIConversation.messages)],
         )
-        if conv and conv.business_id == business_id and conv.user_id == user_id:
+        if (
+            conv
+            and conv.business_id == business_id
+            and conv.user_id == user_id
+            and conv.client_id == client_id
+        ):
             return conv
         raise ConversationNotFoundError(
             f"Conversation #{conversation_id} not found"
         )
 
-    conv = AIConversation(business_id=business_id, user_id=user_id)
+    conv = AIConversation(business_id=business_id, user_id=user_id, client_id=client_id)
     session.add(conv)
     await session.flush()
     set_committed_value(conv, "messages", [])
@@ -165,8 +172,9 @@ async def _execute_tool_call(
     business_id: int,
     name: str,
     arguments: dict,
+    tool_registry: dict[str, Callable],
 ) -> str:
-    fn = TOOL_REGISTRY.get(name)
+    fn = tool_registry.get(name)
     if not fn:
         return json.dumps({"error": f"Unknown tool: {name}"})
 
@@ -218,6 +226,9 @@ async def _execute_pending_tools(
     conversation: AIConversation,
     business: Business,
     *,
+    tools: list[dict],
+    tool_registry: dict[str, Callable],
+    build_prompt: Callable[[Business], str],
     on_event: AIEvHandler = None,
 ) -> ChatResult:
     """Execute pending tool calls and run the analytics loop."""
@@ -242,7 +253,7 @@ async def _execute_pending_tools(
     # then the tool_calls msg itself (manually, so it keeps tool_calls).
     history_before = conversation.messages[:pending_idx]
 
-    system_prompt = build_system_prompt(business)
+    system_prompt = build_prompt(business)
     openai_messages = [
         {"role": "system", "content": system_prompt},
         *_db_messages_to_openai(history_before, conversation.summary),
@@ -258,7 +269,7 @@ async def _execute_pending_tools(
     for tc in tool_calls_data:
         args = json.loads(tc["function"]["arguments"])
         tool_result = await _execute_tool_call(
-            business.id, tc["function"]["name"], args
+            business.id, tc["function"]["name"], args, tool_registry
         )
 
         tool_msg = AIMessage(
@@ -282,12 +293,13 @@ async def _execute_pending_tools(
     openai_messages.extend(tool_results)
 
     async def _tool(name: str, arguments: dict) -> str:
-        return await _execute_tool_call(business.id, name, arguments)
+        return await _execute_tool_call(business.id, name, arguments, tool_registry)
 
     result = await run_openai_analytics_loop(
         client,
         openai_messages,
         execute_tool=_tool,
+        tools=tools,
         max_tool_rounds=MAX_TOOL_ROUNDS,
         on_event=on_event,
     )
@@ -333,20 +345,27 @@ async def _execute_pending_tools(
 async def chat(
     session: AsyncSession,
     business: Business,
-    user_id: int,
     user_message: str,
     conversation_id: int | None = None,
     confirmed: bool = False,  # noqa: ARG001 — kept for API compatibility
     *,
+    user_id: int | None = None,
+    client_id: int | None = None,
+    tools: list[dict] = ANALYTICS_TOOLS,
+    tool_registry: dict[str, Callable] = TOOL_REGISTRY,
+    build_prompt: Callable[[Business], str] = build_system_prompt,
+    use_data_question_nudge: bool = True,
     on_event: AIEvHandler = None,
 ) -> ChatResult:
     """
-    Main entry point.
-    Tool calls execute immediately — no confirmation flow needed since SQL is read-only and validated.
+    Main entry point — generic over the tool set/system prompt so both the owner
+    analytics agent and other agents (e.g. client booking) can reuse the same loop.
+    Tool calls execute immediately — no confirmation flow at the loop level (the
+    booking profile enforces confirmation via its own system prompt instead).
     """
     client = get_openai_client()
     conversation = await _load_or_create_conversation(
-        session, business.id, user_id, conversation_id
+        session, business.id, conversation_id, user_id=user_id, client_id=client_id
     )
 
     # Reset any stale awaiting state
@@ -361,7 +380,7 @@ async def chat(
     session.add(user_msg)
     conversation.messages.append(user_msg)
 
-    system_prompt = build_system_prompt(business)
+    system_prompt = build_prompt(business)
     openai_messages = [
         {"role": "system", "content": system_prompt},
         *_db_messages_to_openai(conversation.messages, conversation.summary),
@@ -371,12 +390,13 @@ async def chat(
         model=settings.llm_model,
         temperature=0,
         messages=openai_messages,
-        tools=ANALYTICS_TOOLS,
+        tools=tools,
     )
     choice = response.choices[0]
 
     if (
-        not (choice.finish_reason == "tool_calls" or choice.message.tool_calls)
+        use_data_question_nudge
+        and not (choice.finish_reason == "tool_calls" or choice.message.tool_calls)
         and looks_like_data_question(user_message)
     ):
         logger.warning(
@@ -392,7 +412,7 @@ async def chat(
                 *openai_messages,
                 {"role": "system", "content": DATA_QUESTION_REQUIRES_TOOL_NUDGE},
             ],
-            tools=ANALYTICS_TOOLS,
+            tools=tools,
             tool_choice="required",
         )
         choice = response.choices[0]
@@ -410,7 +430,14 @@ async def chat(
         conversation.messages.append(assistant_msg)
 
         return await _execute_pending_tools(
-            session, client, conversation, business, on_event=on_event
+            session,
+            client,
+            conversation,
+            business,
+            tools=tools,
+            tool_registry=tool_registry,
+            build_prompt=build_prompt,
+            on_event=on_event,
         )
 
     # AI answered directly without needing tools (e.g. off-topic refusal, clarification)

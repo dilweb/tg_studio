@@ -21,7 +21,7 @@ const sectionComponents = {
   services: ServicesView,
   schedule: ScheduleView,
   business: BusinessView,
-  'my-bookings': PlaceholderSection,
+  'my-bookings': BookingsView,
 }
 
 const appChildren = Object.entries(sectionComponents).map(([path, component]) => ({

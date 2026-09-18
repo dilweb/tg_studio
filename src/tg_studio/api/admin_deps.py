@@ -105,3 +105,20 @@ async def get_master_business(
 OwnerBusinessDep = Annotated[Business, Depends(get_owner_business)]
 OwnerBusinessAIDep = Annotated[Business, Depends(get_owner_business_for_ai)]
 MasterBusinessDep = Annotated[Business, Depends(get_master_business)]
+
+
+async def get_master_business_and_self(
+    user: RequireOwnerOrMasterDep,
+    session: SessionDep,
+) -> tuple[Business, Master | None]:
+    """Business + the acting Master row. None for an owner — they can act on any master."""
+    business = await get_master_business(user, session)
+    if user.role == UserRole.owner:
+        return business, None
+    result = await session.execute(
+        select(Master).where(Master.user_id == user.id, Master.is_active.is_(True))
+    )
+    return business, result.scalar_one_or_none()
+
+
+MasterBusinessAndSelfDep = Annotated[tuple[Business, Master | None], Depends(get_master_business_and_self)]

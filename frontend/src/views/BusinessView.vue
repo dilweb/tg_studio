@@ -11,12 +11,53 @@ const saving = ref(false)
 // null → ещё не сохраняли; true/false — из ответа PATCH payment-settings
 const payConfigured = ref(null)
 
+const gcalStatus = ref(null) // { connected, email }
+const gcalLoading = ref(true)
+const gcalBusy = ref(false)
+
 const form = reactive({
   merchant_id: '',
   secret_key: '',
 })
 
 const tgId = computed(() => authStore.me?.telegram_id)
+
+async function loadGcalStatus() {
+  gcalLoading.value = true
+  try {
+    gcalStatus.value = await api.get('/api/admin/google-calendar/status')
+  } catch (err) {
+    error.value = err.detail ?? err.message
+  } finally {
+    gcalLoading.value = false
+  }
+}
+
+async function connectGcal() {
+  error.value = ''
+  gcalBusy.value = true
+  try {
+    const res = await api.get('/api/admin/google-calendar/auth-url')
+    window.open(res.auth_url, '_blank')
+  } catch (err) {
+    error.value = err.detail ?? err.message
+  } finally {
+    gcalBusy.value = false
+  }
+}
+
+async function disconnectGcal() {
+  error.value = ''
+  gcalBusy.value = true
+  try {
+    await api.del('/api/admin/google-calendar/disconnect')
+    await loadGcalStatus()
+  } catch (err) {
+    error.value = err.detail ?? err.message
+  } finally {
+    gcalBusy.value = false
+  }
+}
 
 onMounted(async () => {
   try {
@@ -26,6 +67,7 @@ onMounted(async () => {
   } finally {
     loading.value = false
   }
+  await loadGcalStatus()
 })
 
 async function savePayment() {
@@ -117,6 +159,47 @@ async function savePayment() {
             {{ saving ? 'Сохраняем…' : 'Сохранить настройки' }}
           </button>
         </form>
+      </div>
+
+      <div class="card" style="margin-top: 16px">
+        <div class="section-head">
+          <h2>Google Calendar</h2>
+          <span
+            v-if="!gcalLoading"
+            class="badge"
+            :class="gcalStatus?.connected ? 'badge-green' : 'badge-yellow'"
+          >
+            {{ gcalStatus?.connected ? 'Подключен' : 'Не подключен' }}
+          </span>
+        </div>
+        <p class="muted" style="font-size: 13px; margin-bottom: 16px">
+          Сеансы мастеров синхронизируются с этим Google-аккаунтом, а свободные слоты
+          вычисляются с учётом занятости в нём. У каждого мастера может быть свой
+          отдельный календарь внутри этого аккаунта — настраивается в разделе «Мастера».
+        </p>
+
+        <div v-if="gcalLoading" class="muted">Загрузка…</div>
+        <template v-else-if="gcalStatus?.connected">
+          <div style="margin-bottom: 12px">
+            Аккаунт: <strong>{{ gcalStatus.email }}</strong>
+          </div>
+          <button class="btn btn-ghost" :disabled="gcalBusy" @click="disconnectGcal">
+            Отключить
+          </button>
+        </template>
+        <template v-else>
+          <div style="display: flex; gap: 10px; align-items: center">
+            <button class="btn btn-primary" :disabled="gcalBusy" @click="connectGcal">
+              Подключить Google Calendar
+            </button>
+            <button class="btn btn-sm btn-ghost" :disabled="gcalBusy" @click="loadGcalStatus">
+              Обновить статус
+            </button>
+          </div>
+          <p class="muted" style="font-size: 12px; margin-top: 8px">
+            Откроется окно Google — после подтверждения доступа нажмите «Обновить статус».
+          </p>
+        </template>
       </div>
     </template>
 

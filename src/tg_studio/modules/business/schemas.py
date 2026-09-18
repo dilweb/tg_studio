@@ -35,6 +35,7 @@ class MasterResponse(BaseModel):
     telegram_id: int | None
     is_active: bool
     service_ids: list[int]
+    google_calendar_id: str | None = None
 
 
 class ServiceCreate(BaseModel):

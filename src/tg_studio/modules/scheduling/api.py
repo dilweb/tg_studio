@@ -1,17 +1,40 @@
-from datetime import date, timedelta
+from datetime import date, datetime, time, timedelta
 
 from fastapi import APIRouter, HTTPException, Query
 from sqlalchemy import select
+from sqlalchemy.orm import selectinload
 
 from tg_studio.api.admin_deps import OwnerBusinessDep
 from tg_studio.api.deps import SessionDep
 from tg_studio.db.models import Master, MasterService, Service, WorkSchedule
+from tg_studio.modules.google_calendar.client import get_busy_periods
 from tg_studio.modules.scheduling.schemas import WEEKDAY_NAMES, ScheduleEntry, ScheduleResponse
-from tg_studio.modules.scheduling.service import get_available_slots
+from tg_studio.modules.scheduling.service import TZ, get_available_slots
 
 router = APIRouter()
 
 MAX_DAYS_RANGE = 60
+
+
+async def _fetch_busy_ranges(
+    session: SessionDep, master_id: int, from_date: date, to_date: date
+) -> list[tuple[datetime, datetime]]:
+    """Занятые периоды мастера — из Google Calendar его студии."""
+    result = await session.execute(
+        select(Master).where(Master.id == master_id).options(selectinload(Master.business))
+    )
+    master = result.scalar_one_or_none()
+    if not master or not master.business.google_calendar_credentials_json:
+        return []
+
+    time_min = datetime.combine(from_date, time.min, tzinfo=TZ).isoformat()
+    time_max = datetime.combine(to_date + timedelta(days=1), time.min, tzinfo=TZ).isoformat()
+    return await get_busy_periods(
+        master.business.google_calendar_credentials_json,
+        time_min,
+        time_max,
+        calendar_id=master.google_calendar_id or "primary",
+    )
 
 # ── Public: slots ─────────────────────────────────────────────────────────────
 
@@ -70,7 +93,8 @@ async def list_available_slots(
         raise HTTPException(status_code=400, detail="to_date must be >= from_date")
     if (to_date - from_date).days > MAX_DAYS_RANGE:
         raise HTTPException(status_code=400, detail=f"Date range too large, max {MAX_DAYS_RANGE} days")
-    return await get_available_slots(session, master_id, from_date, to_date)
+    busy_ranges = await _fetch_busy_ranges(session, master_id, from_date, to_date)
+    return await get_available_slots(session, master_id, from_date, to_date, busy_ranges)
 
 
 @_public.get("/available/month")
@@ -82,7 +106,8 @@ async def list_available_days_in_month(
 ):
     from_date = date(year, month, 1)
     to_date = date(year + 1, 1, 1) - timedelta(days=1) if month == 12 else date(year, month + 1, 1) - timedelta(days=1)
-    slots = await get_available_slots(session, master_id, from_date, to_date)
+    busy_ranges = await _fetch_busy_ranges(session, master_id, from_date, to_date)
+    slots = await get_available_slots(session, master_id, from_date, to_date, busy_ranges)
     return {"available_days": sorted({s["starts_at"][:10] for s in slots})}
 
 

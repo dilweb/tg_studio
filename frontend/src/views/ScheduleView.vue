@@ -16,7 +16,7 @@ const error = ref('')
 const saving = ref(false)
 const savedFlash = ref(false)
 
-const isAdmin = computed(() => authStore.me?.role === 'admin')
+const isAdmin = computed(() => authStore.me?.role === 'owner')
 
 function toRows(schedule) {
   const byWeekday = new Map(schedule.map((e) => [e.weekday, e]))

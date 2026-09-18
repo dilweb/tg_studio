@@ -130,6 +130,21 @@ async function makeRegLink(m) {
   }
 }
 
+const creatingCalendarId = ref(null)
+
+async function createCalendar(m) {
+  error.value = ''
+  creatingCalendarId.value = m.id
+  try {
+    await api.post(`/api/admin/google-calendar/masters/${m.id}/calendar`)
+    await load()
+  } catch (err) {
+    error.value = err.detail ?? err.message
+  } finally {
+    creatingCalendarId.value = null
+  }
+}
+
 async function copyLink(m) {
   const link = regLinks[m.id]?.link
   if (!link) return
@@ -216,6 +231,7 @@ onMounted(load)
             <th>Мастер</th>
             <th>Услуги</th>
             <th>Telegram</th>
+            <th>Календарь</th>
             <th>Статус</th>
             <th></th>
           </tr>
@@ -246,6 +262,17 @@ onMounted(load)
                 </template>
               </td>
               <td>
+                <span v-if="m.google_calendar_id" class="badge badge-green">создан</span>
+                <button
+                  v-else
+                  class="btn btn-sm"
+                  :disabled="creatingCalendarId === m.id"
+                  @click="createCalendar(m)"
+                >
+                  {{ creatingCalendarId === m.id ? 'Создаём…' : 'Создать календарь' }}
+                </button>
+              </td>
+              <td>
                 <span class="badge" :class="m.is_active ? 'badge-green' : 'badge-muted'">
                   {{ m.is_active ? 'Активен' : 'Выключен' }}
                 </span>
@@ -258,7 +285,7 @@ onMounted(load)
               </td>
             </tr>
             <tr v-if="regLinks[m.id]">
-              <td colspan="5" style="background: rgba(108, 99, 255, 0.05)">
+              <td colspan="6" style="background: rgba(108, 99, 255, 0.05)">
                 <div class="link-box" style="margin-top: 0">
                   <span class="link-text">
                     {{ regLinks[m.id].link ?? regLinks[m.id].payload }}
