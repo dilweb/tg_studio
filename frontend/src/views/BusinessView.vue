@@ -1,31 +1,35 @@
 <script setup>
-import { computed, onMounted, reactive, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 
 import { api } from '../api/client'
-import { authStore } from '../store/auth'
 
 const info = ref(null)
 const loading = ref(true)
 const error = ref('')
-const saving = ref(false)
-// null → ещё не сохраняли; true/false — из ответа PATCH payment-settings
-const payConfigured = ref(null)
 
-const gcalStatus = ref(null) // { connected, email }
+const gcalStatus = ref(null) // { connected, email, share_email }
 const gcalLoading = ref(true)
 const gcalBusy = ref(false)
 
-const form = reactive({
-  merchant_id: '',
-  secret_key: '',
-})
+const shareEmail = ref('')
+const shareBusy = ref(false)
+const shareResult = ref(null)
 
-const tgId = computed(() => authStore.me?.telegram_id)
+const shareMessage = computed(() => {
+  if (!shareResult.value) return ''
+  const ok = shareResult.value.shared.filter((c) => c.ok).length
+  const total = shareResult.value.shared.length
+  const failed = shareResult.value.shared.filter((c) => !c.ok)
+  const base = `Доступ открыт для ${ok} из ${total} календарей. Письмо от Google придёт на ${shareResult.value.email}.`
+  if (ok === total) return base
+  return `${base} Ошибки: ${failed.map((f) => `${f.calendar_id} — ${f.error}`).join('; ')}`
+})
 
 async function loadGcalStatus() {
   gcalLoading.value = true
   try {
     gcalStatus.value = await api.get('/api/admin/google-calendar/status')
+    if (gcalStatus.value?.share_email) shareEmail.value = gcalStatus.value.share_email
   } catch (err) {
     error.value = err.detail ?? err.message
   } finally {
@@ -33,12 +37,27 @@ async function loadGcalStatus() {
   }
 }
 
+async function shareGcal() {
+  error.value = ''
+  shareBusy.value = true
+  shareResult.value = null
+  try {
+    shareResult.value = await api.post('/api/admin/google-calendar/share', {
+      email: shareEmail.value.trim(),
+    })
+  } catch (err) {
+    error.value = err.detail ?? err.message
+  } finally {
+    shareBusy.value = false
+  }
+}
+
 async function connectGcal() {
   error.value = ''
   gcalBusy.value = true
   try {
-    const res = await api.get('/api/admin/google-calendar/auth-url')
-    window.open(res.auth_url, '_blank')
+    await api.post('/api/admin/google-calendar/connect')
+    await loadGcalStatus()
   } catch (err) {
     error.value = err.detail ?? err.message
   } finally {
@@ -61,7 +80,7 @@ async function disconnectGcal() {
 
 onMounted(async () => {
   try {
-    info.value = await api.get(`/api/business/by-owner/${tgId.value}`)
+    info.value = await api.get('/api/admin/business')
   } catch (err) {
     error.value = err.detail ?? err.message
   } finally {
@@ -69,34 +88,6 @@ onMounted(async () => {
   }
   await loadGcalStatus()
 })
-
-async function savePayment() {
-  const merchant = form.merchant_id.trim()
-  const secret = form.secret_key.trim()
-  if (!merchant && !secret) {
-    error.value = 'Заполните Merchant ID или Secret Key'
-    return
-  }
-  if (merchant && Number.isNaN(Number(merchant))) {
-    error.value = 'Merchant ID — число из my.freedompay.kz'
-    return
-  }
-
-  saving.value = true
-  error.value = ''
-  try {
-    const body = {}
-    if (merchant) body.freedom_pay_merchant_id = Number(merchant)
-    if (secret) body.freedom_pay_secret_key = secret
-    const res = await api.patch('/api/admin/business/payment-settings', body)
-    payConfigured.value = Boolean(res.freedom_pay_configured)
-    form.secret_key = '' // секрет не держим в форме после сохранения
-  } catch (err) {
-    error.value = err.detail ?? err.message
-  } finally {
-    saving.value = false
-  }
-}
 </script>
 
 <template>
@@ -128,41 +119,6 @@ async function savePayment() {
 
       <div class="card">
         <div class="section-head">
-          <h2>Приём платежей — Freedom Pay</h2>
-          <span v-if="payConfigured !== null" class="badge" :class="payConfigured ? 'badge-green' : 'badge-yellow'">
-            {{ payConfigured ? 'Настроено' : 'Не настроено' }}
-          </span>
-        </div>
-        <p class="muted" style="font-size: 13px; margin-bottom: 16px">
-          Ключи из личного кабинета my.freedompay.kz. Нужны, чтобы клиенты могли вносить предоплату
-          через бота. Secret key сохраняется на сервере и больше не показывается.
-        </p>
-
-        <form @submit.prevent="savePayment">
-          <div class="form-grid">
-            <div class="field">
-              <label for="fp-merchant">Merchant ID</label>
-              <input id="fp-merchant" v-model="form.merchant_id" inputmode="numeric" autocomplete="off" />
-            </div>
-            <div class="field">
-              <label for="fp-secret">Secret Key</label>
-              <input
-                id="fp-secret"
-                v-model="form.secret_key"
-                type="password"
-                :placeholder="payConfigured ? 'уже сохранён — введите, чтобы заменить' : ''"
-                autocomplete="new-password"
-              />
-            </div>
-          </div>
-          <button class="btn btn-primary" type="submit" :disabled="saving">
-            {{ saving ? 'Сохраняем…' : 'Сохранить настройки' }}
-          </button>
-        </form>
-      </div>
-
-      <div class="card" style="margin-top: 16px">
-        <div class="section-head">
           <h2>Google Calendar</h2>
           <span
             v-if="!gcalLoading"
@@ -183,6 +139,35 @@ async function savePayment() {
           <div style="margin-bottom: 12px">
             Аккаунт: <strong>{{ gcalStatus.email }}</strong>
           </div>
+
+          <div style="margin-bottom: 16px">
+            <label
+              class="muted"
+              for="gcal-share-email"
+              style="display: block; font-size: 13px; margin-bottom: 6px"
+            >
+              Ваш Google-адрес — записи появятся в вашем Google Calendar
+            </label>
+            <div style="display: flex; gap: 10px; align-items: center; flex-wrap: wrap">
+              <input
+                id="gcal-share-email"
+                v-model="shareEmail"
+                type="email"
+                autocomplete="email"
+                placeholder="you@gmail.com"
+                style="max-width: 280px"
+              />
+              <button class="btn btn-primary" :disabled="shareBusy" @click="shareGcal">
+                {{ shareBusy ? 'Открываем доступ…' : 'Открыть доступ' }}
+              </button>
+            </div>
+            <p v-if="shareMessage" class="muted" style="font-size: 12px; margin-top: 8px">
+              {{ shareMessage }}
+              Если календарь не появился сам: calendar.google.com → «+» рядом с «Другие
+              календари» → «Подписка на календарь» → адрес {{ gcalStatus.email }}.
+            </p>
+          </div>
+
           <button class="btn btn-ghost" :disabled="gcalBusy" @click="disconnectGcal">
             Отключить
           </button>
@@ -197,7 +182,8 @@ async function savePayment() {
             </button>
           </div>
           <p class="muted" style="font-size: 12px; margin-top: 8px">
-            Откроется окно Google — после подтверждения доступа нажмите «Обновить статус».
+            Подключение через сервисный аккаунт студии — без окна Google. После
+            подключения создайте мастерам календари в разделе «Мастера».
           </p>
         </template>
       </div>

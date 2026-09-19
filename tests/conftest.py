@@ -10,10 +10,11 @@ import os
 # Must be set BEFORE tg_studio modules are imported so pydantic-settings is satisfied.
 os.environ.setdefault("BOT_TOKEN", "1234567890:AAHtest_token_for_testing_only_ci")
 os.environ.setdefault("DEBUG", "true")
+# Роли в дебаг-заглушке решает ALLOWED_USERS; 99999 — телеграм-id владельца из make_business.
+# Присваиваем, а не setdefault: compose прокидывает реальный .env с другими id.
+os.environ["ALLOWED_USERS"] = '[{"id": 99999, "role": "owner"}]'
 os.environ.setdefault("MINIAPP_URL", "http://testserver")
 os.environ.setdefault("API_PUBLIC_URL", "http://testserver")
-
-from datetime import datetime
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -26,8 +27,6 @@ from tg_studio.db.models import (
     Business,
     Client,
     Master,
-    MasterService,
-    Service,
     User,
     UserRole,
     WorkSchedule,
@@ -118,21 +117,6 @@ async def make_master(
     full_name: str = "Test Master",
 ) -> Master:
     obj = Master(business_id=business_id, full_name=full_name, is_active=is_active)
-    session.add(obj)
-    await session.flush()
-    return obj
-
-
-async def make_service(
-    session: AsyncSession,
-    business_id: int,
-    price: float = 5000.0,
-) -> Service:
-    obj = Service(
-        business_id=business_id,
-        name="Test Service",
-        price=price,
-    )
     session.add(obj)
     await session.flush()
     return obj

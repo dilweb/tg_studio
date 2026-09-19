@@ -11,6 +11,10 @@ const sectionTitle = computed(() => route.meta.title ?? 'Панель')
 const me = computed(() => authStore.me)
 
 const roleLabel = computed(() => (me.value?.role === 'owner' ? 'Владелец' : 'Мастер'))
+// /api/auth/me отдаёт first_name/last_name, поля name в ответе нет
+const userLabel = computed(() =>
+  [me.value?.first_name, me.value?.last_name].filter(Boolean).join(' '),
+)
 </script>
 
 <template>
@@ -21,7 +25,7 @@ const roleLabel = computed(() => (me.value?.role === 'owner' ? 'Владелец
         <h1 class="section-title">{{ sectionTitle }}</h1>
         <div class="user-chip">
           <span class="user-role">{{ roleLabel }}</span>
-          <span class="user-name">{{ me?.name }}</span>
+          <span class="user-name">{{ userLabel }}</span>
         </div>
       </header>
       <div class="content">

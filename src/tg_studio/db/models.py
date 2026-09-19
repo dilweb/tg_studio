@@ -58,10 +58,11 @@ class Business(Base):
     # Google Calendar integration
     google_calendar_credentials_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     google_calendar_email: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    # Личный Google-адрес владельца, с которым расшарены календари (ACL-правило)
+    google_share_email: Mapped[str | None] = mapped_column(String(256), nullable=True)
 
     owner: Mapped["User"] = relationship()
     masters: Mapped[list["Master"]] = relationship(back_populates="business")
-    services: Mapped[list["Service"]] = relationship(back_populates="business")
 
 
 class Client(Base):
@@ -96,24 +97,9 @@ class Master(Base):
     google_calendar_id: Mapped[str | None] = mapped_column(String(256), nullable=True)
 
     user: Mapped["User | None"] = relationship(back_populates="master")
-    services: Mapped[list["MasterService"]] = relationship(back_populates="master")
     business: Mapped["Business"] = relationship(back_populates="masters")
     schedules: Mapped[list["WorkSchedule"]] = relationship(back_populates="master")
     works: Mapped[list["TattooWork"]] = relationship(back_populates="master")
-
-
-class Service(Base):
-    __tablename__ = "services"
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    business_id: Mapped[int] = mapped_column(ForeignKey("businesses.id"), nullable=False)
-    name: Mapped[str] = mapped_column(String(256), nullable=False)
-    description: Mapped[str | None] = mapped_column(Text)
-    price: Mapped[float] = mapped_column(Integer, nullable=False)
-    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
-
-    business: Mapped["Business"] = relationship(back_populates="services")
-    masters: Mapped[list["MasterService"]] = relationship(back_populates="service")
 
 
 class WorkSchedule(Base):
@@ -133,18 +119,6 @@ class WorkSchedule(Base):
     slot_duration_minutes: Mapped[int] = mapped_column(Integer, nullable=False, default=60)
 
     master: Mapped["Master"] = relationship(back_populates="schedules")
-
-
-class MasterService(Base):
-    """Связь мастер ↔ услуга (many-to-many)."""
-
-    __tablename__ = "master_services"
-
-    master_id: Mapped[int] = mapped_column(ForeignKey("masters.id"), primary_key=True)
-    service_id: Mapped[int] = mapped_column(ForeignKey("services.id"), primary_key=True)
-
-    master: Mapped["Master"] = relationship(back_populates="services")
-    service: Mapped["Service"] = relationship(back_populates="masters")
 
 
 class AIConversation(Base):
@@ -197,7 +171,6 @@ class Booking(Base):
     client_id: Mapped[int] = mapped_column(ForeignKey("clients.id"), nullable=False)
     master_id: Mapped[int] = mapped_column(ForeignKey("masters.id"), nullable=False)
     slot_id: Mapped[int | None] = mapped_column(ForeignKey("time_slots.id"), nullable=True)
-    service_id: Mapped[int] = mapped_column(ForeignKey("services.id"), nullable=False)
     business_id: Mapped[int] = mapped_column(ForeignKey("businesses.id"), nullable=False, index=True)
     status: Mapped[BookingStatus] = mapped_column(
         Enum(BookingStatus), nullable=False, default=BookingStatus.pending

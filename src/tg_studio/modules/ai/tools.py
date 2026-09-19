@@ -18,8 +18,8 @@ ANALYTICS_TOOLS: list[dict] = [
                 "For staff names use ILIKE with %. "
                 "If the result is zero or ambiguous, make another call — "
                 "fetch the staff list or a different clarifying SELECT. "
-                "If the question is about how many services/staff there are and there are few records — "
-                "select columns for enumeration (name, price, status), not just COUNT(*). "
+                "If the question is about how many masters/bookings there are and there are few records — "
+                "select columns for enumeration (name, status), not just COUNT(*). "
                 "Result: columns, rows (up to 100), row_count, truncated."
             ),
             "parameters": {
@@ -30,8 +30,8 @@ ANALYTICS_TOOLS: list[dict] = [
                         "description": (
                             "A SQL SELECT query. It must contain :business_id. "
                             "Examples:\n"
-                            "- SELECT id, name, price, is_active FROM services "
-                            "WHERE business_id = :business_id ORDER BY name LIMIT 50"
+                            "- SELECT id, full_name FROM masters "
+                            "WHERE business_id = :business_id ORDER BY id LIMIT 50"
                         ),
                     },
                 },

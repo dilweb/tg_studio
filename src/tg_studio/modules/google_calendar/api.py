@@ -1,77 +1,76 @@
 """
-Google Calendar OAuth2 and sync API endpoints.
+Google Calendar service-account connect and sync API endpoints.
 
 Owners can:
-1. GET /api/admin/google-calendar/auth-url — get the OAuth consent URL
-2. GET /api/admin/google-calendar/callback — exchange auth code for tokens
-3. GET /api/admin/google-calendar/status — check connection status
+1. POST /api/admin/google-calendar/connect — connect via the service-account key
+2. GET /api/admin/google-calendar/status — check connection status
+3. POST/DELETE /api/admin/google-calendar/share — share the calendars with the
+   owner's personal Google address (ACL), so bookings are visible there
 4. DELETE /api/admin/google-calendar/disconnect — remove Google Calendar access
 """
-from fastapi import APIRouter, HTTPException, Query
+import json
+
+from fastapi import APIRouter, HTTPException
+from googleapiclient.errors import HttpError
+from sqlalchemy import select
 
 from tg_studio.api.admin_deps import OwnerBusinessDep
 from tg_studio.api.deps import SessionDep
 from tg_studio.db.models import Master
 from tg_studio.modules.google_calendar.client import (
     create_calendar,
-    credentials_to_storage_json,
-    exchange_code,
-    get_auth_url,
-    get_calendar_email,
+    read_service_account_key,
+    share_calendar,
+    unshare_calendar,
+    verify_service_account,
 )
 from tg_studio.modules.google_calendar.schemas import (
-    GoogleCalendarAuthUrlResponse,
+    GoogleCalendarConnectResponse,
+    GoogleCalendarSharedCalendar,
+    GoogleCalendarShareRequest,
+    GoogleCalendarShareResponse,
     GoogleCalendarStatusResponse,
-    GoogleCalendarTokenResponse,
 )
 
 router = APIRouter(prefix="/admin/google-calendar", tags=["admin • google-calendar"])
 
 
-@router.get("/auth-url", response_model=GoogleCalendarAuthUrlResponse)
-async def get_google_auth_url(business: OwnerBusinessDep):
-    """
-    Step 1: Get the Google OAuth2 consent URL.
-
-    The owner must visit this URL in a browser, sign in to their Google account,
-    and grant calendar access. After authorisation, Google redirects to the
-    callback URL with an authorisation code.
-    """
-    state = str(business.id)
-    auth_url = get_auth_url(state=state)
-    return GoogleCalendarAuthUrlResponse(auth_url=auth_url)
-
-
-@router.get("/callback", response_model=GoogleCalendarTokenResponse)
-async def google_callback(
+@router.post("/connect", response_model=GoogleCalendarConnectResponse)
+async def connect_service_account(
     session: SessionDep,
     business: OwnerBusinessDep,
-    code: str = Query(...),
-    state: str | None = Query(None),
 ):
     """
-    Step 2: Exchange the authorisation code for tokens.
+    Connect Google Calendar via the service-account key.
 
-    Google redirects here after the owner grants access.
-    The tokens are stored on the Business record for future use.
+    The key file is read on the server, validated with a live Calendar API call
+    (fails clearly if the key is rejected or the Calendar API is disabled for
+    the project), then stored on the Business record.
     """
-    if state and str(business.id) != state:
-        raise HTTPException(status_code=400, detail="State mismatch — possible CSRF attack")
+    try:
+        key = read_service_account_key()
+    except FileNotFoundError:
+        raise HTTPException(
+            status_code=500, detail="Файл ключа сервисного аккаунта не найден на сервере"
+        ) from None
+    except ValueError:
+        raise HTTPException(
+            status_code=500, detail="Файл ключа сервисного аккаунта повреждён"
+        ) from None
 
     try:
-        creds = exchange_code(code)
+        verify_service_account(key)
+    except HttpError as exc:
+        raise HTTPException(status_code=502, detail=f"Google отклонил ключ: {exc.reason}") from exc
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"Failed to exchange auth code: {exc}")
+        raise HTTPException(status_code=502, detail=f"Не удалось проверить ключ: {exc}") from exc
 
-    email = get_calendar_email(creds)
-    credentials_json = credentials_to_storage_json(creds)
-
-    # Store on the business record
-    business.google_calendar_credentials_json = credentials_json
+    email = key.get("client_email", "")
+    business.google_calendar_credentials_json = json.dumps(key, ensure_ascii=False)
     business.google_calendar_email = email
     await session.commit()
 
-    return GoogleCalendarTokenResponse(email=email, status="connected")
+    return GoogleCalendarConnectResponse(email=email, status="connected")
 
 
 @router.get("/status", response_model=GoogleCalendarStatusResponse)
@@ -81,8 +80,93 @@ async def google_calendar_status(business: OwnerBusinessDep):
         return GoogleCalendarStatusResponse(
             connected=True,
             email=business.google_calendar_email,
+            share_email=business.google_share_email,
         )
     return GoogleCalendarStatusResponse(connected=False)
+
+
+async def _business_master_calendars(session, business_id: int) -> list[str]:
+    """Master calendar IDs — the only calendars that can be shared (an SA
+    primary calendar cannot be shared at all: Google returns 403)."""
+    result = await session.execute(
+        select(Master.google_calendar_id).where(
+            Master.business_id == business_id,
+            Master.google_calendar_id.is_not(None),
+        )
+    )
+    return list(result.scalars().all())
+
+
+@router.post("/share", response_model=GoogleCalendarShareResponse)
+async def share_google_calendar(
+    body: GoogleCalendarShareRequest,
+    session: SessionDep,
+    business: OwnerBusinessDep,
+):
+    """
+    Share every master calendar with the owner's personal Google address.
+    The address is remembered so future master calendars are shared
+    automatically.
+    """
+    if not business.google_calendar_credentials_json:
+        raise HTTPException(status_code=400, detail="Google Calendar не подключен для этого бизнеса")
+
+    email = str(body.email).lower()
+    calendar_ids = await _business_master_calendars(session, business.id)
+    if not calendar_ids:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Нет календарей мастеров — создайте их в разделе «Мастера». "
+                "Записи мастеров без календаря попадают в primary сервисного "
+                "аккаунта, который Google расшарить не позволяет."
+            ),
+        )
+
+    shared = []
+    for calendar_id in calendar_ids:
+        try:
+            await share_calendar(
+                business.google_calendar_credentials_json, calendar_id, email, body.role
+            )
+            shared.append(GoogleCalendarSharedCalendar(calendar_id=calendar_id, ok=True))
+        except HttpError as exc:
+            shared.append(
+                GoogleCalendarSharedCalendar(calendar_id=calendar_id, ok=False, error=exc.reason)
+            )
+        except Exception as exc:  # сеть и прочие сбои — не валим весь запрос
+            shared.append(
+                GoogleCalendarSharedCalendar(calendar_id=calendar_id, ok=False, error=str(exc))
+            )
+
+    if not any(item.ok for item in shared):
+        raise HTTPException(
+            status_code=502, detail=f"Google не принял доступ: {shared[0].error}"
+        ) from None
+
+    business.google_share_email = email
+    await session.commit()
+    return GoogleCalendarShareResponse(email=email, shared=shared)
+
+
+@router.delete("/share", status_code=204)
+async def unshare_google_calendar(
+    session: SessionDep,
+    business: OwnerBusinessDep,
+):
+    """Revoke the personal address's access to all business calendars."""
+    if not business.google_calendar_credentials_json or not business.google_share_email:
+        return
+
+    calendar_ids = await _business_master_calendars(session, business.id)
+    for calendar_id in calendar_ids:
+        try:
+            await unshare_calendar(business.google_calendar_credentials_json, calendar_id)
+        except HttpError:
+            continue  # best-effort: правило могло быть уже снято вручную
+
+    business.google_share_email = None
+    await session.commit()
 
 
 @router.delete("/disconnect", status_code=204)
@@ -90,9 +174,18 @@ async def disconnect_google_calendar(
     session: SessionDep,
     business: OwnerBusinessDep,
 ):
-    """Remove stored Google Calendar credentials."""
+    """Remove stored Google Calendar credentials and the personal share."""
+    if business.google_calendar_credentials_json and business.google_share_email:
+        calendar_ids = await _business_master_calendars(session, business.id)
+        for calendar_id in calendar_ids:
+            try:
+                await unshare_calendar(business.google_calendar_credentials_json, calendar_id)
+            except HttpError:
+                continue  # best-effort: ключ мог стать невалидным
+
     business.google_calendar_credentials_json = None
     business.google_calendar_email = None
+    business.google_share_email = None
     await session.commit()
 
 
@@ -103,10 +196,10 @@ async def create_master_calendar(
     business: OwnerBusinessDep,
 ):
     """
-    Create a dedicated secondary calendar for a master, within the business's
-    connected Google account, and store its ID on the master.
+    Create a dedicated secondary calendar for a master, within the connected
+    service account, and store its ID on the master.
 
-    Requires the business to already be connected (POST .../callback first).
+    Requires the business to already be connected (POST .../connect first).
     """
     if not business.google_calendar_credentials_json:
         raise HTTPException(status_code=400, detail="Google Calendar не подключен для этого бизнеса")
@@ -122,5 +215,22 @@ async def create_master_calendar(
         raise HTTPException(status_code=502, detail="Не удалось создать календарь в Google")
 
     master.google_calendar_id = calendar_id
+
+    # Новый календарь сразу виден владельцу, если шаринг уже настроен
+    share_error = None
+    if business.google_share_email:
+        try:
+            await share_calendar(
+                business.google_calendar_credentials_json,
+                calendar_id,
+                business.google_share_email,
+            )
+        except Exception as exc:
+            share_error = str(exc)
+
     await session.commit()
-    return {"master_id": master.id, "google_calendar_id": calendar_id}
+    return {
+        "master_id": master.id,
+        "google_calendar_id": calendar_id,
+        "share_error": share_error,
+    }

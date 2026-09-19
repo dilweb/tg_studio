@@ -8,7 +8,6 @@ import BusinessView from '../views/BusinessView.vue'
 import LoginView from '../views/LoginView.vue'
 import MastersView from '../views/MastersView.vue'
 import ScheduleView from '../views/ScheduleView.vue'
-import ServicesView from '../views/ServicesView.vue'
 
 // Разделы с готовым бэкендом получают свои view, остальное — заглушка.
 // Важно: у child-роутов vue-router 4.6 обязан быть компонент (или name/redirect),
@@ -18,7 +17,6 @@ const sectionComponents = {
   dashboard: PlaceholderSection,
   bookings: BookingsView,
   masters: MastersView,
-  services: ServicesView,
   schedule: ScheduleView,
   business: BusinessView,
   'my-bookings': BookingsView,
@@ -62,7 +60,11 @@ router.beforeEach((to) => {
     return to.name === 'login' ? true : '/login'
   }
   if (to.name === 'login') {
-    return firstSectionPath(authStore.me.role)
+    const first = firstSectionPath(authStore.me.role)
+    // Если разделов у роли нет (напр., протухший кэш со старой ролью 'admin'),
+    // повторный редирект на /login — это бесконечный redirect: навигация
+    // падает, router-view пустой, чёрный экран. Остаёмся на /login.
+    return first === to.fullPath ? true : first
   }
   // Свой раздел или раздел своей роли
   if (to.meta.roles) {

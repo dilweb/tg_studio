@@ -8,11 +8,6 @@ export const BOOKING_STATUS = {
   cancelled: { label: 'Отменена', tone: 'red' },
 }
 
-export const SERVICE_TYPE = {
-  appointment: 'По записи',
-  project: 'Проект',
-}
-
 export const STATUS_FILTERS = [
   { value: '', label: 'Все статусы' },
   { value: 'pending', label: 'Ожидает оплаты' },

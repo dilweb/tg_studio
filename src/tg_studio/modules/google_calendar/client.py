@@ -1,16 +1,17 @@
 """
 Google Calendar API client wrapper.
 
-Handles OAuth2 token lifecycle and provides a thin wrapper
-around the google-api-python-client for calendar operations.
+Google Calendar is accessed with a service account key (bnztattoo project):
+the key JSON is stored on the Business record and credentials self-refresh
+via JWT — no OAuth consent flow involved.
 """
 import json
 from datetime import datetime
 from pathlib import Path
 
 from google.auth.transport.requests import Request
+from google.oauth2 import service_account
 from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import Flow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
@@ -19,88 +20,48 @@ from tg_studio.config import settings
 # Full read/write access to Google Calendar
 SCOPES = ["https://www.googleapis.com/auth/calendar"]
 
-# Path to the OAuth 2.0 Client ID file downloaded from Google Cloud Console
+# Path to the service-account key file downloaded from Google Cloud Console
 _CREDENTIALS_FILE = Path(settings.google_calendar_credentials_path)
 
 
-def _make_flow() -> Flow:
-    """Create a Flow from the client secrets file with the configured redirect URI."""
-    flow = Flow.from_client_secrets_file(
-        str(_CREDENTIALS_FILE),
-        scopes=SCOPES,
-        redirect_uri=settings.google_calendar_redirect_uri,
-    )
-    return flow
+def read_service_account_key() -> dict:
+    """Read the service-account key file (called once at connect time)."""
+    return json.loads(_CREDENTIALS_FILE.read_text(encoding="utf-8"))
+
+
+def verify_service_account(key: dict) -> None:
+    """
+    Check the key against Google before storing it: key is valid and the
+    Calendar API is enabled for its project. Raises HttpError otherwise.
+    """
+    creds = service_account.Credentials.from_service_account_info(key, scopes=SCOPES)
+    service = build("calendar", "v3", credentials=creds)
+    service.calendarList().list(maxResults=1).execute()
 
 
 def _load_credentials(credentials_json: str | None) -> Credentials | None:
-    """Restore a Credentials object from its JSON representation."""
+    """
+    Restore a Credentials object from its JSON representation.
+
+    Stored JSON is normally a service-account key; the authorized-user branch
+    stays for graceful reading of legacy OAuth-token rows.
+    """
     if not credentials_json:
         return None
     try:
-        return Credentials.from_authorized_user_info(json.loads(credentials_json), SCOPES)
+        info = json.loads(credentials_json)
+        if info.get("type") == "service_account":
+            return service_account.Credentials.from_service_account_info(info, scopes=SCOPES)
+        return Credentials.from_authorized_user_info(info, SCOPES)
     except (ValueError, KeyError):
         return None
 
 
-def _credentials_to_json(creds: Credentials) -> str:
-    """Serialise a Credentials object to JSON for storage."""
-    data = {
-        "token": creds.token,
-        "refresh_token": creds.refresh_token,
-        "token_uri": creds.token_uri,
-        "client_id": creds.client_id,
-        "client_secret": creds.client_secret,
-        "scopes": creds.scopes,
-    }
-    return json.dumps(data, ensure_ascii=False)
-
-
-def get_auth_url(state: str | None = None) -> str:
-    """
-    Generate the Google OAuth2 consent URL.
-
-    The owner must visit this URL, sign in, and grant access.
-    After granting, Google redirects to the redirect_uri with an auth code.
-    """
-    flow = _make_flow()
-
-    authorization_url, _ = flow.authorization_url(
-        access_type="offline",
-        include_granted_scopes="true",
-        prompt="consent",
-        state=state,
-    )
-    return authorization_url
-
-
-def exchange_code(authorization_code: str) -> Credentials:
-    """
-    Exchange the OAuth2 authorization code for tokens.
-
-    Returns a Credentials object that can be serialised and stored.
-    """
-    flow = _make_flow()
-    flow.fetch_token(code=authorization_code)
-    return flow.credentials
-
-
 def refresh_if_expired(creds: Credentials) -> Credentials:
-    """Refresh the access token if it has expired."""
-    if creds and creds.expired and creds.refresh_token:
+    """Refresh the access token if it has expired (SA keys re-sign the JWT)."""
+    if creds and creds.expired:
         creds.refresh(Request())
     return creds
-
-
-def get_calendar_email(creds: Credentials) -> str:
-    """
-    Retrieve the primary email address associated with the authorised account.
-    Uses the Google People API or the token info endpoint.
-    """
-    refresh_if_expired(creds)
-    service = build("oauth2", "v2", credentials=creds)
-    user_info = service.userinfo().get().execute()
-    return user_info.get("email", "")
 
 
 async def create_event(
@@ -303,6 +264,48 @@ async def create_calendar(credentials_json: str, summary: str) -> str | None:
         return None
 
 
-def credentials_to_storage_json(creds: Credentials) -> str:
-    """Convert Credentials to JSON string for DB storage."""
-    return _credentials_to_json(creds)
+async def share_calendar(
+    credentials_json: str,
+    calendar_id: str,
+    email: str,
+    role: str = "writer",
+) -> None:
+    """
+    Grant a personal address access to `calendar_id` (ACL rule), so bookings
+    made inside the service account become visible in the owner's own Google
+    Calendar. Raises HttpError on failure.
+
+    Any previous personal rule is replaced, so the calendar is shared with
+    exactly one address. Ownership rules (the SA's own access) are never touched.
+    """
+    creds = refresh_if_expired(_load_credentials(credentials_json))
+    service = build("calendar", "v3", credentials=creds)
+
+    rules = service.acl().list(calendarId=calendar_id).execute().get("items", [])
+    for rule in rules:
+        scope = rule.get("scope", {})
+        if rule.get("role") == "owner":
+            continue  # владение SA снимать нельзя — потеряем управление календарём
+        if scope.get("type") == "user" and scope.get("value", "").lower() != email.lower():
+            service.acl().delete(calendarId=calendar_id, ruleId=rule["id"]).execute()
+
+    service.acl().insert(
+        calendarId=calendar_id,
+        body={"role": role, "scope": {"type": "user", "value": email}},
+        sendNotifications=True,
+    ).execute()
+
+
+async def unshare_calendar(credentials_json: str, calendar_id: str) -> None:
+    """
+    Revoke all personal ACL rules from `calendar_id` (ownership rules are kept).
+    Raises HttpError on failure.
+    """
+    creds = refresh_if_expired(_load_credentials(credentials_json))
+    service = build("calendar", "v3", credentials=creds)
+
+    rules = service.acl().list(calendarId=calendar_id).execute().get("items", [])
+    for rule in rules:
+        scope = rule.get("scope", {})
+        if scope.get("type") == "user" and rule.get("role") != "owner":
+            service.acl().delete(calendarId=calendar_id, ruleId=rule["id"]).execute()

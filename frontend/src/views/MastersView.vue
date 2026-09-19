@@ -1,10 +1,9 @@
 <script setup>
-import { computed, onMounted, reactive, ref } from 'vue'
+import { onMounted, reactive, ref } from 'vue'
 
 import { api } from '../api/client'
 
 const masters = ref([])
-const services = ref([])
 const loading = ref(true)
 const error = ref('')
 const saving = ref(false)
@@ -19,22 +18,13 @@ const form = reactive({
   full_name: '',
   description: '',
   telegram_id: '',
-  service_ids: [],
-})
-
-const serviceName = computed(() => {
-  const byId = new Map(services.value.map((s) => [s.id, s]))
-  return (id) => byId.get(id)?.name ?? `услуга #${id}`
 })
 
 async function load() {
   loading.value = true
   error.value = ''
   try {
-    // Услуги нужны для чекбоксов формы и названий в списке мастеров
-    const [m, s] = await Promise.all([api.get('/api/admin/masters'), api.get('/api/admin/services')])
-    masters.value = m
-    services.value = s
+    masters.value = await api.get('/api/admin/masters')
   } catch (err) {
     error.value = err.detail ?? err.message
   } finally {
@@ -44,7 +34,7 @@ async function load() {
 
 function openCreate() {
   editingId.value = null
-  Object.assign(form, { full_name: '', description: '', telegram_id: '', service_ids: [] })
+  Object.assign(form, { full_name: '', description: '', telegram_id: '' })
   error.value = ''
   showForm.value = true
 }
@@ -55,16 +45,9 @@ function openEdit(m) {
     full_name: m.full_name,
     description: m.description ?? '',
     telegram_id: m.telegram_id === null || m.telegram_id === undefined ? '' : String(m.telegram_id),
-    service_ids: [...m.service_ids],
   })
   error.value = ''
   showForm.value = true
-}
-
-function toggleService(id) {
-  const i = form.service_ids.indexOf(id)
-  if (i === -1) form.service_ids.push(id)
-  else form.service_ids.splice(i, 1)
 }
 
 async function submit() {
@@ -86,7 +69,6 @@ async function submit() {
         full_name: form.full_name.trim(),
         description: form.description.trim(),
         telegram_id: tg,
-        service_ids: [...form.service_ids],
       })
     } else {
       // PATCH не принимает null для telegram_id (null = «не менять»),
@@ -97,9 +79,6 @@ async function submit() {
       }
       if (tg !== null) patch.telegram_id = tg
       await api.patch(`/api/admin/masters/${editingId.value}`, patch)
-      await api.put(`/api/admin/masters/${editingId.value}/services`, {
-        service_ids: [...form.service_ids],
-      })
     }
     showForm.value = false
     await load()
@@ -192,20 +171,6 @@ onMounted(load)
         <textarea id="m-desc" v-model="form.description" rows="2"></textarea>
       </div>
 
-      <div class="field">
-        <label>Услуги мастера</label>
-        <div v-if="!services.length" class="muted" style="font-size: 13px">
-          Сначала добавьте услуги в разделе «Услуги»
-        </div>
-        <div v-else style="display: flex; flex-direction: column; gap: 8px">
-          <label v-for="s in services" :key="s.id" class="checkbox-row">
-            <input type="checkbox" :checked="form.service_ids.includes(s.id)" @change="toggleService(s.id)" />
-            <span>{{ s.name }}</span>
-            <span class="muted">— {{ s.price }} ₸</span>
-          </label>
-        </div>
-      </div>
-
       <div style="display: flex; gap: 10px">
         <button class="btn btn-primary" type="submit" :disabled="saving">
           {{ saving ? 'Сохраняем…' : editingId === null ? 'Создать' : 'Сохранить' }}
@@ -219,7 +184,7 @@ onMounted(load)
     <div v-else-if="!masters.length" class="card">
       <div class="empty-state">
         <div class="empty-title">Мастеров пока нет</div>
-        <div>Добавьте первого мастера и привяжите к нему услуги</div>
+        <div>Добавьте первого мастера — записи и расписание появятся после этого</div>
         <button class="btn btn-primary btn-sm" @click="openCreate">+ Добавить мастера</button>
       </div>
     </div>
@@ -229,7 +194,6 @@ onMounted(load)
         <thead>
           <tr>
             <th>Мастер</th>
-            <th>Услуги</th>
             <th>Telegram</th>
             <th>Календарь</th>
             <th>Статус</th>
@@ -242,12 +206,6 @@ onMounted(load)
               <td>
                 <div>{{ m.full_name }}</div>
                 <div v-if="m.description" class="muted" style="font-size: 12px">{{ m.description }}</div>
-              </td>
-              <td>
-                <div v-if="m.service_ids.length" class="chips">
-                  <span v-for="id in m.service_ids" :key="id" class="chip">{{ serviceName(id) }}</span>
-                </div>
-                <span v-else class="muted">—</span>
               </td>
               <td>
                 <template v-if="m.telegram_id">
@@ -285,7 +243,7 @@ onMounted(load)
               </td>
             </tr>
             <tr v-if="regLinks[m.id]">
-              <td colspan="6" style="background: rgba(108, 99, 255, 0.05)">
+              <td colspan="5" style="background: rgba(108, 99, 255, 0.05)">
                 <div class="link-box" style="margin-top: 0">
                   <span class="link-text">
                     {{ regLinks[m.id].link ?? regLinks[m.id].payload }}

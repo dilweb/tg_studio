@@ -9,7 +9,7 @@ from datetime import datetime, timedelta
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from tg_studio.db.models import Business, Master, Service, WorkSchedule
+from tg_studio.db.models import Business, Master, WorkSchedule
 from tg_studio.modules.google_calendar.client import (
     cancel_event,
     create_event,
@@ -31,13 +31,6 @@ async def _get_master(session: AsyncSession, business_id: int, master_id: int) -
     return master
 
 
-async def _get_service(session: AsyncSession, business_id: int, service_id: int) -> Service:
-    service = await session.get(Service, service_id)
-    if not service or service.business_id != business_id:
-        raise BookingError("Услуга не найдена")
-    return service
-
-
 async def _slot_duration_minutes(session: AsyncSession, master_id: int, start: datetime) -> int:
     result = await session.execute(
         select(WorkSchedule.slot_duration_minutes).where(
@@ -52,7 +45,7 @@ def _event_to_booking(event: dict) -> dict:
     return {
         "event_id": event["id"],
         "master_id": int(props["master_id"]) if "master_id" in props else None,
-        "service_id": int(props["service_id"]) if "service_id" in props else None,
+        "service_name": props.get("service_name") or None,
         "client_name": props.get("client_name") or None,
         "client_phone": props.get("client_phone") or None,
         "starts_at": event["start"].get("dateTime", event["start"].get("date")),
@@ -65,16 +58,15 @@ async def create_booking(
     session: AsyncSession,
     business: Business,
     master_id: int,
-    service_id: int,
     start_datetime: datetime,
     client_name: str,
     client_phone: str | None = None,
+    service_name: str | None = None,
 ) -> dict:
     if not business.google_calendar_credentials_json:
         raise BookingError("Google Calendar не подключен для этого бизнеса")
 
     master = await _get_master(session, business.id, master_id)
-    service = await _get_service(session, business.id, service_id)
     calendar_id = master.google_calendar_id or "primary"
 
     duration = await _slot_duration_minutes(session, master_id, start_datetime)
@@ -91,16 +83,19 @@ async def create_booking(
 
     event_id = await create_event(
         credentials_json=business.google_calendar_credentials_json,
-        summary=f"{service.name} — {client_name}",
-        description=f"Услуга: {service.name}\nКлиент: {client_name}\nТелефон: {client_phone or '—'}",
+        summary=f"{service_name} — {client_name}" if service_name else client_name,
+        description=(
+            (f"Услуга: {service_name}\n" if service_name else "")
+            + f"Клиент: {client_name}\nТелефон: {client_phone or '—'}"
+        ),
         start_datetime=start_datetime.isoformat(),
         end_datetime=end_datetime.isoformat(),
         calendar_id=calendar_id,
         extended_properties={
             "master_id": str(master_id),
-            "service_id": str(service_id),
             "client_name": client_name,
             "client_phone": client_phone or "",
+            **({"service_name": service_name} if service_name else {}),
         },
     )
     if not event_id:
@@ -109,12 +104,12 @@ async def create_booking(
     return {
         "event_id": event_id,
         "master_id": master_id,
-        "service_id": service_id,
+        "service_name": service_name,
         "client_name": client_name,
         "client_phone": client_phone,
         "starts_at": start_datetime.isoformat(),
         "ends_at": end_datetime.isoformat(),
-        "summary": f"{service.name} — {client_name}",
+        "summary": f"{service_name} — {client_name}" if service_name else client_name,
     }
 
 

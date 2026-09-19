@@ -5,10 +5,16 @@ import { fetchMe, hasInitData } from '../api/client'
 const ME_KEY = 'tg_studio.me'
 const DEBUG_ID_KEY = 'tg_studio.debugUserId'
 
+// Роли, которые понимает роутер (nav.js). Всё остальное — протухший кэш
+// со старой схемы ролей: его выбрасываем, иначе guard уводит в /login и зацикливается.
+const VALID_ROLES = new Set(['owner', 'master'])
+
 function loadMe() {
   try {
     const raw = localStorage.getItem(ME_KEY)
-    return raw ? JSON.parse(raw) : null
+    const me = raw ? JSON.parse(raw) : null
+    if (me && !VALID_ROLES.has(me.role)) return null
+    return me
   } catch {
     return null
   }

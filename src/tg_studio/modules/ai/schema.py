@@ -39,19 +39,6 @@ Use it as `WHERE business_id = :business_id`.
 - description (text)
 - is_active (bool)
 
-### services
-- id (int, PK)
-- business_id (int, FK → businesses.id)
-- name (varchar)
-- description (text)
-- service_type (enum: 'appointment', 'project')
-- price (decimal)
-- is_active (bool)
-
-### master_services (master ↔ service, M2M)
-- master_id (int, FK → masters.id, PK)
-- service_id (int, FK → services.id, PK)
-
 ### work_schedules (master's weekly schedule)
 - id (int, PK)
 - master_id (int, FK → masters.id)
@@ -61,7 +48,6 @@ Use it as `WHERE business_id = :business_id`.
 - slot_duration_minutes (int)
 
 ## Key JOIN relationships
-- masters ↔ services via master_services (M2M)
 - masters → work_schedules (schedule)
 
 ## Searching staff by name

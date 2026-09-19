@@ -26,7 +26,7 @@ async def sync_booking_to_calendar(
     Returns the Google Calendar event ID, or None on failure.
     """
     if not booking.slot:
-        return None
+        return None #странно что тут просто глотаем тихо
 
     summary = f"{service_name} — {client_name} @ {master_name}"
     description = (

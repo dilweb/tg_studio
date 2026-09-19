@@ -3,7 +3,10 @@ Authentication module.
 
 Supports two auth strategies:
 - JWT Bearer tokens (web panel for owners/masters)
-- Telegram initData HMAC (Mini App fallback for owners/masters)
+- Telegram initData HMAC (Mini App: подпись валидируется, роль берётся из ALLOWED_USERS)
+
+Доступ и роли решает env ALLOWED_USERS (JSON: [{"id": <tg_id>, "role": "owner"|"master"}]).
+Соответствующая строка User в БД создаётся/синхронизируется автоматически.
 
 Clients authenticate via Telegram bot natively (telegram_id from message.from_user.id).
 """
@@ -189,6 +192,53 @@ def _validate_init_data(init_data: str, bot_token: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# ALLOWED_USERS: доступ в панель решает env, БД-юзер подтягивается автоматически
+# ---------------------------------------------------------------------------
+
+def resolve_allowed_role(tg_id: int) -> UserRole | None:
+    for entry in settings.allowed_users:
+        if entry.id == tg_id:
+            return UserRole(entry.role)
+    return None
+
+
+async def _provision_allowed_user(
+    session: AsyncSession,
+    tg_user: dict,
+    role: UserRole,
+) -> User:
+    """Найти или создать User по telegram_id; роль всегда синхронизируем с env."""
+    result = await session.execute(
+        select(User).where(User.telegram_id == tg_user["id"])
+    )
+    user = result.scalar_one_or_none()
+    changed = False
+    if user is None:
+        user = User(
+            telegram_id=tg_user["id"],
+            first_name=tg_user.get("first_name") or f"tg-{tg_user['id']}",
+            last_name=tg_user.get("last_name"),
+            role=role,
+        )
+        session.add(user)
+        changed = True
+    else:
+        if user.role != role:  # env — источник правды по роли
+            user.role = role
+            changed = True
+        if not user.is_active:
+            user.is_active = True
+            changed = True
+        if not user.first_name and tg_user.get("first_name"):
+            user.first_name = tg_user["first_name"]
+            changed = True
+    if changed:
+        await session.flush()
+        await session.commit()
+    return user
+
+
+# ---------------------------------------------------------------------------
 # FastAPI dependencies
 # ---------------------------------------------------------------------------
 
@@ -198,7 +248,7 @@ _UNVERIFIED_ALLOWED_PATHS = frozenset({
 
 
 def smtp_configured() -> bool:
-    return bool(settings.smtp_user and settings.smtp_password and settings.api_public_url)
+    return bool(settings.smtp_user and settings.smtp_password and settings.public_url)
 
 
 def _require_email_verified_if_applicable(request: Request, user: User) -> None:
@@ -222,15 +272,32 @@ async def get_current_user(
     """
     Unified auth dependency. Accepts either:
     - Bearer <JWT>           — web panel login
-    - TelegramInitData <...> — Mini App fallback
+    - TelegramInitData <...> — Mini App (роль из ALLOWED_USERS)
     """
-    # Debug mode stub
+    # Debug mode (браузерный дев без initData): X-Debug-User-Id или первый из ALLOWED_USERS
     if settings.debug and credentials is None and authorization is None:
-        result = await session.execute(select(User).limit(1))
-        user = result.scalar_one_or_none()
-        if user:
-            return user
-        raise HTTPException(status_code=401, detail="No users in DB (debug mode)")
+        raw_debug_id = request.headers.get("X-Debug-User-Id")
+        if raw_debug_id:
+            try:
+                debug_tg_id = int(raw_debug_id)
+            except ValueError:
+                raise HTTPException(status_code=400, detail="Invalid X-Debug-User-Id") from None
+        elif settings.allowed_users:
+            debug_tg_id = settings.allowed_users[0].id
+        else:
+            raise HTTPException(
+                status_code=401,
+                detail="No credentials and ALLOWED_USERS is empty (set X-Debug-User-Id)",
+            )
+        role = resolve_allowed_role(debug_tg_id)
+        if role is None:
+            raise HTTPException(
+                status_code=403,
+                detail=f"tg_id {debug_tg_id} отсутствует в ALLOWED_USERS",
+            )
+        return await _provision_allowed_user(
+            session, {"id": debug_tg_id, "first_name": f"Debug {debug_tg_id}"}, role
+        )
 
     # Path 1: JWT Bearer or HttpOnly access cookie
     bearer_or_cookie: str | None = None
@@ -253,23 +320,17 @@ async def get_current_user(
         _require_email_verified_if_applicable(request, user)
         return user
 
-    # Path 2: Telegram initData (Mini App fallback)
+    # Path 2: Telegram initData (Mini App) — tg_id матчим с ALLOWED_USERS
     if authorization and authorization.startswith("TelegramInitData "):
         init_data = authorization.removeprefix("TelegramInitData ")
         tg_user = _validate_init_data(init_data, settings.bot_token)
-        result = await session.execute(
-            select(User).where(
-                User.telegram_id == tg_user["id"],
-                User.is_active.is_(True),
-            )
-        )
-        user = result.scalar_one_or_none()
-        if not user:
+        role = resolve_allowed_role(tg_user["id"])
+        if role is None:
             raise HTTPException(
-                status_code=401,
-                detail="Telegram user not linked to any account",
+                status_code=403,
+                detail="Этот Telegram-аккаунт не добавлен в ALLOWED_USERS",
             )
-        _require_email_verified_if_applicable(request, user)
+        user = await _provision_allowed_user(session, tg_user, role)
         return user
 
     raise HTTPException(

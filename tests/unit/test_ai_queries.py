@@ -8,7 +8,7 @@ from tg_studio.modules.ai.queries import validate_sql
 class TestValidateSQL:
     def test_valid_simple_select_with_placeholder(self) -> None:
         ok, err = validate_sql(
-            "SELECT COUNT(*) AS cnt FROM services WHERE business_id = :business_id"
+            "SELECT COUNT(*) AS cnt FROM bookings WHERE business_id = :business_id"
         )
         assert ok is True
         assert err == ""
@@ -39,7 +39,7 @@ class TestValidateSQL:
     @pytest.mark.parametrize(
         "sql",
         [
-            "SELECT * FROM services",
+            "SELECT * FROM bookings",
         ],
     )
     def test_requires_business_id_placeholder(self, sql: str) -> None:

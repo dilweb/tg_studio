@@ -8,6 +8,7 @@ from fastapi import APIRouter, HTTPException, Query
 
 from tg_studio.api.admin_deps import MasterBusinessAndSelfDep
 from tg_studio.api.deps import SessionDep
+from tg_studio.modules.booking.registry import SERVICE_TYPES
 from tg_studio.modules.booking.schemas import BookingCreate, BookingResponse
 from tg_studio.modules.booking.service import (
     BookingError,
@@ -18,6 +19,14 @@ from tg_studio.modules.booking.service import (
 from tg_studio.modules.scheduling.service import TZ
 
 router = APIRouter(prefix="/admin/bookings", tags=["admin • bookings"])
+
+public_router = APIRouter(prefix="/bookings", tags=["bookings"])
+
+
+@public_router.get("/service-types", response_model=list[str])
+async def list_service_types():
+    """Реестр типов работ — подсказки для формы записи и AI-агента."""
+    return SERVICE_TYPES
 
 MAX_DAYS_RANGE = 60
 
@@ -67,10 +76,10 @@ async def post_booking(body: BookingCreate, session: SessionDep, ctx: MasterBusi
             session,
             business,
             master_id=master_id,
-            service_id=body.service_id,
             start_datetime=_localize(body.start_datetime),
             client_name=body.client_name,
             client_phone=body.client_phone,
+            service_name=body.service_name,
         )
     except BookingError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc

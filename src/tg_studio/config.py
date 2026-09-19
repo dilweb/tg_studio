@@ -1,7 +1,18 @@
 from typing import Literal, Self
 
-from pydantic import model_validator
+from pydantic import BaseModel, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class AllowedUser(BaseModel):
+    """Запись в ALLOWED_USERS: Telegram id → роль в панели.
+
+    Env-значение — JSON-массив, pydantic-settings парсит его сам:
+    ALLOWED_USERS=[{"id":228553615,"role":"owner"},{"id":222222222,"role":"master"}]
+    """
+
+    id: int  # telegram_id
+    role: Literal["owner", "master"]
 
 
 class Settings(BaseSettings):
@@ -15,6 +26,10 @@ class Settings(BaseSettings):
     bot_token: str
     bot_username: str = ""  # без @, для ссылки регистрации мастера (t.me/bot_username?start=...)
     miniapp_url: str = "https://localhost:3000"
+
+    # Кто допущен в панель (миниаппа/дебаг): telegram id → роль.
+    # Источник правды по доступу и ролям — окружение, БД только отражает его.
+    allowed_users: list[AllowedUser] = []
 
     # Database
     database_url: str = "postgresql+asyncpg://tg_studio:secret@localhost:5432/tg_studio"

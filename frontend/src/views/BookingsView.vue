@@ -8,7 +8,7 @@ import { formatDateTime } from '../utils/format'
 const isMaster = computed(() => authStore.me?.role === 'master')
 
 const masters = ref([])
-const services = ref([])
+const serviceTypes = ref([])
 const items = ref([])
 const masterId = ref(null)
 
@@ -29,15 +29,15 @@ function inDays(n) {
 const range = reactive({ from_date: todayISO(), to_date: inDays(14) })
 
 const form = reactive({
-  service_id: '',
+  service_name: '',
   date: todayISO(),
   time: '10:00',
   client_name: '',
   client_phone: '',
 })
 
-async function loadServices() {
-  services.value = masterId.value ? await api.get(`/api/slots/masters/${masterId.value}/services`) : []
+async function loadServiceTypes() {
+  serviceTypes.value = await api.get('/api/bookings/service-types')
 }
 
 async function loadBookings() {
@@ -57,7 +57,6 @@ async function loadBookings() {
 
 async function selectMaster(id) {
   masterId.value = Number(id)
-  await loadServices()
   await loadBookings()
 }
 
@@ -65,13 +64,13 @@ async function load() {
   loading.value = true
   error.value = ''
   try {
+    await loadServiceTypes()
     if (isMaster.value) {
       masterId.value = authStore.me.master_id
       if (!masterId.value) {
         error.value = 'Профиль мастера не найден'
         return
       }
-      await loadServices()
       await loadBookings()
     } else {
       masters.value = await api.get('/api/admin/masters')
@@ -85,10 +84,6 @@ async function load() {
 }
 
 async function submit() {
-  if (!form.service_id) {
-    error.value = 'Выберите услугу'
-    return
-  }
   if (!form.client_name.trim()) {
     error.value = 'Введите имя клиента'
     return
@@ -98,12 +93,12 @@ async function submit() {
   try {
     await api.post('/api/admin/bookings', {
       master_id: masterId.value,
-      service_id: Number(form.service_id),
+      service_name: form.service_name.trim() || null,
       start_datetime: `${form.date}T${form.time}:00`,
       client_name: form.client_name.trim(),
       client_phone: form.client_phone.trim() || null,
     })
-    Object.assign(form, { service_id: '', client_name: '', client_phone: '' })
+    Object.assign(form, { service_name: '', client_name: '', client_phone: '' })
     await loadBookings()
   } catch (err) {
     error.value = err.detail ?? err.message
@@ -152,16 +147,19 @@ onMounted(load)
       </div>
 
       <form class="card" style="margin-bottom: 16px" @submit.prevent="submit">
-        <div v-if="!services.length" class="muted" style="font-size: 13px">
-          У этого мастера пока нет услуг — добавьте их в разделе «Услуги»
-        </div>
-        <div v-else class="form-grid">
+        <div class="form-grid">
           <div class="field">
-            <label for="b-service">Услуга</label>
-            <select id="b-service" v-model="form.service_id">
-              <option value="" disabled>Выберите услугу</option>
-              <option v-for="s in services" :key="s.id" :value="s.id">{{ s.name }} — {{ s.price }} ₸</option>
-            </select>
+            <label for="b-service">Тип работы</label>
+            <input
+              id="b-service"
+              v-model="form.service_name"
+              list="service-type-options"
+              placeholder="необязательно"
+              autocomplete="off"
+            />
+            <datalist id="service-type-options">
+              <option v-for="t in serviceTypes" :key="t" :value="t" />
+            </datalist>
           </div>
           <div class="field">
             <label for="b-date">Дата</label>
@@ -180,7 +178,7 @@ onMounted(load)
             <input id="b-phone" v-model="form.client_phone" placeholder="необязательно" autocomplete="off" />
           </div>
         </div>
-        <button v-if="services.length" class="btn btn-primary" type="submit" :disabled="saving">
+        <button class="btn btn-primary" type="submit" :disabled="saving">
           {{ saving ? 'Создаём…' : 'Создать запись' }}
         </button>
       </form>
@@ -209,6 +207,7 @@ onMounted(load)
               </td>
               <td>
                 <div>{{ b.client_name }}</div>
+                <div v-if="b.service_name" class="muted" style="font-size: 12px">{{ b.service_name }}</div>
                 <div v-if="b.client_phone" class="muted" style="font-size: 12px">{{ b.client_phone }}</div>
               </td>
               <td style="text-align: right; white-space: nowrap">

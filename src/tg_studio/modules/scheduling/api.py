@@ -6,7 +6,7 @@ from sqlalchemy.orm import selectinload
 
 from tg_studio.api.admin_deps import OwnerBusinessDep
 from tg_studio.api.deps import SessionDep
-from tg_studio.db.models import Master, MasterService, Service, WorkSchedule
+from tg_studio.db.models import Master, WorkSchedule
 from tg_studio.modules.google_calendar.client import get_busy_periods
 from tg_studio.modules.scheduling.schemas import WEEKDAY_NAMES, ScheduleEntry, ScheduleResponse
 from tg_studio.modules.scheduling.service import TZ, get_available_slots
@@ -45,24 +45,6 @@ _public = APIRouter(prefix="/slots", tags=["slots"])
 async def list_masters(session: SessionDep):
     result = await session.execute(select(Master).where(Master.is_active.is_(True)))
     return [{"id": m.id, "full_name": m.full_name, "description": m.description} for m in result.scalars().all()]
-
-
-@_public.get("/masters/{master_id}/services")
-async def list_master_services(master_id: int, session: SessionDep):
-    result = await session.execute(
-        select(Service)
-        .join(MasterService, MasterService.service_id == Service.id)
-        .where(MasterService.master_id == master_id, Service.is_active.is_(True))
-    )
-    return [
-        {
-            "id": s.id,
-            "name": s.name,
-            "description": s.description,
-            "price": float(s.price),
-        }
-        for s in result.scalars().all()
-    ]
 
 
 @_public.get("/masters/{master_id}/schedule")
