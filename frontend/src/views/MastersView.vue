@@ -18,6 +18,7 @@ const form = reactive({
   full_name: '',
   description: '',
   telegram_id: '',
+  default_duration_minutes: '',
 })
 
 async function load() {
@@ -34,7 +35,7 @@ async function load() {
 
 function openCreate() {
   editingId.value = null
-  Object.assign(form, { full_name: '', description: '', telegram_id: '' })
+  Object.assign(form, { full_name: '', description: '', telegram_id: '', default_duration_minutes: '' })
   error.value = ''
   showForm.value = true
 }
@@ -45,6 +46,7 @@ function openEdit(m) {
     full_name: m.full_name,
     description: m.description ?? '',
     telegram_id: m.telegram_id === null || m.telegram_id === undefined ? '' : String(m.telegram_id),
+    default_duration_minutes: m.default_duration_minutes ? String(m.default_duration_minutes) : '',
   })
   error.value = ''
   showForm.value = true
@@ -62,14 +64,23 @@ async function submit() {
 
   saving.value = true
   error.value = ''
+  notice.value = ''
   try {
     const tg = form.telegram_id.trim() ? Number(form.telegram_id.trim()) : null
+    const dur = Number(form.default_duration_minutes)
+    const duration = form.default_duration_minutes.trim() && dur >= 15 ? Math.round(dur) : null
     if (editingId.value === null) {
-      await api.post('/api/admin/masters', {
+      const created = await api.post('/api/admin/masters', {
         full_name: form.full_name.trim(),
         description: form.description.trim(),
         telegram_id: tg,
+        default_duration_minutes: duration,
       })
+      if (created.google_calendar_id) {
+        notice.value = `Мастер добавлен, календарь создан. Нажми «Добавить себе» в строке ${created.full_name}, чтобы он появился в твоём Google Calendar.`
+      } else {
+        notice.value = 'Мастер добавлен.'
+      }
     } else {
       // PATCH не принимает null для telegram_id (null = «не менять»),
       // поэтому пустое поле просто не отправляем
@@ -78,6 +89,7 @@ async function submit() {
         description: form.description.trim(),
       }
       if (tg !== null) patch.telegram_id = tg
+      if (duration !== null) patch.default_duration_minutes = duration
       await api.patch(`/api/admin/masters/${editingId.value}`, patch)
     }
     showForm.value = false
@@ -91,6 +103,7 @@ async function submit() {
 
 async function toggleActive(m) {
   error.value = ''
+  notice.value = ''
   try {
     await api.patch(`/api/admin/masters/${m.id}`, { is_active: !m.is_active })
     await load()
@@ -110,12 +123,20 @@ async function makeRegLink(m) {
 }
 
 const creatingCalendarId = ref(null)
+// подсказка после успешных действий (создание календаря, ссылка входа)
+const notice = ref('')
 
 async function createCalendar(m) {
   error.value = ''
+  notice.value = ''
   creatingCalendarId.value = m.id
   try {
-    await api.post(`/api/admin/google-calendar/masters/${m.id}/calendar`)
+    const res = await api.post(`/api/admin/google-calendar/masters/${m.id}/calendar`)
+    if (res.share_error) {
+      error.value = `Календарь создан, но открыть доступ не удалось: ${res.share_error}`
+    } else {
+      notice.value = `Календарь создан. Нажми «Добавить себе» в строке ${m.full_name}, чтобы он появился в твоём Google Calendar.`
+    }
     await load()
   } catch (err) {
     error.value = err.detail ?? err.message
@@ -144,6 +165,7 @@ onMounted(load)
 <template>
   <div>
     <div v-if="error" class="error-box">{{ error }}</div>
+    <div v-else-if="notice" class="success-box">{{ notice }}</div>
 
     <div class="toolbar">
       <button class="btn btn-primary btn-sm" @click="openCreate">+ Добавить мастера</button>
@@ -161,6 +183,16 @@ onMounted(load)
             id="m-tg"
             v-model="form.telegram_id"
             :placeholder="editingId !== null ? 'не менять, если пусто' : 'необязательно'"
+            inputmode="numeric"
+            autocomplete="off"
+          />
+        </div>
+        <div class="field">
+          <label for="m-dur">Длительность записи, мин</label>
+          <input
+            id="m-dur"
+            v-model="form.default_duration_minutes"
+            placeholder="60"
             inputmode="numeric"
             autocomplete="off"
           />
@@ -184,7 +216,7 @@ onMounted(load)
     <div v-else-if="!masters.length" class="card">
       <div class="empty-state">
         <div class="empty-title">Мастеров пока нет</div>
-        <div>Добавьте первого мастера — записи и расписание появятся после этого</div>
+        <div>Добавьте первого мастера — записи появятся после этого</div>
         <button class="btn btn-primary btn-sm" @click="openCreate">+ Добавить мастера</button>
       </div>
     </div>
@@ -220,7 +252,18 @@ onMounted(load)
                 </template>
               </td>
               <td>
-                <span v-if="m.google_calendar_id" class="badge badge-green">создан</span>
+                <template v-if="m.google_calendar_id">
+                  <div><span class="badge badge-green">создан</span></div>
+                  <a
+                    class="btn btn-sm"
+                    style="margin-top: 4px"
+                    :href="m.calendar_add_url"
+                    target="_blank"
+                    rel="noopener"
+                  >
+                    Добавить себе
+                  </a>
+                </template>
                 <button
                   v-else
                   class="btn btn-sm"
@@ -258,7 +301,8 @@ onMounted(load)
                   </button>
                 </div>
                 <div class="muted" style="font-size: 12px; margin-top: 8px">
-                  {{ regLinks[m.id].hint }}
+                  Отправь эту ссылку мастеру — по ней он откроет миниапп и привяжет свой Telegram.
+                  Ссылка одноразовая: при генерации новой старая перестаёт работать.
                 </div>
               </td>
             </tr>

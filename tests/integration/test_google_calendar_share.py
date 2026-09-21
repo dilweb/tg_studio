@@ -144,5 +144,6 @@ async def test_new_master_calendar_is_shared_automatically(api_client, db_sessio
         "master_id": master.id,
         "google_calendar_id": "new-cal-id",
         "share_error": None,
+        "shared_with": "owner@example.com",
     }
     assert calls == [("new-cal-id", "owner@example.com")]

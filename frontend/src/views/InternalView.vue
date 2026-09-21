@@ -37,13 +37,16 @@ const userLabel = computed(() =>
 
 <style scoped>
 .layout {
-  min-height: 100%;
+  /* Высота зафиксирована на вьюпорт: скроллится .content, а не вся страница.
+     Иначе вью «Чатов» не получает definite-высоту и колонки скроллятся вместе. */
+  height: 100%;
   display: flex;
 }
 
 .main {
   flex: 1;
   min-width: 0;
+  min-height: 0;
   display: flex;
   flex-direction: column;
 }
@@ -89,5 +92,7 @@ const userLabel = computed(() =>
 .content {
   flex: 1;
   padding: 24px;
+  min-height: 0;
+  overflow-y: auto;
 }
 </style>

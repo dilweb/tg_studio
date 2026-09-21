@@ -5,11 +5,12 @@ Shared by the HTTP API (owner/master) and, later, an AI-agent tool wrapper —
 both call these same functions so booking logic exists in exactly one place.
 """
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from tg_studio.db.models import Business, Master, WorkSchedule
+from tg_studio.db.models import Business, Master
 from tg_studio.modules.google_calendar.client import (
     cancel_event,
     create_event,
@@ -18,6 +19,9 @@ from tg_studio.modules.google_calendar.client import (
 )
 
 DEFAULT_DURATION_MINUTES = 60
+
+# часовой пояс студии — все календарные времена в нём (Алматы, UTC+6)
+TZ = ZoneInfo("Asia/Almaty")
 
 
 class BookingError(Exception):
@@ -29,15 +33,6 @@ async def _get_master(session: AsyncSession, business_id: int, master_id: int) -
     if not master or master.business_id != business_id:
         raise BookingError("Мастер не найден")
     return master
-
-
-async def _slot_duration_minutes(session: AsyncSession, master_id: int, start: datetime) -> int:
-    result = await session.execute(
-        select(WorkSchedule.slot_duration_minutes).where(
-            WorkSchedule.master_id == master_id, WorkSchedule.weekday == start.weekday()
-        )
-    )
-    return result.scalar_one_or_none() or DEFAULT_DURATION_MINUTES
 
 
 def _event_to_booking(event: dict) -> dict:
@@ -62,14 +57,16 @@ async def create_booking(
     client_name: str,
     client_phone: str | None = None,
     service_name: str | None = None,
+    duration_minutes: int | None = None,
 ) -> dict:
+    """Длительность события: явно переданная > дефолт мастера > 60 минут."""
     if not business.google_calendar_credentials_json:
         raise BookingError("Google Calendar не подключен для этого бизнеса")
 
     master = await _get_master(session, business.id, master_id)
     calendar_id = master.google_calendar_id or "primary"
 
-    duration = await _slot_duration_minutes(session, master_id, start_datetime)
+    duration = duration_minutes or master.default_duration_minutes or DEFAULT_DURATION_MINUTES
     end_datetime = start_datetime + timedelta(minutes=duration)
 
     busy = await get_busy_periods(
@@ -116,21 +113,58 @@ async def create_booking(
 async def list_bookings(
     session: AsyncSession,
     business: Business,
-    master_id: int,
+    master_id: int | None,
     from_date: datetime,
     to_date: datetime,
 ) -> list[dict]:
-    master = await _get_master(session, business.id, master_id)
+    """Записи одного мастера (master_id задан) или все записи бизнеса (None).
+
+    События читаются из календаря каждого мастера; у мастеров без своего
+    календаря — из primary, там их размечает extendedProperties.master_id.
+    """
     if not business.google_calendar_credentials_json:
         return []
 
-    events = await list_events(
-        business.google_calendar_credentials_json,
-        time_min=from_date.isoformat(),
-        time_max=to_date.isoformat(),
-        calendar_id=master.google_calendar_id or "primary",
-    )
-    return [_event_to_booking(e) for e in events]
+    if master_id is not None:
+        master = await _get_master(session, business.id, master_id)
+        masters = [master]
+    else:
+        result = await session.execute(
+            select(Master).where(
+                Master.business_id == business.id,
+                Master.is_active.is_(True),
+            )
+        )
+        masters = list(result.scalars().all())
+        if not masters:
+            return []
+
+    by_event: dict[str, dict] = {}
+    for m in masters:
+        events = await list_events(
+            business.google_calendar_credentials_json,
+            time_min=from_date.isoformat(),
+            time_max=to_date.isoformat(),
+            calendar_id=m.google_calendar_id or "primary",
+        )
+        for e in events:
+            booking = _event_to_booking(e)
+            # событие в общем primary не размечено — считаем его записью мастера,
+            # в чей календарь смотрим; повторный заход (тот же primary у другого
+            # мастера) только дозаполняет разметку, дублей по event_id нет
+            if booking["master_id"] is None:
+                booking["master_id"] = m.id
+            existing = by_event.get(booking["event_id"])
+            if existing is None:
+                by_event[booking["event_id"]] = booking
+            elif existing["master_id"] is None:
+                existing["master_id"] = booking["master_id"]
+
+    names = {m.id: m.full_name for m in masters}
+    bookings = list(by_event.values())
+    for b in bookings:
+        b["master_name"] = names.get(b["master_id"]) if b["master_id"] is not None else None
+    return sorted(bookings, key=lambda b: b["starts_at"])
 
 
 async def cancel_booking(

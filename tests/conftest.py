@@ -29,7 +29,6 @@ from tg_studio.db.models import (
     Master,
     User,
     UserRole,
-    WorkSchedule,
 )
 from tg_studio.db.session import get_session
 
@@ -117,26 +116,6 @@ async def make_master(
     full_name: str = "Test Master",
 ) -> Master:
     obj = Master(business_id=business_id, full_name=full_name, is_active=is_active)
-    session.add(obj)
-    await session.flush()
-    return obj
-
-
-async def make_schedule(
-    session: AsyncSession,
-    master_id: int,
-    weekday: int = 0,
-    start_time: str = "10:00",
-    end_time: str = "18:00",
-    slot_duration_minutes: int = 60,
-) -> WorkSchedule:
-    obj = WorkSchedule(
-        master_id=master_id,
-        weekday=weekday,
-        start_time=start_time,
-        end_time=end_time,
-        slot_duration_minutes=slot_duration_minutes,
-    )
     session.add(obj)
     await session.flush()
     return obj

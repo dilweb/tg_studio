@@ -6,7 +6,7 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.fsm.storage.memory import MemoryStorage
 
-from tg_studio.bot.handlers import admin, start
+from tg_studio.bot.handlers import admin, client_messages, start
 from tg_studio.config import settings
 
 logger = logging.getLogger(__name__)
@@ -31,6 +31,8 @@ async def main():
 
     dp.include_router(start.router)
     dp.include_router(admin.router)
+    # Ловушка сообщений клиентов — строго последней, чтобы не перехватить команды
+    dp.include_router(client_messages.router)
 
     logger.info("Starting bot polling...")
     await dp.start_polling(bot)

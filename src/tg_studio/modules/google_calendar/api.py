@@ -233,4 +233,5 @@ async def create_master_calendar(
         "master_id": master.id,
         "google_calendar_id": calendar_id,
         "share_error": share_error,
+        "shared_with": business.google_share_email,
     }

@@ -5,9 +5,9 @@ import { firstSectionPath } from '../nav'
 import { authStore } from '../store/auth'
 import BookingsView from '../views/BookingsView.vue'
 import BusinessView from '../views/BusinessView.vue'
+import ChatsView from '../views/ChatsView.vue'
 import LoginView from '../views/LoginView.vue'
 import MastersView from '../views/MastersView.vue'
-import ScheduleView from '../views/ScheduleView.vue'
 
 // Разделы с готовым бэкендом получают свои view, остальное — заглушка.
 // Важно: у child-роутов vue-router 4.6 обязан быть компонент (или name/redirect),
@@ -17,7 +17,7 @@ const sectionComponents = {
   dashboard: PlaceholderSection,
   bookings: BookingsView,
   masters: MastersView,
-  schedule: ScheduleView,
+  chats: ChatsView,
   business: BusinessView,
   'my-bookings': BookingsView,
 }

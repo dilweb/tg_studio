@@ -11,12 +11,12 @@ from tg_studio.api.deps import SessionDep
 from tg_studio.modules.booking.registry import SERVICE_TYPES
 from tg_studio.modules.booking.schemas import BookingCreate, BookingResponse
 from tg_studio.modules.booking.service import (
+    TZ,
     BookingError,
     cancel_booking,
     create_booking,
     list_bookings,
 )
-from tg_studio.modules.scheduling.service import TZ
 
 router = APIRouter(prefix="/admin/bookings", tags=["admin • bookings"])
 
@@ -47,6 +47,16 @@ def _resolve_master_id(master_id: int | None, ctx: tuple) -> int:
     return master_id
 
 
+def _resolve_list_master(master_id: int | None, ctx: tuple) -> int | None:
+    """Для списка записей: мастер — только свои; владелец без master_id — все мастера."""
+    _business, own_master = ctx
+    if own_master is not None:
+        if master_id is not None and master_id != own_master.id:
+            raise HTTPException(status_code=403, detail="Доступ только к своим записям")
+        return own_master.id
+    return master_id  # None = все мастера
+
+
 @router.get("", response_model=list[BookingResponse])
 async def get_bookings(
     session: SessionDep,
@@ -56,7 +66,7 @@ async def get_bookings(
     to_date: datetime = Query(...),
 ):
     business, _ = ctx
-    master_id = _resolve_master_id(master_id, ctx)
+    master_id = _resolve_list_master(master_id, ctx)
     if to_date < from_date:
         raise HTTPException(status_code=400, detail="to_date must be >= from_date")
     if (to_date - from_date).days > MAX_DAYS_RANGE:
@@ -80,6 +90,7 @@ async def post_booking(body: BookingCreate, session: SessionDep, ctx: MasterBusi
             client_name=body.client_name,
             client_phone=body.client_phone,
             service_name=body.service_name,
+            duration_minutes=body.duration_minutes,
         )
     except BookingError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc

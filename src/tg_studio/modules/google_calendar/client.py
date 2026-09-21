@@ -292,7 +292,9 @@ async def share_calendar(
     service.acl().insert(
         calendarId=calendar_id,
         body={"role": role, "scope": {"type": "user", "value": email}},
-        sendNotifications=True,
+        # письма-приглашения не отправляем: владелец добавляет календарь
+        # по прямой ссылке calendar_add_url из раздела «Мастера»
+        sendNotifications=False,
     ).execute()
 
 

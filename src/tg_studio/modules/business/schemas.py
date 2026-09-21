@@ -19,6 +19,7 @@ class MasterCreate(BaseModel):
     full_name: str
     description: str | None = None
     telegram_id: int | None = None
+    default_duration_minutes: int | None = None
 
 
 class MasterUpdate(BaseModel):
@@ -26,6 +27,7 @@ class MasterUpdate(BaseModel):
     description: str | None = None
     telegram_id: int | None = None
     is_active: bool | None = None
+    default_duration_minutes: int | None = None
 
 
 class MasterResponse(BaseModel):
@@ -35,3 +37,6 @@ class MasterResponse(BaseModel):
     telegram_id: int | None
     is_active: bool
     google_calendar_id: str | None = None
+    default_duration_minutes: int | None = None
+    # прямая ссылка «добавить календарь в мой Google Calendar» (без письма)
+    calendar_add_url: str | None = None

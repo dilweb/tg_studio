@@ -38,17 +38,7 @@ Use it as `WHERE business_id = :business_id`.
 - full_name (varchar)
 - description (text)
 - is_active (bool)
-
-### work_schedules (master's weekly schedule)
-- id (int, PK)
-- master_id (int, FK → masters.id)
-- weekday (int) — 0 = Monday, 6 = Sunday
-- start_time (varchar "HH:MM")
-- end_time (varchar "HH:MM")
-- slot_duration_minutes (int)
-
-## Key JOIN relationships
-- masters → work_schedules (schedule)
+- default_duration_minutes (int) — default booking duration
 
 ## Searching staff by name
 - By **partial name**: `full_name ILIKE '%fragment%'` (lowercase pattern), not `=`.

@@ -96,29 +96,13 @@ class Master(Base):
     # account. NULL means "not set up yet", callers fall back to "primary".
     google_calendar_id: Mapped[str | None] = mapped_column(String(256), nullable=True)
 
+    # Дефолтная длительность записи (мин) — подставляется в форму записи,
+    # реальную длительность задаёт конкретная запись. NULL = 60.
+    default_duration_minutes: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
     user: Mapped["User | None"] = relationship(back_populates="master")
     business: Mapped["Business"] = relationship(back_populates="masters")
-    schedules: Mapped[list["WorkSchedule"]] = relationship(back_populates="master")
     works: Mapped[list["TattooWork"]] = relationship(back_populates="master")
-
-
-class WorkSchedule(Base):
-    """
-    Рабочее расписание мастера по дням недели.
-    Одна запись = один рабочий день недели.
-    Пример: мастер работает пн/ср/пт с 10:00 до 18:00.
-    """
-
-    __tablename__ = "work_schedules"
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    master_id: Mapped[int] = mapped_column(ForeignKey("masters.id"), nullable=False)
-    weekday: Mapped[int] = mapped_column(Integer, nullable=False)  # 0=пн, 6=вс
-    start_time: Mapped[str] = mapped_column(String(5), nullable=False)  # "10:00"
-    end_time: Mapped[str] = mapped_column(String(5), nullable=False)    # "18:00"
-    slot_duration_minutes: Mapped[int] = mapped_column(Integer, nullable=False, default=60)
-
-    master: Mapped["Master"] = relationship(back_populates="schedules")
 
 
 class AIConversation(Base):
@@ -155,6 +139,32 @@ class AIMessage(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
     conversation: Mapped["AIConversation"] = relationship(back_populates="messages")
+
+
+class ChatDirection(str, enum.Enum):
+    from_client = "from_client"
+    from_master = "from_master"
+
+
+class ChatMessage(Base):
+    """Сообщение в чате клиента с мастерской (через Telegram-бота)."""
+
+    __tablename__ = "chat_messages"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    client_id: Mapped[int] = mapped_column(ForeignKey("clients.id"), nullable=False, index=True)
+    direction: Mapped[ChatDirection] = mapped_column(
+        Enum(ChatDirection, length=16), nullable=False
+    )
+    content: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Telegram file_id: у входящих — фото клиента, у исходящих — фото, которое мы отправили
+    telegram_file_id: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    file_kind: Mapped[str | None] = mapped_column(String(16), nullable=True)  # "photo"
+    # id сообщения в Telegram (только для исходящих — для отладки/дедупликации)
+    telegram_message_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    # Непрочитанное входящее: read_at IS NULL. Общее для owner/master (один бизнес).
+    read_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
 
 class BookingStatus(str, enum.Enum):

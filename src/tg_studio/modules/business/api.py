@@ -1,4 +1,5 @@
 import secrets
+from urllib.parse import quote
 
 from fastapi import APIRouter, HTTPException
 from sqlalchemy import select
@@ -14,6 +15,7 @@ from tg_studio.modules.business.schemas import (
     MasterResponse,
     MasterUpdate,
 )
+from tg_studio.modules.google_calendar.client import create_calendar, share_calendar
 
 router = APIRouter()
 
@@ -69,7 +71,41 @@ def _master_to_response(m: Master) -> MasterResponse:
         telegram_id=m.telegram_id,
         is_active=m.is_active,
         google_calendar_id=m.google_calendar_id,
+        default_duration_minutes=m.default_duration_minutes,
+        # прямая ссылка: открой — календарь добавится в твой Google Calendar,
+        # письмо-приглашение для этого не нужно
+        calendar_add_url=(
+            f"https://calendar.google.com/calendar/u/0/r?cid={quote(m.google_calendar_id)}"
+            if m.google_calendar_id
+            else None
+        ),
     )
+
+
+async def _auto_create_calendar(master: Master, business: Business) -> None:
+    """Завести мастеру личный календарь в Google сразу при создании мастера
+    (если GC подключен) и сразу открыть владельцу доступ. Любая ошибка не
+    валит создание мастера — календарь можно завести позже кнопкой."""
+    if not business.google_calendar_credentials_json:
+        return
+    try:
+        calendar_id = await create_calendar(
+            business.google_calendar_credentials_json, summary=master.full_name
+        )
+    except Exception:
+        return
+    if not calendar_id:
+        return
+    master.google_calendar_id = calendar_id
+    if business.google_share_email:
+        try:
+            await share_calendar(
+                business.google_calendar_credentials_json,
+                calendar_id,
+                business.google_share_email,
+            )
+        except Exception:
+            pass  # дешарить/решарить можно кнопкой «Открыть доступ» в «Бизнесе»
 
 
 async def _get_own_master(session, master_id: int, business_id: int) -> Master:
@@ -94,8 +130,10 @@ async def create_master(body: MasterCreate, session: SessionDep, business: Owner
         full_name=body.full_name,
         description=body.description,
         telegram_id=body.telegram_id,
+        default_duration_minutes=body.default_duration_minutes,
     )
     session.add(master)
+    await _auto_create_calendar(master, business)
     await session.commit()
     await session.refresh(master)
     return _master_to_response(master)
@@ -112,6 +150,8 @@ async def update_master(master_id: int, body: MasterUpdate, session: SessionDep,
         master.telegram_id = body.telegram_id
     if body.is_active is not None:
         master.is_active = body.is_active
+    if body.default_duration_minutes is not None:
+        master.default_duration_minutes = body.default_duration_minutes
     await session.commit()
     await session.refresh(master)
     return _master_to_response(master)

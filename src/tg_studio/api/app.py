@@ -10,9 +10,9 @@ from tg_studio.modules.ai.system_prompt import set_engine as set_ai_engine
 from tg_studio.modules.booking.api import public_router as booking_public_router
 from tg_studio.modules.booking.api import router as booking_router
 from tg_studio.modules.business.api import router as business_router
+from tg_studio.modules.chat.api import router as chat_router
 from tg_studio.modules.google_calendar.api import router as google_calendar_router
 from tg_studio.modules.identity.api import router as auth_router
-from tg_studio.modules.scheduling.api import router as scheduling_router
 from tg_studio.modules.tattoo.api import router as tattoo_router
 
 app = FastAPI(
@@ -40,12 +40,12 @@ app.add_middleware(
 
 app.include_router(auth_router, prefix="/api")
 app.include_router(business_router, prefix="/api")
-app.include_router(scheduling_router, prefix="/api")
 app.include_router(ai_router, prefix="/api")
 app.include_router(google_calendar_router, prefix="/api")
 app.include_router(tattoo_router, prefix="/api")
 app.include_router(booking_router, prefix="/api")
 app.include_router(booking_public_router, prefix="/api")
+app.include_router(chat_router, prefix="/api")
 
 
 # Initialize AI schema introspection

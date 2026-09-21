@@ -25,6 +25,8 @@ function authHeaders() {
   return {}
 }
 
+export { authHeaders }
+
 /**
  * Запрос к API. Бросает Error с полями status/detail при не-2xx.
  */
@@ -35,7 +37,10 @@ export async function apiFetch(path, options = {}) {
       ...options,
       headers: {
         ...authHeaders(),
-        ...(options.body ? { 'Content-Type': 'application/json' } : {}),
+        // FormData брайзер сам ставит Content-Type с boundary — не мешаем
+        ...(options.body && !(options.body instanceof FormData)
+          ? { 'Content-Type': 'application/json' }
+          : {}),
         ...options.headers,
       },
     })
@@ -61,6 +66,34 @@ export async function apiFetch(path, options = {}) {
   return data
 }
 
+/**
+ * Binary-запрос (фото чата): заголовки авторизации <img> не умеет,
+ * поэтому качаем blob и отдаём во view через object URL.
+ */
+export async function apiFetchBlob(path) {
+  let response
+  try {
+    response = await fetch(path, { headers: authHeaders() })
+  } catch {
+    const err = new Error('API недоступен')
+    err.kind = 'network'
+    throw err
+  }
+  if (!response.ok) {
+    let detail = `Ошибка ${response.status}`
+    try {
+      detail = (await response.json())?.detail ?? detail
+    } catch {
+      // тело не json
+    }
+    const err = new Error(detail)
+    err.status = response.status
+    err.detail = detail
+    throw err
+  }
+  return response.blob()
+}
+
 export function fetchMe() {
   return apiFetch('/api/auth/me')
 }
@@ -69,6 +102,7 @@ export function fetchMe() {
 export const api = {
   get: (path) => apiFetch(path),
   post: (path, body) => apiFetch(path, { method: 'POST', body: JSON.stringify(body) }),
+  postForm: (path, formData) => apiFetch(path, { method: 'POST', body: formData }),
   patch: (path, body) => apiFetch(path, { method: 'PATCH', body: JSON.stringify(body) }),
   put: (path, body) => apiFetch(path, { method: 'PUT', body: JSON.stringify(body) }),
   del: (path) => apiFetch(path, { method: 'DELETE' }),

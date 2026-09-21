@@ -3,11 +3,12 @@ from .models import (
     AIConversation,
     AIMessage,
     Business,
+    ChatDirection,
+    ChatMessage,
     Client,
     Master,
     User,
     UserRole,
-    WorkSchedule,
 )
 from .session import async_session_factory, engine, get_session
 
@@ -16,11 +17,12 @@ __all__ = [
     "AIMessage",
     "Base",
     "Business",
+    "ChatDirection",
+    "ChatMessage",
     "Client",
     "Master",
     "User",
     "UserRole",
-    "WorkSchedule",
     "async_session_factory",
     "engine",
     "get_session",
