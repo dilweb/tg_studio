@@ -3,11 +3,13 @@ import { createRouter, createWebHistory } from 'vue-router'
 import PlaceholderSection from '../components/PlaceholderSection.vue'
 import { firstSectionPath } from '../nav'
 import { authStore } from '../store/auth'
-import BookingsView from '../views/BookingsView.vue'
+import AiAssistantView from '../views/AiAssistantView.vue'
 import BusinessView from '../views/BusinessView.vue'
 import ChatsView from '../views/ChatsView.vue'
 import LoginView from '../views/LoginView.vue'
 import MastersView from '../views/MastersView.vue'
+import SuppliesView from '../views/SuppliesView.vue'
+import TattoosView from '../views/TattoosView.vue'
 
 // Разделы с готовым бэкендом получают свои view, остальное — заглушка.
 // Важно: у child-роутов vue-router 4.6 обязан быть компонент (или name/redirect),
@@ -15,11 +17,12 @@ import MastersView from '../views/MastersView.vue'
 // с бесконечным redirect-циклом
 const sectionComponents = {
   dashboard: PlaceholderSection,
-  bookings: BookingsView,
   masters: MastersView,
+  works: TattoosView,
   chats: ChatsView,
+  supplies: SuppliesView,
   business: BusinessView,
-  'my-bookings': BookingsView,
+  ai: AiAssistantView,
 }
 
 const appChildren = Object.entries(sectionComponents).map(([path, component]) => ({

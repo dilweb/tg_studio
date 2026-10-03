@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from tg_studio.db.session import engine
 
+from .calendar_tools import get_bookings
 from .schema import FORBIDDEN_COLUMNS
 
 logger = logging.getLogger(__name__)
@@ -145,4 +146,5 @@ async def execute_analytics_sql(
 
 TOOL_REGISTRY: dict[str, callable] = {
     "execute_analytics_sql": execute_analytics_sql,
+    "get_bookings": get_bookings,
 }

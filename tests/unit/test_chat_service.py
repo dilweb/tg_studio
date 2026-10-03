@@ -1,5 +1,9 @@
 """Юнит-тесты chat service: upsert клиента, сохранение, mark_read, owner."""
 
+import shutil
+import subprocess
+import time
+
 import pytest
 from sqlalchemy import select
 
@@ -123,6 +127,45 @@ async def test_previews_for_media_kinds(db_session):
     assert threads[sticker.id]["last_message_preview"] == "😀"
     assert threads[video.id]["last_message_preview"] == "📎 Видео"
     assert threads[doc.id]["last_message_preview"] == "sketch.pdf"
+
+
+def test_file_token_roundtrip():
+    token = service.make_file_token(42)
+    assert service.verify_file_token(42, token)
+
+    # чужой id, испорченная подпись, просрочка, мусор
+    assert not service.verify_file_token(43, token)
+    tampered = token[:-1] + ("0" if token[-1] != "0" else "1")
+    assert not service.verify_file_token(42, tampered)
+    expired = service.make_file_token(42, now=int(time.time()) - service.FILE_TOKEN_TTL - 5)
+    assert not service.verify_file_token(42, expired)
+    assert not service.verify_file_token(42, "мусор")
+    assert not service.verify_file_token(42, None)
+
+
+@pytest.mark.asyncio
+async def test_transcode_voice_to_mp3():
+    if shutil.which("ffmpeg") is None:
+        pytest.skip("ffmpeg недоступен в образе")
+
+    # валидный ogg/opus синтезируем самим ffmpeg
+    ogg = subprocess.run(
+        [
+            "ffmpeg", "-hide_banner", "-loglevel", "error",
+            "-f", "lavfi", "-i", "sine=frequency=440:duration=1",
+            "-c:a", "libopus", "-f", "ogg", "pipe:1",
+        ],
+        capture_output=True,
+        check=True,
+    ).stdout
+
+    mp3 = await service.transcode_voice_to_mp3(ogg)
+    assert mp3 is not None
+    # ID3-тег или MPEG-фрейм (0xFF Expose)
+    assert mp3[:3] == b"ID3" or mp3[0] == 0xFF
+
+    # битые байты — не перекодируем, прокси отдаст оригинал
+    assert await service.transcode_voice_to_mp3(b"garbage") is None
 
 
 @pytest.mark.asyncio

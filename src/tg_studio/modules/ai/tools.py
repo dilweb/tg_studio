@@ -1,9 +1,8 @@
 """
 OpenAI function-calling tool definitions.
-Single flexible tool: execute_analytics_sql — the LLM writes the SQL,
-we validate and run it in a read-only transaction.
 
-All tables have business_id directly where applicable.
+Two tools: execute_analytics_sql (LLM writes SQL against the business DB)
+and get_bookings (live schedule from Google Calendar, filter-based).
 """
 
 ANALYTICS_TOOLS: list[dict] = [
@@ -41,3 +40,48 @@ ANALYTICS_TOOLS: list[dict] = [
         },
     },
 ]
+
+BOOKINGS_TOOLS: list[dict] = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_bookings",
+            "description": (
+                "The live studio schedule from Google Calendar: who is booked and when. "
+                "Returns only BUSY intervals with labels — free time must be inferred. "
+                "All parameters are optional filters; omit everything to get all bookings "
+                "for the next 2 weeks. Use this for schedule/free-time questions; "
+                "bookings are NOT in the DB — never use SQL for them."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "master": {
+                        "type": "string",
+                        "description": (
+                            "Fuzzy master name, e.g. 'Eugene' matches 'Eugene Smirnov'. "
+                            "Omit for all masters."
+                        ),
+                    },
+                    "date_from": {
+                        "type": "string",
+                        "description": (
+                            "Start date YYYY-MM-DD, studio timezone Asia/Almaty. Default: today."
+                        ),
+                    },
+                    "date_to": {
+                        "type": "string",
+                        "description": (
+                            "End date YYYY-MM-DD inclusive. Default: date_from + 14 days; "
+                            "the window is clamped to 31 days."
+                        ),
+                    },
+                },
+                "required": [],
+                "additionalProperties": False,
+            },
+        },
+    },
+]
+
+AGENT_TOOLS: list[dict] = ANALYTICS_TOOLS + BOOKINGS_TOOLS

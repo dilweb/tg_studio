@@ -45,6 +45,25 @@ function docName(m) {
   return m.content || 'файл'
 }
 
+// Blob-ссылки живут только внутри страницы: браузер/вебвью пытается их
+// «открыть» и предлагает найти приложение (macOS: «Do you want to open
+// blob:…», на телефоне так же). Поэтому документ идёт по прямой подписанной
+// ссылке: в Telegram открываем её через openLink в системном браузере (там
+// скачивание штатное), в обычном браузере оставляем дефолт — браузер скачает
+// сам (Content-Disposition: attachment).
+function openDocument(m, event) {
+  const webApp = window.Telegram?.WebApp
+  if (!webApp?.openLink) return
+  event.preventDefault()
+  webApp.openLink(new URL(m.file_url, window.location.href).href)
+}
+
+// Элемент не смог декодировать blob (формат не поддержан вебвью, битые
+// байты) — показываем заглушку вместо мёртвого плеера
+function mediaFailed(id) {
+  mediaUrls[id] = 'error'
+}
+
 function previewText(t) {
   const prefix = t.last_direction === 'from_master' ? 'Вы: ' : ''
   return prefix + (t.last_message_preview || '—')
@@ -71,14 +90,19 @@ async function loadThreads() {
   }
 }
 
+const pendingMedia = new Set() // id, чей blob ещё качается — тик не должен плодить параллельные fetch
+
 async function fetchMedia(messageId) {
-  if (mediaUrls[messageId]) return
+  if (mediaUrls[messageId] || pendingMedia.has(messageId)) return
+  pendingMedia.add(messageId)
   try {
     const blob = await apiFetchBlob(`/api/admin/chats/files/${messageId}`)
     mediaUrls[messageId] = URL.createObjectURL(blob)
   } catch (err) {
     // не удалось скачать — показываем плейсхолдер, чат не ломаем
     mediaUrls[messageId] = 'error'
+  } finally {
+    pendingMedia.delete(messageId)
   }
 }
 
@@ -93,8 +117,9 @@ async function loadMessages(animateScroll = false) {
   try {
     messages.value = await api.get(`/api/admin/chats/${activeClientId.value}/messages`)
     for (const m of messages.value) {
-      // любой file_kind скачивается через прокси (фото, голос, видео, документ…)
-      if (m.has_photo || m.file_kind) fetchMedia(m.id)
+      // фото/голос/видео качаем в blob сразу; документ — нет: он идёт по
+      // прямой подписанной ссылке (m.file_url) и качается только по клику
+      if (m.file_kind && m.file_kind !== 'document') fetchMedia(m.id)
     }
     if (animateScroll) await scrollToBottom()
   } catch (err) {
@@ -266,13 +291,14 @@ onUnmounted(() => {
             >
               <div class="bubble">
                 <img
-                  v-if="m.has_photo && mediaUrls[m.id] && mediaUrls[m.id] !== 'error'"
+                  v-if="m.file_kind === 'photo' && mediaUrls[m.id] && mediaUrls[m.id] !== 'error'"
                   :src="mediaUrls[m.id]"
                   class="bubble-photo"
                   alt="фото"
+                  @error="mediaFailed(m.id)"
                 />
                 <div
-                  v-else-if="m.has_photo"
+                  v-else-if="m.file_kind === 'photo'"
                   class="bubble-media-fallback muted"
                 >
                   📷 фото недоступно
@@ -280,8 +306,11 @@ onUnmounted(() => {
                 <video
                   v-else-if="isVideo(m) && mediaUrls[m.id] && mediaUrls[m.id] !== 'error'"
                   controls
+                  playsinline
+                  preload="metadata"
                   :src="mediaUrls[m.id]"
                   class="bubble-video"
+                  @error="mediaFailed(m.id)"
                 ></video>
                 <div
                   v-else-if="isVideo(m)"
@@ -292,8 +321,10 @@ onUnmounted(() => {
                 <audio
                   v-else-if="isAudio(m) && mediaUrls[m.id] && mediaUrls[m.id] !== 'error'"
                   controls
+                  preload="metadata"
                   :src="mediaUrls[m.id]"
                   class="bubble-audio"
+                  @error="mediaFailed(m.id)"
                 ></audio>
                 <div
                   v-else-if="isAudio(m)"
@@ -302,10 +333,11 @@ onUnmounted(() => {
                   🎙 аудио недоступно
                 </div>
                 <a
-                  v-else-if="isFile(m) && mediaUrls[m.id] && mediaUrls[m.id] !== 'error'"
-                  :href="mediaUrls[m.id]"
+                  v-else-if="isFile(m) && m.file_url"
+                  :href="m.file_url"
                   :download="docName(m)"
                   class="bubble-file"
+                  @click="openDocument(m, $event)"
                 >⬇️ {{ docName(m) }}</a>
                 <div
                   v-else-if="isFile(m)"

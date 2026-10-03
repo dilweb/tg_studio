@@ -340,3 +340,23 @@ async def get_current_user(
 
 
 CurrentUserDep = Annotated[User, Depends(get_current_user)]
+
+
+async def get_current_user_optional(
+    request: Request,
+    credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(bearer_scheme)] = None,
+    authorization: Annotated[str | None, Header()] = None,
+    session: AsyncSession = Depends(get_session),
+) -> User | None:
+    """То же, что get_current_user, но без кредов → None вместо 401.
+
+    Для эндпоинтов со вторым способом доступа (подписанная ссылка на файл):
+    сначала пробуем токен, при его отсутствии — обычную авторизацию staff.
+    """
+    try:
+        return await get_current_user(request, credentials, authorization, session)
+    except HTTPException:
+        return None
+
+
+CurrentUserOptionalDep = Annotated[User | None, Depends(get_current_user_optional)]

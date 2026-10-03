@@ -34,6 +34,9 @@ class Settings(BaseSettings):
     # Database
     database_url: str = "postgresql+asyncpg://tg_studio:secret@localhost:5432/tg_studio"
 
+    # Локальное хранилище фото сеансов (tattoo-модуль): bind mount в контейнере
+    upload_dir: str = "/app/uploads"
+
     # Redis / Celery
     redis_url: str = "redis://localhost:6379/0"
     celery_broker_url: str = "redis://localhost:6379/1"

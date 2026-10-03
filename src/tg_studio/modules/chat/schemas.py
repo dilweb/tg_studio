@@ -16,6 +16,9 @@ class ChatMessageOut(BaseModel):
     content: str | None
     file_kind: str | None
     has_photo: bool
+    # Подписанная прямая ссылка на файл (?t=<token>): документы скачиваются
+    # по ней браузером — blob-ссылки вне страницы не работают
+    file_url: str | None = None
     created_at: datetime
 
 

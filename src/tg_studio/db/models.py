@@ -2,6 +2,7 @@ import enum
 from datetime import datetime
 
 from sqlalchemy import (
+    JSON,
     BigInteger,
     Boolean,
     DateTime,
@@ -61,19 +62,43 @@ class Business(Base):
     # Личный Google-адрес владельца, с которым расшарены календари (ACL-правило)
     google_share_email: Mapped[str | None] = mapped_column(String(256), nullable=True)
 
+    # Прайс-конфиг (глобальный %, ставки размера, коэффициенты стилей/зон,
+    # cover-up) — правится владельцем в разделе «Бизнес». NULL = прайс по
+    # умолчанию из tattoo/pricing.py. См. effective_pricing().
+    pricing_config: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+
     owner: Mapped["User"] = relationship()
     masters: Mapped[list["Master"]] = relationship(back_populates="business")
 
 
+class ClientSource(str, enum.Enum):
+    """Откуда пришёл клиент."""
+
+    telegram = "tg"
+    manual = "manual"
+    instagram = "instagram"
+
+
 class Client(Base):
+    """Клиент. PK — суррогатный id; telegram/телефон/инста — идентификаторы
+    каналов (nullable, уникальные). Ручной клиент может пока не иметь ни
+    одного канала — бот позже допишет telegram_id в эту же строку."""
+
     __tablename__ = "clients"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), unique=True, nullable=False)
-    telegram_id: Mapped[int] = mapped_column(BigInteger, unique=True, nullable=False)
+    user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), unique=True)
+    telegram_id: Mapped[int | None] = mapped_column(BigInteger, unique=True)
     username: Mapped[str | None] = mapped_column(String(64))
+    instagram_username: Mapped[str | None] = mapped_column(String(64), unique=True)
     full_name: Mapped[str] = mapped_column(String(256), nullable=False)
-    phone: Mapped[str | None] = mapped_column(String(20))
+    phone: Mapped[str | None] = mapped_column(String(20), unique=True)
+    # Метка канала (tg/manual/instagram) — строка, как и прочие справочники;
+    # ClientSource — константы. Значения в БД — .value.
+    source: Mapped[str] = mapped_column(
+        String(16), default=ClientSource.telegram.value
+    )
+    note: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
     user: Mapped["User"] = relationship(back_populates="client")
@@ -167,48 +192,6 @@ class ChatMessage(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
 
-class BookingStatus(str, enum.Enum):
-    pending = "pending"
-    confirmed = "confirmed"
-    cancelled = "cancelled"
-    completed = "completed"
-
-
-class Booking(Base):
-    __tablename__ = "bookings"
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    client_id: Mapped[int] = mapped_column(ForeignKey("clients.id"), nullable=False)
-    master_id: Mapped[int] = mapped_column(ForeignKey("masters.id"), nullable=False)
-    slot_id: Mapped[int | None] = mapped_column(ForeignKey("time_slots.id"), nullable=True)
-    business_id: Mapped[int] = mapped_column(ForeignKey("businesses.id"), nullable=False, index=True)
-    status: Mapped[BookingStatus] = mapped_column(
-        Enum(BookingStatus), nullable=False, default=BookingStatus.pending
-    )
-    notes: Mapped[str | None] = mapped_column(Text, nullable=True)
-    duration_hours: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    total_amount: Mapped[float | None] = mapped_column(Numeric(10, 2), nullable=True)
-    cancel_deadline_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
-    project_deadline: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
-
-    # Google Calendar event ID for sync
-    google_event_id: Mapped[str | None] = mapped_column(String(256), nullable=True)
-
-    # Relationships
-    slot: Mapped["TimeSlot | None"] = relationship()
-
-
-class TimeSlot(Base):
-    __tablename__ = "time_slots"
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    master_id: Mapped[int] = mapped_column(ForeignKey("masters.id"), nullable=False)
-    starts_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
-    ends_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
-    is_available: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
-
-
 class TattooWorkStatus(str, enum.Enum):
     in_progress = "in_progress"  # ещё будут сеансы
     completed = "completed"
@@ -236,8 +219,12 @@ class TattooWork(Base):
     master_id: Mapped[int] = mapped_column(ForeignKey("masters.id"), nullable=False, index=True)
     business_id: Mapped[int] = mapped_column(ForeignKey("businesses.id"), nullable=False, index=True)
 
-    size: Mapped[str] = mapped_column(String(64), nullable=False)  # маленький, средний, большой
+    # Размер тату в сантиметрах: длина × высота (выбирается числами, не enum)
+    size_length_cm: Mapped[float] = mapped_column(Numeric(6, 1), nullable=False)
+    size_height_cm: Mapped[float] = mapped_column(Numeric(6, 1), nullable=False)
     complexity: Mapped[str] = mapped_column(String(64), nullable=False)  # низкая, средняя, высокая
+    # Стиль и зона — строки из справочника TattooStyle/TattooPlacement
+    # (tattoo/schemas.py): валидация на входе, справочник растит без миграций
     style: Mapped[str] = mapped_column(String(64), nullable=False)
     placement: Mapped[str] = mapped_column(String(256), nullable=False)
 
@@ -251,7 +238,10 @@ class TattooWork(Base):
     )
 
     master: Mapped["Master"] = relationship(back_populates="works")
-    sessions: Mapped[list["TattooSession"]] = relationship(back_populates="work")
+    # Удаление работы уносит сеансы, сеансы — свои фото (файлы стирает API)
+    sessions: Mapped[list["TattooSession"]] = relationship(
+        back_populates="work", cascade="all, delete-orphan"
+    )
 
 
 class TattooSession(Base):
@@ -268,8 +258,12 @@ class TattooSession(Base):
     work_id: Mapped[int] = mapped_column(ForeignKey("tattoo_works.id"), nullable=False, index=True)
 
     session_date: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
-    quoted_cost: Mapped[float | None] = mapped_column(Numeric(10, 2))  # озвучено клиенту до/на сеансе
-    cost: Mapped[float] = mapped_column(Numeric(10, 2), nullable=False)  # фактически взято
+    # Рекомендуемая цена по прайсу (tattoo/pricing.py) — для счёта на предоплату;
+    # для дополнительного сеанса может быть задана вручную.
+    recommended_price: Mapped[float | None] = mapped_column(Numeric(10, 2))
+    # Фактически взято — за сколько договорились с клиентом; известно после
+    # сеанса, поэтому nullable
+    cost: Mapped[float | None] = mapped_column(Numeric(10, 2))
     status: Mapped[TattooProjectStatus] = mapped_column(
         Enum(TattooProjectStatus), nullable=False, default=TattooProjectStatus.planned
     )
@@ -293,3 +287,113 @@ class TattooSession(Base):
     )
 
     work: Mapped["TattooWork"] = relationship(back_populates="sessions")
+    files: Mapped[list["TattooFile"]] = relationship(
+        back_populates="session", cascade="all, delete-orphan"
+    )
+
+
+class SupplyMovementKind(str, enum.Enum):
+    """Тип движения по складу. Хранится строкой (.value) — как clients.source."""
+
+    init = "init"          # начальный остаток при создании позиции
+    purchase = "purchase"  # закупка (пополнение)
+    use = "use"            # списание (мастер или владелец)
+    adjust = "adjust"      # ревизия: остаток выставлен вручную
+
+
+class Supply(Base):
+    """Позиция склада: справочник + денормализованный текущий остаток.
+
+    История — в supply_movements; quantity обновляется транзакционно вместе
+    со вставкой движения. Удаление — мягкое (is_active=False): журнал
+    не должен терять позицию.
+    """
+
+    __tablename__ = "supplies"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    business_id: Mapped[int] = mapped_column(ForeignKey("businesses.id"), nullable=False, index=True)
+    name: Mapped[str] = mapped_column(String(256), nullable=False)
+    # Строки, не enum-типы в БД: справочник растим без миграций (как стили тату)
+    category: Mapped[str] = mapped_column(String(64), nullable=False)
+    unit: Mapped[str] = mapped_column(String(16), nullable=False)
+    quantity: Mapped[float] = mapped_column(Numeric(12, 2), nullable=False, default=0)
+    # Порог «пора докупать»; NULL — за позицией не следим
+    min_quantity: Mapped[float | None] = mapped_column(Numeric(12, 2), nullable=True)
+    note: Mapped[str | None] = mapped_column(Text)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now(), onupdate=func.now()
+    )
+
+    movements: Mapped[list["SupplyMovement"]] = relationship(back_populates="supply")
+
+    @property
+    def low(self) -> bool:
+        return self.min_quantity is not None and self.quantity <= self.min_quantity
+
+
+class SupplyMovement(Base):
+    """Движение по складу: кто, когда, сколько и зачем.
+
+    delta со знаком: + закупка / начальный остаток, − списание. Для kind=use
+    заполняется master_id; work_id/session_id (nullable) связывают списание
+    с тату-работой/сеансом — база для будущей себестоимости сеанса.
+    """
+
+    __tablename__ = "supply_movements"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    business_id: Mapped[int] = mapped_column(ForeignKey("businesses.id"), nullable=False, index=True)
+    supply_id: Mapped[int] = mapped_column(ForeignKey("supplies.id"), nullable=False, index=True)
+    delta: Mapped[float] = mapped_column(Numeric(12, 2), nullable=False)
+    kind: Mapped[str] = mapped_column(String(16), nullable=False)
+    master_id: Mapped[int | None] = mapped_column(ForeignKey("masters.id"), nullable=True)
+    # ondelete=SET NULL: удаление работы/сеанса не должно ломать историю
+    # движений — списание уже случилось, теряется только ссылка
+    work_id: Mapped[int | None] = mapped_column(
+        ForeignKey("tattoo_works.id", ondelete="SET NULL"), nullable=True
+    )
+    session_id: Mapped[int | None] = mapped_column(
+        ForeignKey("tattoo_sessions.id", ondelete="SET NULL"), nullable=True
+    )
+    note: Mapped[str | None] = mapped_column(Text)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+    supply: Mapped["Supply"] = relationship(back_populates="movements")
+    master: Mapped["Master | None"] = relationship()
+
+
+class TattooFileKind(str, enum.Enum):
+    sketch = "sketch"  # эскиз
+    result = "result"  # фото результата
+
+
+class TattooFile(Base):
+    """Фото сеанса (эскиз/результат), лежит на диске в UPLOAD_DIR.
+
+    В БД — только метаданные и относительный путь: папка переезжает
+    на другую машину (VPS) вместе с дампом БД без правок.
+    """
+
+    __tablename__ = "tattoo_files"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    session_id: Mapped[int] = mapped_column(
+        ForeignKey("tattoo_sessions.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    kind: Mapped[TattooFileKind] = mapped_column(Enum(TattooFileKind), nullable=False)
+
+    # Относительный путь от settings.upload_dir; имя генерируем сами
+    # (uuid), оригинальное имя пользователя храним рядом
+    stored_path: Mapped[str] = mapped_column(String(512), unique=True, nullable=False)
+    original_name: Mapped[str] = mapped_column(String(256), nullable=False)
+    mime: Mapped[str] = mapped_column(String(64), nullable=False)
+    size_bytes: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+    session: Mapped["TattooSession"] = relationship(back_populates="files")

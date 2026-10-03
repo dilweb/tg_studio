@@ -4,7 +4,12 @@
 download_photo) — тесты подменяют именно их.
 """
 
+import asyncio
+import hashlib
+import hmac
 import logging
+import subprocess
+import time
 from datetime import datetime
 
 from aiogram import Bot
@@ -43,6 +48,44 @@ PREVIEW_LABELS = {
     "audio": "📎 Аудио",
     "document": "📎 Документ",
 }
+
+
+# ---------------------------------------------------------------------------
+# Подписанные ссылки на файлы
+# ---------------------------------------------------------------------------
+# Документы в миниаппе отдаются прямой ссылкой (?t=<token>): blob-ссылки
+# живут только внутри страницы — вебвью/браузер пытается «открыть» их как
+# файл и предлагает найти приложение (macOS: «Do you want to open blob:…»).
+# Прямая ссылка с Content-Disposition: attachment скачивается штатно
+# и в обычном браузере, и в системном браузере с телефона.
+
+FILE_TOKEN_TTL = 3600  # час; фронт перегенерирует ссылки на каждом тике опроса
+
+
+def make_file_token(message_id: int, now: int | None = None) -> str:
+    """HMAC-подпись "<id>:<exp>" ключом JWT — доступ к одному файлу на час."""
+    exp = (now if now is not None else int(time.time())) + FILE_TOKEN_TTL
+    payload = f"{message_id}:{exp}"
+    sig = hmac.new(
+        settings.jwt_secret_key.encode(), payload.encode(), hashlib.sha256
+    ).hexdigest()[:32]
+    return f"{exp}:{sig}"
+
+
+def verify_file_token(message_id: int, token: str, now: int | None = None) -> bool:
+    try:
+        exp_str, sig = token.rsplit(":", 1)
+        exp = int(exp_str)
+    except (AttributeError, ValueError):
+        return False
+    if exp < (now if now is not None else int(time.time())):
+        return False
+    expected = hmac.new(
+        settings.jwt_secret_key.encode(),
+        f"{message_id}:{exp}".encode(),
+        hashlib.sha256,
+    ).hexdigest()[:32]
+    return hmac.compare_digest(sig, expected)
 
 
 class TelegramSendError(Exception):
@@ -386,6 +429,36 @@ async def mark_thread_read(session: AsyncSession, client_id: int) -> int:
         row.read_at = now
     await session.commit()
     return len(rows)
+
+
+def _transcode_voice_to_mp3(data: bytes) -> bytes | None:
+    """Ogg/Opus голосовое → mp3.
+
+    WebKit (iOS, Telegram на macOS) не умеет ogg — blob-аудио в миниаппе
+    просто не загружается. None — ffmpeg нет или перекодировать не удалось:
+    тогда прокси отдаёт оригинал как есть.
+    """
+    try:
+        proc = subprocess.run(
+            [
+                "ffmpeg", "-hide_banner", "-loglevel", "error", "-i", "pipe:0",
+                "-map", "a", "-c:a", "libmp3lame", "-b:a", "64k", "-f", "mp3",
+                "pipe:1",
+            ],
+            input=data,
+            capture_output=True,
+            check=False,
+        )
+    except FileNotFoundError:
+        return None
+    if proc.returncode != 0 or not proc.stdout:
+        return None
+    return proc.stdout
+
+
+async def transcode_voice_to_mp3(data: bytes) -> bytes | None:
+    """Обёртка в тредпул: subprocess блокирует event loop, файл может быть до 20 МБ."""
+    return await asyncio.to_thread(_transcode_voice_to_mp3, data)
 
 
 async def get_message_file(session: AsyncSession, message_id: int) -> ChatMessage | None:

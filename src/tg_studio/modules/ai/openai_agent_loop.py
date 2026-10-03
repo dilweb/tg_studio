@@ -20,8 +20,8 @@ from openai.types.chat import ChatCompletionMessageToolCall
 
 from tg_studio.config import settings
 
-from .system_prompt import ZERO_COUNT_FOLLOWUP_NUDGE
-from .tools import ANALYTICS_TOOLS
+from .system_prompt import REPEATED_TOOL_CALL_NUDGE, ZERO_COUNT_FOLLOWUP_NUDGE
+from .tools import AGENT_TOOLS
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +30,7 @@ type AgentEventHandler = Callable[[dict[str, Any]], Awaitable[None]] | None
 
 MAX_TOOL_ROUNDS_DEFAULT = 12
 MAX_ZERO_RESULT_NUDGES = 2
+MAX_REPEATED_CALL_NUDGES = 1
 
 _DATA_Q = re.compile(
     r"сколько|скольки|запис|бронир|выруч|заработ|доход|клиент|мастер|продюс|"
@@ -159,9 +160,11 @@ async def run_openai_analytics_loop(
     until a non-tool final reply or the round cap.
     """
     mdl = model or settings.llm_model
-    tdefs = tools if tools is not None else ANALYTICS_TOOLS
+    tdefs = tools if tools is not None else AGENT_TOOLS
     pending: list[PendingAIMessage] = []
     zero_nudges = 0
+    repeated_nudges = 0
+    seen_calls: set[tuple[str, str]] = set()
     for round_idx in range(max_tool_rounds):
         if on_event is not None:
             await on_event(
@@ -212,15 +215,26 @@ async def run_openai_analytics_loop(
                     "tool_calls": json.loads(tjson),
                 }
             )
+            repeated_this_round = False
             for tc in tcalls:
+                # args парсим до эвента — в песочнице показываем SQL вызова
+                args = json.loads(tc.function.arguments)
+                signature = (
+                    tc.function.name,
+                    json.dumps(args, sort_keys=True, ensure_ascii=False),
+                )
+                if signature in seen_calls:
+                    repeated_this_round = True
+                seen_calls.add(signature)
                 if on_event is not None:
                     await on_event(
                         {
                             "type": "tool_call",
                             "name": tc.function.name,
+                            "sql": args.get("sql_query"),
+                            "args": {k: v for k, v in args.items() if k != "sql_query"},
                         }
                     )
-                args = json.loads(tc.function.arguments)
                 tool_result = await execute_tool(tc.function.name, args)
                 pending.append(
                     PendingAIMessage(
@@ -236,6 +250,22 @@ async def run_openai_analytics_loop(
                         "tool_call_id": tc.id,
                     }
                 )
+            # Одинаковый вызов (имя + аргументы) повторно за ход: сначала нудж,
+            # после него — обрываем цикл, иначе модель крутится до кэпа раундов
+            if repeated_this_round:
+                if repeated_nudges < MAX_REPEATED_CALL_NUDGES:
+                    repeated_nudges += 1
+                    logger.info("Repeated identical tool call — nudge model to answer (%s/%s)", repeated_nudges, MAX_REPEATED_CALL_NUDGES)
+                    if on_event is not None:
+                        await on_event({"type": "nudge", "kind": "repeated_tool_call"})
+                    _replace_or_append_nudge(openai_messages, REPEATED_TOOL_CALL_NUDGE)
+                else:
+                    logger.warning("Model repeats identical tool call after nudge — stopping loop")
+                    return OpenAIAgentLoopResult(
+                        final_reply="",
+                        pending_db_messages=pending,
+                        stopped_at_max_rounds=True,
+                    )
             continue
         if (
             zero_nudges < max_zero_nudges

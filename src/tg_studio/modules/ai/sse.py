@@ -17,6 +17,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from tg_studio.db.models import Business
 from tg_studio.modules.ai.client import ChatResult, ConversationNotFoundError, chat
 from tg_studio.modules.ai.schemas import AIChatRequest
+from tg_studio.modules.ai.system_prompt import build_system_prompt
+from tg_studio.modules.ai.tools import AGENT_TOOLS
 
 type IsDisconnected = Callable[[], Coroutine[Any, Any, bool]] | None
 
@@ -34,9 +36,12 @@ def _chunk_text(text: str, size: int = 120) -> list[str]:
 async def stream_ai_chat_sse(
     session: AsyncSession,
     business: Business,
-    user_id: int,
+    user_id: int | None,
     body: AIChatRequest,
     *,
+    client_id: int | None = None,
+    build_prompt: Callable[[Business], str] = build_system_prompt,
+    tools: list[dict] | None = None,
     is_disconnected: IsDisconnected = None,
 ) -> AsyncIterator[str]:
     queue: asyncio.Queue[tuple[str, Any]] = asyncio.Queue()
@@ -50,9 +55,12 @@ async def stream_ai_chat_sse(
                 session=session,
                 business=business,
                 user_id=user_id,
+                client_id=client_id,
                 user_message=body.message.strip(),
                 conversation_id=body.conversation_id,
                 confirmed=body.confirmed,
+                build_prompt=build_prompt,
+                tools=tools if tools is not None else AGENT_TOOLS,
                 on_event=on_event,
             )
         except Exception as e:

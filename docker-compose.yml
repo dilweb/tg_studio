@@ -38,6 +38,9 @@ services:
     volumes:
       # Ключ сервисного аккаунта Google (читается при POST /connect)
       - ./credentials.json:/app/credentials.json:ro
+      # Фото сеансов tattoo-модуля (UPLOAD_DIR): bind mount — папка видна
+      # на хосте, на VPS переезжает rsync'ом целиком
+      - ./data/uploads:/app/uploads
     ports:
       - "8000:8000"
     depends_on:

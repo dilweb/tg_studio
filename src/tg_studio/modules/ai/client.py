@@ -3,6 +3,7 @@ AI chat orchestrator — manages the OpenAI conversation loop with function call
 Tool calls execute immediately without user confirmation (read-only SQL is already validated).
 """
 
+import inspect
 import json
 import logging
 import re
@@ -34,7 +35,7 @@ from .system_prompt import (
     DATA_QUESTION_REQUIRES_TOOL_NUDGE,
     build_system_prompt,
 )
-from .tools import ANALYTICS_TOOLS
+from .tools import AGENT_TOOLS
 
 logger = logging.getLogger(__name__)
 
@@ -254,6 +255,8 @@ async def _execute_pending_tools(
     history_before = conversation.messages[:pending_idx]
 
     system_prompt = build_prompt(business)
+    if inspect.isawaitable(system_prompt):
+        system_prompt = await system_prompt
     openai_messages = [
         {"role": "system", "content": system_prompt},
         *_db_messages_to_openai(history_before, conversation.summary),
@@ -268,6 +271,16 @@ async def _execute_pending_tools(
     tool_results = []
     for tc in tool_calls_data:
         args = json.loads(tc["function"]["arguments"])
+        if on_event is not None:
+            # Первый раунд вне лупа — эмитим сами, иначе первый вызов невидим
+            await on_event(
+                {
+                    "type": "tool_call",
+                    "name": tc["function"]["name"],
+                    "sql": args.get("sql_query"),
+                    "args": {k: v for k, v in args.items() if k != "sql_query"},
+                }
+            )
         tool_result = await _execute_tool_call(
             business.id, tc["function"]["name"], args, tool_registry
         )
@@ -351,7 +364,7 @@ async def chat(
     *,
     user_id: int | None = None,
     client_id: int | None = None,
-    tools: list[dict] = ANALYTICS_TOOLS,
+    tools: list[dict] = AGENT_TOOLS,
     tool_registry: dict[str, Callable] = TOOL_REGISTRY,
     build_prompt: Callable[[Business], str] = build_system_prompt,
     use_data_question_nudge: bool = True,
@@ -381,6 +394,8 @@ async def chat(
     conversation.messages.append(user_msg)
 
     system_prompt = build_prompt(business)
+    if inspect.isawaitable(system_prompt):
+        system_prompt = await system_prompt
     openai_messages = [
         {"role": "system", "content": system_prompt},
         *_db_messages_to_openai(conversation.messages, conversation.summary),

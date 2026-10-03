@@ -14,8 +14,10 @@ from tg_studio.modules.business.schemas import (
     MasterCreate,
     MasterResponse,
     MasterUpdate,
+    PricingConfigUpdate,
 )
 from tg_studio.modules.google_calendar.client import create_calendar, share_calendar
+from tg_studio.modules.tattoo.pricing import effective_pricing
 
 router = APIRouter()
 
@@ -54,6 +56,25 @@ async def get_my_business(business: OwnerBusinessDep):
         phone=business.phone,
         is_active=business.is_active,
         owner_telegram_id=business.owner_telegram_id,
+        pricing_config=effective_pricing(business),
+    )
+
+
+@_admin_business.put("/pricing", response_model=AdminBusinessResponse)
+async def update_pricing(
+    body: PricingConfigUpdate, session: SessionDep, business: OwnerBusinessDep
+):
+    """Прайс-конфиг бизнеса: глобальный % и все коэффициенты. Правится целиком."""
+    business.pricing_config = body.model_dump(mode="json")
+    await session.commit()
+    return AdminBusinessResponse(
+        id=business.id,
+        name=business.name,
+        description=business.description,
+        phone=business.phone,
+        is_active=business.is_active,
+        owner_telegram_id=business.owner_telegram_id,
+        pricing_config=effective_pricing(business),
     )
 
 

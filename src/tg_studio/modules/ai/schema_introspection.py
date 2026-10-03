@@ -153,9 +153,9 @@ def introspect_schema(
             comment=_get_table_comment(inspector, table_name),
         )
 
-        # Get columns
+        # Get columns (PK flag уже в каждой колонке — get_pk_constraint под asyncpg ненадёжен)
         columns = inspector.get_columns(table_name, schema=schema)
-        pk_cols = {col["name"] for col in inspector.get_pk_constraint(table_name, schema=schema).get("constrained_columns", [])}
+        pk_cols = {col["name"] for col in columns if col.get("primary_key")}
 
         for col in columns:
             if col["name"] in forbidden:
@@ -215,4 +215,27 @@ def get_schema_info(
             exclude_tables=exclude_tables,
             forbidden_columns=forbidden_columns,
         )
+    return _schema_cache
+
+
+async def get_schema_info_async(
+    *,
+    force_refresh: bool = False,
+    exclude_tables: set[str] | None = None,
+    forbidden_columns: set[str] | None = None,
+) -> SchemaInfo:
+    """Асинхронная интроспекция через async engine (sync-инспектор AsyncEngine не работает)."""
+    global _schema_cache
+    if _schema_cache is None or force_refresh:
+        from tg_studio.db.session import engine as async_engine
+
+        async with async_engine.connect() as conn:
+            # introspect_schema принимает Engine/Connection — инспектор поверх live-коннекта
+            _schema_cache = await conn.run_sync(
+                lambda sync_conn: introspect_schema(
+                    sync_conn,
+                    exclude_tables=exclude_tables,
+                    forbidden_columns=forbidden_columns,
+                )
+            )
     return _schema_cache

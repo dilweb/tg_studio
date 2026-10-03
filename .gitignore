@@ -10,6 +10,9 @@ node_modules/
 frontend/dist/
 celerybeat-schedule
 *.db
+
+# Фото сеансов (UPLOAD_DIR, bind mount в api)
+data/
 client_secret_*.json
 credentials.json
 

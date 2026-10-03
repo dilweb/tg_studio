@@ -106,6 +106,7 @@ async def test_post_text_message(api_client, db_session, business, monkeypatch):
     body = resp.json()
     assert body["direction"] == "from_master"
     assert body["content"] == "Проверка"
+    assert body["file_url"] is None  # у текста файла нет
 
     row = await db_session.get(ChatMessage, body["id"])
     assert row.telegram_message_id == 777
@@ -157,6 +158,7 @@ async def test_post_photo(api_client, db_session, business, monkeypatch):
     assert body["has_photo"] is True
     assert body["file_kind"] == "photo"
     assert body["content"] == "смотри эскиз"
+    assert body["file_url"].startswith(f"/api/admin/chats/files/{body['id']}?t=")
 
     row = await db_session.get(ChatMessage, body["id"])
     assert row.telegram_file_id == "fileid_out"
@@ -244,6 +246,16 @@ async def test_file_proxy(api_client, db_session, business, monkeypatch):
     assert resp.headers["content-type"] == "audio/ogg"
     assert resp.content == b"oggbytes"
 
+    # перекодировка удалась (ffmpeg на месте) — отдаём mp3
+    async def fake_voice_mp3(data):
+        return b"mp3-bytes"
+
+    monkeypatch.setattr(service, "transcode_voice_to_mp3", fake_voice_mp3)
+    resp = await api_client.get(f"/api/admin/chats/files/{voice_msg.id}", headers=OWNER_HEADERS)
+    assert resp.status_code == 200
+    assert resp.headers["content-type"] == "audio/mpeg"
+    assert resp.content == b"mp3-bytes"
+
     # видео отдаётся как video/mp4
     async def fake_download_video(file_id):
         assert file_id == "fid_video"
@@ -260,6 +272,22 @@ async def test_file_proxy(api_client, db_session, business, monkeypatch):
     assert resp.headers["content-type"] == "video/mp4"
     assert resp.content == b"mp4bytes"
 
+    # документ: attachment с именем файла — браузер скачает его как есть
+    async def fake_download_doc(file_id):
+        assert file_id == "fid_doc"
+        return b"%PDF-1.4 bytes"
+
+    monkeypatch.setattr(service, "download_photo", fake_download_doc)
+
+    doc_msg = await seed_message(
+        db_session, client, direction=ChatDirection.from_client,
+        content="sketch.pdf", file_id="fid_doc", file_kind="document",
+    )
+    resp = await api_client.get(f"/api/admin/chats/files/{doc_msg.id}", headers=OWNER_HEADERS)
+    assert resp.status_code == 200
+    assert resp.headers["content-type"] == "application/octet-stream"
+    assert resp.headers["content-disposition"] == "attachment; filename*=UTF-8''sketch.pdf"
+
     # сообщение без фото → 404
     text_msg = await seed_message(
         db_session, client, direction=ChatDirection.from_client, content="текст"
@@ -270,3 +298,34 @@ async def test_file_proxy(api_client, db_session, business, monkeypatch):
     # неизвестное сообщение → 404
     resp = await api_client.get("/api/admin/chats/files/99999", headers=OWNER_HEADERS)
     assert resp.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_file_proxy_signed_token(api_client, db_session, monkeypatch):
+    """Прямая ссылка ?t= отдаёт файл без заголовков: так документ скачивает
+    обычный браузер (на ноуте) и системный браузер с телефона."""
+    from tg_studio.config import settings
+
+    monkeypatch.setattr(settings, "debug", False)  # как в проде: без кредов только токен
+
+    client = await make_client(db_session, telegram_id=120)
+    msg = await seed_message(
+        db_session, client, direction=ChatDirection.from_client, file_id="fid_tok"
+    )
+
+    async def fake_download(file_id):
+        return b"tokbytes"
+
+    monkeypatch.setattr(service, "download_photo", fake_download)
+
+    resp = await api_client.get(
+        f"/api/admin/chats/files/{msg.id}?t={service.make_file_token(msg.id)}"
+    )
+    assert resp.status_code == 200
+    assert resp.content == b"tokbytes"
+
+    # битый токен и вовсе без токена — без авторизации → 401
+    resp = await api_client.get(f"/api/admin/chats/files/{msg.id}?t=1:bad")
+    assert resp.status_code == 401
+    resp = await api_client.get(f"/api/admin/chats/files/{msg.id}")
+    assert resp.status_code == 401

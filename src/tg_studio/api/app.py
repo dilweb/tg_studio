@@ -7,12 +7,11 @@ from tg_studio.api.auth import AUTH_RESPONSE_EXPOSE_HEADERS
 from tg_studio.db.session import engine
 from tg_studio.modules.ai.api import router as ai_router
 from tg_studio.modules.ai.system_prompt import set_engine as set_ai_engine
-from tg_studio.modules.booking.api import public_router as booking_public_router
-from tg_studio.modules.booking.api import router as booking_router
 from tg_studio.modules.business.api import router as business_router
 from tg_studio.modules.chat.api import router as chat_router
 from tg_studio.modules.google_calendar.api import router as google_calendar_router
 from tg_studio.modules.identity.api import router as auth_router
+from tg_studio.modules.supplies.api import router as supplies_router
 from tg_studio.modules.tattoo.api import router as tattoo_router
 
 app = FastAPI(
@@ -43,8 +42,7 @@ app.include_router(business_router, prefix="/api")
 app.include_router(ai_router, prefix="/api")
 app.include_router(google_calendar_router, prefix="/api")
 app.include_router(tattoo_router, prefix="/api")
-app.include_router(booking_router, prefix="/api")
-app.include_router(booking_public_router, prefix="/api")
+app.include_router(supplies_router, prefix="/api")
 app.include_router(chat_router, prefix="/api")
 
 
