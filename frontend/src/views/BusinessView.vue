@@ -10,6 +10,7 @@ const error = ref('')
 // ── Прайс: глобальный % и все коэффициенты ───────────────────────────────────
 const pricing = reactive({
   global_percent: 100,
+  prepay_percent: 30,
   size_rates: { xs: 0, s: 0, m: 0, l: 0 },
   style_factors: {},
   zone_factors: { std: 1, elevated: 1.2, critical: 1.4 },
@@ -47,6 +48,7 @@ async function loadPricing() {
   const cfg = info.value.pricing_config
   if (!cfg) return
   pricing.global_percent = cfg.global_percent ?? 100
+  pricing.prepay_percent = cfg.prepay_percent ?? 30
   Object.assign(pricing.size_rates, cfg.size_rates ?? {})
   pricing.style_factors = { ...(cfg.style_factors ?? {}) }
   Object.assign(pricing.zone_factors, cfg.zone_factors ?? {})
@@ -61,6 +63,7 @@ async function savePricing() {
     const num = (v) => (v === '' || v == null ? 0 : Number(v))
     info.value = await api.put('/api/admin/business/pricing', {
       global_percent: Number(pricing.global_percent) || 100,
+      prepay_percent: num(pricing.prepay_percent),
       size_rates: Object.fromEntries(
         Object.entries(pricing.size_rates).map(([k, v]) => [k, num(v)]),
       ),
@@ -211,6 +214,13 @@ onMounted(async () => {
               Глобальный процент, %
             </label>
             <input v-model="pricing.global_percent" type="number" min="10" max="500" step="1" style="max-width: 120px" />
+          </div>
+          <div>
+            <label class="muted" style="display: block; font-size: 13px; margin-bottom: 4px">
+              Предоплата брони, %
+            </label>
+            <input v-model="pricing.prepay_percent" type="number" min="0" max="100" step="5" style="max-width: 120px" />
+            <div class="muted" style="font-size: 12px; margin-top: 2px">счёт при подтверждении мастера; 0 — без предоплаты</div>
           </div>
           <div>
             <label class="muted" style="display: block; font-size: 13px; margin-bottom: 4px">

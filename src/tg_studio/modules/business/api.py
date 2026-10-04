@@ -93,6 +93,7 @@ def _master_to_response(m: Master) -> MasterResponse:
         is_active=m.is_active,
         google_calendar_id=m.google_calendar_id,
         default_duration_minutes=m.default_duration_minutes,
+        specializations=m.specializations or [],
         # прямая ссылка: открой — календарь добавится в твой Google Calendar,
         # письмо-приглашение для этого не нужно
         calendar_add_url=(
@@ -152,6 +153,7 @@ async def create_master(body: MasterCreate, session: SessionDep, business: Owner
         description=body.description,
         telegram_id=body.telegram_id,
         default_duration_minutes=body.default_duration_minutes,
+        specializations=body.specializations,
     )
     session.add(master)
     await _auto_create_calendar(master, business)
@@ -173,6 +175,8 @@ async def update_master(master_id: int, body: MasterUpdate, session: SessionDep,
         master.is_active = body.is_active
     if body.default_duration_minutes is not None:
         master.default_duration_minutes = body.default_duration_minutes
+    if body.specializations is not None:
+        master.specializations = body.specializations
     await session.commit()
     await session.refresh(master)
     return _master_to_response(master)

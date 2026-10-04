@@ -64,6 +64,14 @@ class Settings(BaseSettings):
     smtp_password: str = ""
     smtp_from_name: str = "TG Studio"
 
+    # Apipay (Kaspi Pay API, api.apipay.kz): приём оплаты счётом по номеру.
+    # Ключ вводится в окружение (APIPAY_API_KEY), никогда не в чат/репозиторий.
+    # Пусто = приём платежей только manual (наличные/перевод, кнопка «Оплатил»).
+    apipay_api_key: str = ""
+    # Секрет проверки подписи вебхуков (X-Webhook-Signature) — при подключении
+    apipay_webhook_secret: str = ""
+    apipay_base_url: str = "https://api.apipay.kz/api/v1"
+
     # Google Calendar
     google_calendar_credentials_path: str = "credentials.json"
     google_calendar_redirect_uri: str = "http://localhost:8000/api/admin/google-calendar/callback"

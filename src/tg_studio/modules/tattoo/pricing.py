@@ -85,12 +85,18 @@ COVERUP_FACTOR_DEFAULT = 1.4
 # --- Глобальный коэффициент (%): 100 = как в конфиге ниже --------------------
 GLOBAL_PERCENT_DEFAULT = 100.0
 
+# --- Предоплата брони (%) -----------------------------------------------------
+# Счёт на столько процентов от договорной цены выставляется автоматически,
+# когда мастер подтверждает работу (принимает оффер). 0 = без предоплаты.
+PREPAY_PERCENT_DEFAULT = 30.0
+
 # Округление итога до тысяч (89 600 → 90 000)
 ROUND_TO = 1000
 
 # Полный конфиг по умолчанию (то, что видит владелец, пока не правил прайс)
 DEFAULT_PRICING = {
     "global_percent": GLOBAL_PERCENT_DEFAULT,
+    "prepay_percent": PREPAY_PERCENT_DEFAULT,
     "size_rates": {"xs": RATE_XS, "s": RATE_S, "m": RATE_M, "l": RATE_L},
     "style_factors": dict(STYLE_FACTOR_DEFAULTS),
     "zone_factors": dict(ZONE_FACTORS_DEFAULTS),

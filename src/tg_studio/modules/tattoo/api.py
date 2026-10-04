@@ -8,7 +8,7 @@ API тату-работ и сеансов (миниапп: владелец и �
 """
 
 import logging
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
@@ -22,13 +22,15 @@ from tg_studio.api.admin_deps import (
     MasterBusinessDep,
     get_master_business,
 )
-from tg_studio.api.auth import CurrentUserOptionalDep
+from tg_studio.api.auth import CurrentUserDep, CurrentUserOptionalDep
 from tg_studio.api.deps import SessionDep
 from tg_studio.db.models import (
     Business,
     Client,
     ClientSource,
     Master,
+    SessionOffer,
+    SessionOfferStatus,
     TattooFile,
     TattooFileKind,
     TattooProjectStatus,
@@ -43,11 +45,16 @@ from tg_studio.modules.google_calendar.client import (
     list_events,
     update_event,
 )
+from tg_studio.modules.payments import service as payments_service
+from tg_studio.modules.payments.service import ensure_can_complete
 from tg_studio.modules.tattoo import files as files_storage
+from tg_studio.modules.tattoo import offers
 from tg_studio.modules.tattoo.pricing import effective_pricing, estimate_price
 from tg_studio.modules.tattoo.schemas import (
     COMPLEXITY_OPTIONS,
     DIFFICULT_PLACEMENTS,
+    OfferListResponse,
+    OfferOut,
     PriceEstimateResponse,
     TattooClientCreate,
     TattooClientOut,
@@ -498,15 +505,21 @@ async def create_work(
     actor: MasterBusinessAndSelfDep,
     force: bool = Query(False, description="Создать даже если время у мастера занято"),
 ):
-    """Создать новую тату-работу вместе с первым сеансом и событием в Google Calendar."""
+    """Создать новую тату-работу вместе с первым сеансом и событием в Google Calendar.
+
+    Владелец может не указать master_id: работа уйдёт в очередь офферов
+    (специализация ∩ стиль → загрузка за месяц → эскалация владельцу).
+    """
     business, self_master = actor
-    master = await _resolve_master(session, business, self_master, body.master_id)
+    master = self_master
+    if master is None and body.master_id is not None:
+        master = await _resolve_master(session, business, None, body.master_id)
     client = await session.get(Client, body.client_id)
     if not client:
         raise HTTPException(status_code=404, detail="Клиент не найден")
 
     first_start = _ensure_tz(body.first_session.session_date)
-    if not force:
+    if master is not None and not force:
         await _assert_slot_free(
             session,
             business,
@@ -517,7 +530,8 @@ async def create_work(
 
     work = TattooWork(
         client_id=body.client_id,
-        master_id=master.id,
+        # NULL = мастер не выбран: работа раздаётся через очередь офферов
+        master_id=master.id if master is not None else None,
         business_id=business.id,
         size_length_cm=body.size_length_cm,
         size_height_cm=body.size_height_cm,
@@ -544,16 +558,29 @@ async def create_work(
     if tattoo_session.is_final_session:
         work.status = TattooWorkStatus.completed
 
-    try:
-        event_id = await _sync_session_to_calendar(tattoo_session, work, master, business)
-        if event_id:
-            tattoo_session.google_event_id = event_id
-    except Exception:
-        logger.exception("Failed to sync session %d to Google Calendar", tattoo_session.id)
+    created_offers: list = []
+    if master is None:
+        created_offers = await offers.create_offers(session, work, first_start)
+
+    if master is not None:
+        try:
+            event_id = await _sync_session_to_calendar(tattoo_session, work, master, business)
+            if event_id:
+                tattoo_session.google_event_id = event_id
+        except Exception:
+            logger.exception("Failed to sync session %d to Google Calendar", tattoo_session.id)
 
     await session.commit()
     work = await _reload_work(session, work.id)
     _attach_file_urls(work.sessions)
+
+    # Уведомления после коммита и best-effort: сбой Telegram не отменяет запись
+    if master is None:
+        if created_offers:
+            await offers.notify_master(session, created_offers[0])
+        else:
+            await offers.escalate_to_owner(session, work)
+
     return TattooWorkResponse.model_validate(work)
 
 
@@ -586,6 +613,9 @@ async def update_work(
         s.value for s in TattooWorkStatus
     ):
         raise HTTPException(status_code=422, detail="Недопустимый статус работы")
+    if update_data.get("status") == TattooWorkStatus.completed.value:
+        # С непогашенным балансом работу не закрываем: 409 «остаток не оплачен»
+        await ensure_can_complete(session, work)
     # enum-справочники в БД хранятся строками-значениями
     for field in ("style", "placement"):
         if update_data.get(field):
@@ -676,6 +706,9 @@ async def create_session(
     """
     business, self_master = actor
     work = await _get_work_or_404(session, work_id, business, self_master)
+    if body.is_final_session:
+        # Финальный сеанс закрывает работу — с непогашенным балансом нельзя
+        await ensure_can_complete(session, work)
     master = await _resolve_master(session, business, self_master, work.master_id)
 
     new_start = _ensure_tz(body.session_date)
@@ -730,7 +763,18 @@ async def update_session(
     master = await _resolve_master(session, business, self_master, work.master_id)
 
     update_data = body.model_dump(exclude_unset=True)
+    if update_data.get("status") is not None:
+        if update_data["status"] not in (s.value for s in TattooProjectStatus):
+            raise HTTPException(status_code=422, detail="Недопустимый статус сеанса")
+        update_data["status"] = TattooProjectStatus(update_data["status"])
     old_date = tattoo_session.session_date
+
+    if update_data.get("is_final_session") is True:
+        # Этим сеансом закрывается работа — с непогашенным балансом нельзя.
+        # Пометка «сеанс прошёл» (status=completed) разрешена всегда:
+        # сеанс физически закончен, деньги могут прийти и позже.
+        await ensure_can_complete(session, work)
+
     for field, value in update_data.items():
         setattr(tattoo_session, field, value)
 
@@ -893,3 +937,212 @@ async def delete_session_file(
     await session.delete(record)
     await session.commit()
     files_storage.delete_file(record)
+
+
+# ---------------------------------------------------------------------------
+# Офферы: распределение работ без мастера
+# ---------------------------------------------------------------------------
+
+
+async def _get_offer_or_404(
+    session: SessionDep, business: Business, offer_id: int, self_master: Master | None
+) -> SessionOffer:
+    result = await session.execute(
+        select(SessionOffer).where(
+            SessionOffer.id == offer_id, SessionOffer.business_id == business.id
+        )
+    )
+    offer = result.scalar_one_or_none()
+    if offer is None:
+        raise HTTPException(status_code=404, detail="Оффер не найден")
+    if self_master is not None and offer.master_id != self_master.id:
+        raise HTTPException(status_code=404, detail="Оффер не найден")
+    return offer
+
+
+async def _first_session_of(session: SessionDep, work_id: int) -> TattooSession | None:
+    return (
+        await session.execute(
+            select(TattooSession)
+            .where(TattooSession.work_id == work_id)
+            .order_by(TattooSession.session_date.asc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+
+
+def _offer_out(
+    offer: SessionOffer,
+    master_name: str,
+    work: TattooWork,
+    client_name: str,
+    first_session: TattooSession | None,
+) -> OfferOut:
+    return OfferOut(
+        id=offer.id,
+        work_id=offer.work_id,
+        master_id=offer.master_id,
+        master_name=master_name,
+        status=offer.status,
+        rank=offer.rank,
+        expires_at=offer.expires_at,
+        created_at=offer.created_at,
+        responded_at=offer.responded_at,
+        client_name=client_name,
+        style=work.style,
+        placement=work.placement,
+        size_length_cm=float(work.size_length_cm),
+        size_height_cm=float(work.size_height_cm),
+        complexity=work.complexity,
+        session_date=first_session.session_date if first_session else None,
+        recommended_price=(
+            float(first_session.recommended_price)
+            if first_session and first_session.recommended_price is not None
+            else None
+        ),
+        work_status=work.status.value if hasattr(work.status, "value") else str(work.status),
+    )
+
+
+@router.get("/offers", response_model=OfferListResponse)
+async def list_offers(
+    session: SessionDep,
+    actor: MasterBusinessAndSelfDep,
+    status: str | None = Query(None),
+):
+    """Офферы распределения записей. Мастер — свои, владелец — все."""
+    business, self_master = actor
+    stmt = (
+        select(SessionOffer, Master.full_name, TattooWork, Client.full_name)
+        .join(Master, SessionOffer.master_id == Master.id)
+        .join(TattooWork, SessionOffer.work_id == TattooWork.id)
+        .join(Client, TattooWork.client_id == Client.id)
+        .where(SessionOffer.business_id == business.id)
+        .order_by(SessionOffer.created_at.desc(), SessionOffer.rank.asc())
+        .limit(200)
+    )
+    if self_master is not None:
+        stmt = stmt.where(SessionOffer.master_id == self_master.id)
+    if status is not None:
+        stmt = stmt.where(SessionOffer.status == status)
+    rows = (await session.execute(stmt)).all()
+
+    work_ids = {work.id for _, _, work, _ in rows}
+    firsts: dict[int, TattooSession] = {}
+    if work_ids:
+        first_rows = (
+            await session.execute(
+                select(TattooSession)
+                .where(TattooSession.work_id.in_(work_ids))
+                .order_by(TattooSession.session_date.asc())
+            )
+        ).scalars().all()
+        for s in first_rows:
+            firsts.setdefault(s.work_id, s)
+
+    out = [
+        _offer_out(offer, master_name, work, client_name, firsts.get(work.id))
+        for offer, master_name, work, client_name in rows
+    ]
+    return OfferListResponse(offers=out, total=len(out))
+
+
+@router.post("/offers/{offer_id}/accept", response_model=OfferOut)
+async def accept_offer(
+    offer_id: int,
+    session: SessionDep,
+    actor: MasterBusinessAndSelfDep,
+    user: CurrentUserDep,
+    force: bool = Query(False, description="Не проверять занятость слота"),
+):
+    """Взять работу.
+
+    Мастер принимает только свой pending-оффер («кто первый успел»
+    невозможно по построению). Владелец может назначить любого мастера
+    вручную — его accept любого оффера решает эскалацию. Слот занят → 409:
+    откажись от оффера или договорись о другом времени (force — для
+    владельца, который разруливает сам).
+
+    Подтверждение фиксирует договорную цену (Σ recommended_price сеансов)
+    и сразу выставляет счёт на предоплату (prepay_percent из «Бизнеса»,
+    30% по умолчанию). Не оплачен за 24ч — бронь отменяется автоматически.
+    """
+    business, self_master = actor
+    offer = await _get_offer_or_404(session, business, offer_id, self_master)
+    if offer.status != SessionOfferStatus.pending.value:
+        raise HTTPException(
+            status_code=409,
+            detail="Оффер уже не активен: работу взяли, отклонили или истёк срок",
+        )
+    work = await session.get(TattooWork, offer.work_id)
+    if work is None:
+        raise HTTPException(status_code=404, detail="Работа не найдена")
+    if work.master_id is not None:
+        raise HTTPException(status_code=409, detail="Работу уже распределили")
+    master = await session.get(Master, offer.master_id)
+    first_session = await _first_session_of(session, work.id)
+    if first_session is not None and not force:
+        start = _ensure_tz(first_session.session_date)
+        await _assert_slot_free(
+            session, business, master, start, start + _master_duration(master)
+        )
+
+    offer.status = SessionOfferStatus.accepted.value
+    offer.responded_at = datetime.now(UTC)
+    work.master_id = master.id
+    await offers.close_remaining_offers(session, work, offer.id)
+
+    if first_session is not None:
+        try:
+            event_id = await _sync_session_to_calendar(first_session, work, master, business)
+            if event_id:
+                first_session.google_event_id = event_id
+        except Exception:
+            logger.exception("Failed to sync session %d to Google Calendar", first_session.id)
+
+    # Подтверждение = деньги: фиксируем цену и сразу счёт на предоплату
+    prepay = await payments_service.create_prepay_invoice(session, work, business, user)
+
+    await session.commit()
+    client = await session.get(Client, work.client_id)
+    out = _offer_out(offer, master.full_name, work, client.full_name if client else "", first_session)
+    if prepay is not None:
+        out.prepay_amount = float(prepay.amount)
+        out.prepay_provider = prepay.provider
+    return out
+
+
+@router.post("/offers/{offer_id}/decline", response_model=OfferOut)
+async def decline_offer(offer_id: int, session: SessionDep, actor: MasterBusinessAndSelfDep):
+    """Отказаться от работы: оффер уходит следующему в очереди.
+
+    Очередь пуста — эскалация владельцу в Telegram.
+    """
+    business, self_master = actor
+    offer = await _get_offer_or_404(session, business, offer_id, self_master)
+    if offer.status != SessionOfferStatus.pending.value:
+        raise HTTPException(status_code=409, detail="Этот оффер уже не активен")
+    offer.status = SessionOfferStatus.declined.value
+    offer.responded_at = datetime.now(UTC)
+    work = await session.get(TattooWork, offer.work_id)
+
+    next_offer = None
+    if work is not None and work.master_id is None:
+        next_offer = await offers.advance_queue(session, work)
+    await session.commit()
+
+    if next_offer is not None:
+        await offers.notify_master(session, next_offer)
+    elif work is not None and work.master_id is None:
+        await offers.escalate_to_owner(session, work)
+
+    master = await session.get(Master, offer.master_id)
+    client = await session.get(Client, work.client_id) if work else None
+    first_session = await _first_session_of(session, offer.work_id) if work else None
+    return _offer_out(
+        offer,
+        master.full_name if master else "",
+        work,
+        client.full_name if client else "",
+        first_session,
+    )

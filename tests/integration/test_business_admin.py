@@ -22,6 +22,7 @@ async def test_get_my_business(api_client, db_session):
         "owner_telegram_id": 99999,
         "pricing_config": {
             "global_percent": 100,
+            "prepay_percent": 30,
             "size_rates": {"xs": 22000, "s": 35000, "m": 60000, "l": 130000},
             "zone_factors": {"std": 1.0, "elevated": 1.2, "critical": 1.4},
             "coverup_factor": 1.4,

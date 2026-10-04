@@ -266,12 +266,26 @@ async def test_owner_creates_work_for_master(api_client, db_session, business, m
 
 
 @pytest.mark.asyncio
-async def test_owner_create_requires_master_id(api_client, db_session, business):
+async def test_owner_create_without_master_starts_queue(api_client, db_session, business, monkeypatch):
+    """Работа без мастера разрешена: она уходит в очередь офферов.
+
+    Мастеров в бизнесе нет — очередь пустая, сразу эскалация владельцу.
+    """
+    from tg_studio.modules.tattoo import offers as offers_mod
+
+    escalated = []
+
+    async def fake_escalate(session, work):
+        escalated.append(work)
+
+    monkeypatch.setattr(offers_mod, "escalate_to_owner", fake_escalate)
     client = await make_client(db_session, telegram_id=113)
     resp = await api_client.post(
         "/api/tattoo/works", json=work_payload(client.id), headers=OWNER_HEADERS
     )
-    assert resp.status_code == 422
+    assert resp.status_code == 201, resp.text
+    assert resp.json()["master_id"] is None
+    assert len(escalated) == 1
 
 
 @pytest.mark.asyncio

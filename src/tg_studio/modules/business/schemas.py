@@ -22,6 +22,8 @@ class PricingConfigUpdate(BaseModel):
     так видны все значения, без частичных патчей по коэффициенту."""
 
     global_percent: float = Field(100, ge=10, le=500, description="100 = базовый прайс")
+    # Процент предоплаты брони: автосчёт при подтверждении работы мастером
+    prepay_percent: float = Field(30, ge=0, le=100, description="0 = без предоплаты")
     size_rates: dict[str, float]
     style_factors: dict[str, float]
     zone_factors: dict[str, float]
@@ -66,6 +68,8 @@ class MasterCreate(BaseModel):
     description: str | None = None
     telegram_id: int | None = None
     default_duration_minutes: int | None = None
+    # Стили мастера (строки справочника TattooStyle). Пусто = универсал.
+    specializations: list[str] = []
 
 
 class MasterUpdate(BaseModel):
@@ -74,6 +78,7 @@ class MasterUpdate(BaseModel):
     telegram_id: int | None = None
     is_active: bool | None = None
     default_duration_minutes: int | None = None
+    specializations: list[str] | None = None
 
 
 class MasterResponse(BaseModel):
@@ -84,5 +89,6 @@ class MasterResponse(BaseModel):
     is_active: bool
     google_calendar_id: str | None = None
     default_duration_minutes: int | None = None
+    specializations: list[str] = []
     # прямая ссылка «добавить календарь в мой Google Calendar» (без письма)
     calendar_add_url: str | None = None

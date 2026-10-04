@@ -192,6 +192,8 @@ class TattooSessionUpdate(BaseModel):
     session_date: datetime | None = None
     recommended_price: float | None = Field(None, gt=0)
     cost: float | None = Field(None, gt=0)
+    # Сеанс прошёл — мастер помечает completed (деньги — через /api/payments)
+    status: str | None = None
     sketch_file_id: str | None = None
     result_file_id: str | None = None
     is_final_session: bool | None = None
@@ -257,6 +259,9 @@ class TattooWorkUpdate(BaseModel):
     style: TattooStyle | None = None
     placement: TattooPlacement | None = None
     status: str | None = None
+    # Пересмотр договорной цены (гада половину простили и т.п.) — баланс
+    # считается как contract_price − Σ оплаченных платежей
+    contract_price: float | None = Field(None, ge=0)
 
 
 class TattooWorkResponse(BaseModel):
@@ -264,7 +269,8 @@ class TattooWorkResponse(BaseModel):
 
     id: int
     client_id: int
-    master_id: int
+    # NULL = мастер не назначен: работа в очереди офферов
+    master_id: int | None
     business_id: int
     size_length_cm: float
     size_height_cm: float
@@ -272,6 +278,7 @@ class TattooWorkResponse(BaseModel):
     style: str
     placement: str
     status: str
+    contract_price: float | None
     created_at: datetime
     updated_at: datetime
     sessions: list[TattooSessionResponse] = []
@@ -297,4 +304,39 @@ class TattooWorkListResponse(BaseModel):
     """Список тату-работ мастера."""
 
     works: list[TattooWorkResponse]
+    total: int
+
+
+class OfferOut(BaseModel):
+    """Оффер работы мастеру: очередь распределения записей."""
+
+    id: int
+    work_id: int
+    master_id: int
+    master_name: str
+    status: str
+    rank: int
+    expires_at: datetime | None
+    created_at: datetime
+    responded_at: datetime | None
+
+    # Что за работа — чтобы мастер решал, не открывая работу отдельно
+    client_name: str
+    style: str
+    placement: str
+    size_length_cm: float
+    size_height_cm: float
+    complexity: str
+    session_date: datetime | None
+    recommended_price: float | None
+    work_status: str
+
+    # Заполняется только в ответе accept: счёт на предоплату, созданный
+    # подтверждением работы (30% по умолчанию). None — счёта нет.
+    prepay_amount: float | None = None
+    prepay_provider: str | None = None
+
+
+class OfferListResponse(BaseModel):
+    offers: list[OfferOut]
     total: int

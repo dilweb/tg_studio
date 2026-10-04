@@ -19,13 +19,21 @@ const form = reactive({
   description: '',
   telegram_id: '',
   default_duration_minutes: '',
+  specializations: [], // стили мастера; пусто = универсал (любой стиль)
 })
+// Справочник стилей — тот же, что в работах (/api/tattoo/options)
+const styleOptions = ref([])
 
 async function load() {
   loading.value = true
   error.value = ''
   try {
-    masters.value = await api.get('/api/admin/masters')
+    const [loaded, options] = await Promise.all([
+      api.get('/api/admin/masters'),
+      api.get('/api/tattoo/options'),
+    ])
+    masters.value = loaded
+    styleOptions.value = options.styles
   } catch (err) {
     error.value = err.detail ?? err.message
   } finally {
@@ -33,9 +41,20 @@ async function load() {
   }
 }
 
+// «Лайнворк (Linework)» → «Лайнворк», «Графика / Гравюра (Engraving)» → «Графика»
+function shortStyle(style) {
+  return style.split(' (')[0].split(' / ')[0]
+}
+
 function openCreate() {
   editingId.value = null
-  Object.assign(form, { full_name: '', description: '', telegram_id: '', default_duration_minutes: '' })
+  Object.assign(form, {
+    full_name: '',
+    description: '',
+    telegram_id: '',
+    default_duration_minutes: '',
+    specializations: [],
+  })
   error.value = ''
   showForm.value = true
 }
@@ -47,6 +66,7 @@ function openEdit(m) {
     description: m.description ?? '',
     telegram_id: m.telegram_id === null || m.telegram_id === undefined ? '' : String(m.telegram_id),
     default_duration_minutes: m.default_duration_minutes ? String(m.default_duration_minutes) : '',
+    specializations: [...(m.specializations ?? [])],
   })
   error.value = ''
   showForm.value = true
@@ -75,6 +95,7 @@ async function submit() {
         description: form.description.trim(),
         telegram_id: tg,
         default_duration_minutes: duration,
+        specializations: [...form.specializations],
       })
       if (created.google_calendar_id) {
         notice.value = `Мастер добавлен, календарь создан. Нажми «Добавить себе» в строке ${created.full_name}, чтобы он появился в твоём Google Calendar.`
@@ -87,6 +108,8 @@ async function submit() {
       const patch = {
         full_name: form.full_name.trim(),
         description: form.description.trim(),
+        // Специализации отправляем всегда: снятые галочки — это «универсал»
+        specializations: [...form.specializations],
       }
       if (tg !== null) patch.telegram_id = tg
       if (duration !== null) patch.default_duration_minutes = duration
@@ -203,6 +226,20 @@ onMounted(load)
         <textarea id="m-desc" v-model="form.description" rows="2"></textarea>
       </div>
 
+      <div class="field">
+        <label>Специализации (не отметишь — считается универсалом, берёт любые стили)</label>
+        <div style="display: flex; flex-wrap: wrap; gap: 6px 14px; margin-top: 4px">
+          <label
+            v-for="style in styleOptions"
+            :key="style"
+            style="display: flex; align-items: center; gap: 6px; font-size: 13px"
+          >
+            <input type="checkbox" :value="style" v-model="form.specializations" />
+            <span>{{ shortStyle(style) }}</span>
+          </label>
+        </div>
+      </div>
+
       <div style="display: flex; gap: 10px">
         <button class="btn btn-primary" type="submit" :disabled="saving">
           {{ saving ? 'Сохраняем…' : editingId === null ? 'Создать' : 'Сохранить' }}
@@ -238,6 +275,12 @@ onMounted(load)
               <td>
                 <div>{{ m.full_name }}</div>
                 <div v-if="m.description" class="muted" style="font-size: 12px">{{ m.description }}</div>
+                <div v-if="m.specializations?.length" style="margin-top: 4px; display: flex; flex-wrap: wrap; gap: 4px">
+                  <span v-for="s in m.specializations" :key="s" class="badge badge-muted">
+                    {{ shortStyle(s) }}
+                  </span>
+                </div>
+                <div v-else class="muted" style="font-size: 12px; margin-top: 4px">универсал</div>
               </td>
               <td>
                 <template v-if="m.telegram_id">

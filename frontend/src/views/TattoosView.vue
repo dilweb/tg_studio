@@ -1,5 +1,5 @@
 <script setup>
-import { computed, onMounted, reactive, ref, watch } from 'vue'
+import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 
 import { api } from '../api/client'
 import { authStore } from '../store/auth'
@@ -68,6 +68,7 @@ const editWorkForm = reactive({
   style: '',
   placement: '',
   status: 'in_progress',
+  contract_price: '',
 })
 
 // Редактирование сеанса: { workId, sessionId } | null
@@ -88,7 +89,8 @@ const photoTarget = ref(null)
 const activeMasters = computed(() => masters.value.filter((m) => m.is_active))
 
 const clientName = (id) => clients.value.find((c) => c.id === id)?.full_name ?? `клиент #${id}`
-const masterName = (id) => masters.value.find((m) => m.id === id)?.full_name ?? `мастер #${id}`
+const masterName = (id) =>
+  id == null ? 'мастер не выбран' : masters.value.find((m) => m.id === id)?.full_name ?? `мастер #${id}`
 
 const money = (n) => `${new Intl.NumberFormat('ru-RU').format(n)} ₸`
 
@@ -205,13 +207,17 @@ async function load() {
     ]
     // Владелец выбирает мастера, мастеру список не нужен
     if (isOwner.value) jobs.push(api.get('/api/admin/masters'))
-    const [w, c, o, m] = await Promise.all(jobs)
+    // Офферы — обеим ролям: мастер принимает/отказывается, владелец видит очередь
+    jobs.push(api.get('/api/tattoo/offers'))
+    const [w, c, o, m, offs] = await Promise.all(jobs)
     works.value = w.works
     clients.value = c
     styleOptions.value = o.styles
     placementOptions.value = o.placements
     complexityOptions.value = o.complexities
     masters.value = m ?? []
+    offers.value = offs.offers
+    await loadPayments()
   } catch (err) {
     error.value = err.detail ?? err.message
   } finally {
@@ -248,6 +254,7 @@ function openSessionForm(w) {
   sessionWorkId.value = sessionWorkId.value === w.id ? null : w.id
   editWorkId.value = null
   editSession.value = null
+  finishPanel.value = null
   Object.assign(sessionForm, {
     session_date: '',
     recommended_price: '',
@@ -262,6 +269,7 @@ function openEditWork(w) {
   editWorkId.value = editWorkId.value === w.id ? null : w.id
   sessionWorkId.value = null
   editSession.value = null
+  finishPanel.value = null
   Object.assign(editWorkForm, {
     size_length_cm: w.size_length_cm,
     size_height_cm: w.size_height_cm,
@@ -269,6 +277,7 @@ function openEditWork(w) {
     style: w.style,
     placement: w.placement,
     status: w.status,
+    contract_price: w.contract_price ?? '',
   })
   error.value = ''
 }
@@ -282,6 +291,7 @@ function openEditSession(work, s) {
   editSession.value = { workId: work.id, sessionId: s.id }
   sessionWorkId.value = null
   editWorkId.value = null
+  finishPanel.value = null
   Object.assign(editSessionForm, {
     session_date: toLocalInput(s.session_date),
     recommended_price: s.recommended_price ?? '',
@@ -348,10 +358,8 @@ async function submitWork() {
     error.value = 'Выберите клиента'
     return
   }
-  if (isOwner.value && !form.master_id) {
-    error.value = 'Выберите мастера'
-    return
-  }
+  // Мастер может быть не выбран: пусто = «в очередь мастерам» — работу
+  // распределят по специализациям и загрузке (офферы)
   const len = Number(form.size_length_cm)
   const hgt = Number(form.size_height_cm)
   if (!len || len <= 0 || !hgt || hgt <= 0) {
@@ -372,7 +380,7 @@ async function submitWork() {
   error.value = ''
   notice.value = ''
   const workBody = {
-    master_id: isOwner.value ? Number(form.master_id) : null,
+    master_id: isOwner.value && form.master_id ? Number(form.master_id) : null,
     client_id: clientId,
     size_length_cm: len,
     size_height_cm: hgt,
@@ -480,6 +488,9 @@ async function submitEditWork(w) {
       style: editWorkForm.style,
       placement: editWorkForm.placement,
       status: editWorkForm.status,
+      ...(editWorkForm.contract_price !== ''
+        ? { contract_price: Number(editWorkForm.contract_price) }
+        : {}),
     })
     editWorkId.value = null
     notice.value = 'Работа обновлена, события в календаре пересинхронизированы.'
@@ -576,6 +587,7 @@ async function openSuppliesPanel(w, s) {
   sessionWorkId.value = null
   editWorkId.value = null
   editSession.value = null
+  finishPanel.value = null
   for (const k of Object.keys(useAmounts)) delete useAmounts[k]
   useNote.value = ''
   error.value = ''
@@ -627,13 +639,258 @@ async function submitSupplies() {
   }
 }
 
-onMounted(load)
+// ---------------------------------------------------------------------------
+// Завершение сеанса: баланс работы + оплата + пометка «сеанс прошёл».
+// Долг живёт на РАБОТЕ (contract_price − Σ оплаченных платежей), поэтому
+// «взяли меньше остатка» — не отдельная ветка: остаток автоматически
+// переезжает на следующий сеанс.
+// ---------------------------------------------------------------------------
+
+const finishPanel = ref(null) // { workId, sessionId } | null
+const finishBalance = ref(null) // GET /api/payments/works/{id}/balance
+const finishForm = reactive({
+  amount: '',
+  contract_price: '', // пусто нельзя: при первом счёте фиксирует цену работы
+  closeWork: false, // тату готово — этим сеансом закрываем работу
+  provider: 'manual', // manual | apipay (когда подключён и есть телефон)
+  note: '',
+})
+const finishSaving = ref(false)
+
+// Платежи всех работ одной выборкой: бейджи «оплачено/долг/счёт» в таблице
+const payments = ref([])
+
+const paidByWork = computed(() => {
+  const map = {}
+  for (const p of payments.value) {
+    if (p.status === 'paid' && p.work_id != null) {
+      map[p.work_id] = (map[p.work_id] ?? 0) + Number(p.amount)
+    }
+  }
+  return map
+})
+const pendingByWork = computed(() => {
+  const map = {}
+  for (const p of payments.value) {
+    if (p.status === 'pending' && p.work_id != null) {
+      map[p.work_id] = (map[p.work_id] ?? 0) + Number(p.amount)
+    }
+  }
+  return map
+})
+
+async function loadPayments() {
+  try {
+    payments.value = (await api.get('/api/payments?limit=200')).payments
+  } catch {
+    /* платежи не критичны для списка работ */
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Офферы: работа без мастера раздаётся по очереди (специализация → загрузка)
+// ---------------------------------------------------------------------------
+
+const offers = ref([])
+const offersByWork = computed(() => {
+  const map = {}
+  for (const o of offers.value) (map[o.work_id] ??= []).push(o)
+  return map
+})
+// У мастера — его pending-оффер (бэк отдаёт только свои); у владельца — null
+const myPendingOffer = computed(() => offers.value.find((o) => o.status === 'pending') ?? null)
+
+const offerBusy = ref(false)
+
+function fmtTime(iso) {
+  if (!iso) return ''
+  return new Date(iso).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+}
+
+// Владельцу — состояние очереди работы без мастера одной строкой
+function queueState(workId) {
+  const list = offersByWork.value[workId] ?? []
+  const pending = list.find((o) => o.status === 'pending')
+  if (pending) {
+    const until = pending.expires_at ? ` до ${fmtTime(pending.expires_at)}` : ''
+    return `ждёт ответа: ${pending.master_name}${until}`
+  }
+  const refused = list.filter((o) => o.status === 'declined' || o.status === 'expired').length
+  if (refused) return `отказались: ${refused} — реши сам`
+  return 'в очереди'
+}
+
+async function loadOffers() {
+  try {
+    offers.value = (await api.get('/api/tattoo/offers')).offers
+  } catch {
+    /* офферы не критичны */
+  }
+}
+
+async function answerOffer(offer, action) {
+  offerBusy.value = true
+  error.value = ''
+  notice.value = ''
+  try {
+    const fresh = await api.post(`/api/tattoo/offers/${offer.id}/${action}`)
+    if (action === 'accept') {
+      let prepay = ``
+      if (fresh.prepay_amount) {
+        prepay =
+          fresh.prepay_provider === 'apipay'
+            ? ` Счёт на предоплату ${money(fresh.prepay_amount)} ₸ выставлен (Kaspi) — у клиента 24 часа, дальше бронь отменится сама.`
+            : ` Предоплата ${money(fresh.prepay_amount)} ₸ — подтверди оплату кнопкой «Оплатил», не оплаченный Kaspi-счёт отменит бронь через 24ч.`
+      }
+      notice.value = `Работа закреплена за тобой: ${fresh.client_name}.${prepay}`
+    } else {
+      notice.value = 'Отказали — предложение ушло следующему мастеру.'
+    }
+    await load()
+  } catch (err) {
+    error.value = err.detail ?? err.message
+    await loadOffers()
+  } finally {
+    offerBusy.value = false
+  }
+}
+
+async function openFinishPanel(w, s) {
+  // повторный клик по 🏁 того же сеанса — закрыть
+  if (finishPanel.value?.sessionId === s.id) {
+    finishPanel.value = null
+    return
+  }
+  finishPanel.value = { workId: w.id, sessionId: s.id }
+  sessionWorkId.value = null
+  editWorkId.value = null
+  editSession.value = null
+  suppliesPanel.value = null
+  error.value = ''
+  finishBalance.value = null
+  try {
+    const b = await api.get(`/api/payments/works/${w.id}/balance`)
+    finishBalance.value = b
+    // Договорная цена: при первом счёте предзаполняем суммой сеансов по прайсу
+    finishForm.contract_price =
+      b.contract_price != null
+        ? String(b.contract_price)
+        : String(w.sessions.reduce((sum, x) => sum + Number(x.recommended_price ?? 0), 0) || '')
+    finishForm.amount = b.balance != null && b.balance > 0 ? String(b.balance) : ''
+    finishForm.closeWork = false
+    finishForm.note = ''
+    finishForm.provider = b.apipay_ready && b.client_phone ? 'apipay' : 'manual'
+  } catch (err) {
+    error.value = err.detail ?? err.message
+  }
+}
+
+async function submitFinish(w, s) {
+  const b = finishBalance.value
+  const amount = finishForm.amount === '' ? 0 : Number(finishForm.amount)
+  const cp = finishForm.contract_price === '' ? null : Number(finishForm.contract_price)
+  if (cp == null || Number.isNaN(cp) || cp <= 0) {
+    error.value = 'Укажите договорную цену работы'
+    return
+  }
+  if (finishForm.amount !== '' && (Number.isNaN(amount) || amount <= 0)) {
+    error.value = 'Сумма должна быть больше 0'
+    return
+  }
+  if (finishForm.provider === 'apipay' && !b.client_phone) {
+    error.value = 'У клиента нет телефона — счёт Kaspi не выставить, укажите его в «Клиентах»'
+    return
+  }
+  finishSaving.value = true
+  error.value = ''
+  notice.value = ''
+  try {
+    let invoiceNote = ''
+    if (amount > 0) {
+      const p = await api.post('/api/payments', {
+        work_id: w.id,
+        session_id: s.id,
+        amount,
+        contract_price: cp,
+        provider: finishForm.provider,
+        paid_now: finishForm.provider === 'manual',
+        note: finishForm.note.trim() || null,
+      })
+      invoiceNote =
+        p.status === 'paid'
+          ? ` Принято ${money(amount)}.`
+          : ` Счёт на ${money(amount)} выставлен — оплата подтянется автоматически.`
+    }
+    const body = { status: 'completed' }
+    if (finishForm.closeWork) body.is_final_session = true
+    await api.patch(`/api/tattoo/works/${w.id}/sessions/${s.id}`, body)
+    finishPanel.value = null
+    notice.value = 'Сеанс завершён.' + invoiceNote
+    await load()
+  } catch (err) {
+    error.value = err.detail ?? err.message
+  } finally {
+    finishSaving.value = false
+  }
+}
+
+// Счёты Kaspi подтягиваются сами: раз в 10с опрашиваем ApiPay по pending-счётам
+// (страховка, пока вебхук не подключён). Оплачено — обновляем бейджи и балансы.
+let paymentsSyncTimer = null
+async function syncPendingPayments() {
+  const pending = payments.value.filter(
+    (p) => p.provider === 'apipay' && p.status === 'pending' && p.external_invoice_id,
+  )
+  if (!pending.length) return
+  let changed = false
+  for (const p of pending.slice(0, 5)) {
+    try {
+      if ((await api.post(`/api/payments/${p.id}/sync`)).status !== p.status) changed = true
+    } catch {
+      /* сеть или счёт ещё дозревает (processing) — попробуем в следующий тик */
+    }
+  }
+  if (changed) await loadPayments()
+}
+
+onMounted(() => {
+  load()
+  paymentsSyncTimer = setInterval(syncPendingPayments, 10000)
+})
+onUnmounted(() => clearInterval(paymentsSyncTimer))
 </script>
 
 <template>
   <div>
     <div v-if="error" class="error-box">{{ error }}</div>
     <div v-else-if="notice" class="success-box">{{ notice }}</div>
+
+    <!-- Мастеру: предложили работу — принять или отказаться -->
+    <div v-if="!isOwner && myPendingOffer" class="card" style="margin-bottom: 16px; border: 1px solid rgba(108, 99, 255, 0.45)">
+      <div class="section-title">🔔 Тебя предложили работу</div>
+      <div style="font-weight: 600">{{ myPendingOffer.client_name }} · {{ myPendingOffer.style }}</div>
+      <div class="muted" style="font-size: 13px; margin-top: 2px">
+        {{ myPendingOffer.size_length_cm }}×{{ myPendingOffer.size_height_cm }} см ·
+        {{ myPendingOffer.complexity }} · {{ myPendingOffer.placement }}
+      </div>
+      <div class="muted" style="font-size: 13px; margin-top: 2px">
+        Сеанс: {{ myPendingOffer.session_date ? fmtDate(myPendingOffer.session_date) : 'дата не задана' }}
+        <template v-if="myPendingOffer.recommended_price">
+          · ориентир {{ money(myPendingOffer.recommended_price) }} ₸
+        </template>
+        <template v-if="myPendingOffer.expires_at">
+          · ответ до {{ fmtTime(myPendingOffer.expires_at) }}
+        </template>
+      </div>
+      <div style="display: flex; gap: 10px; margin-top: 10px">
+        <button class="btn btn-primary" :disabled="offerBusy" @click="answerOffer(myPendingOffer, 'accept')">
+          Принять
+        </button>
+        <button class="btn btn-ghost" :disabled="offerBusy" @click="answerOffer(myPendingOffer, 'decline')">
+          Отказать
+        </button>
+      </div>
+    </div>
 
     <div class="toolbar">
       <select v-if="isOwner" v-model="masterFilter" class="filter-select">
@@ -691,7 +948,7 @@ onMounted(load)
           <div v-if="isOwner" class="field">
             <label for="w-master">Мастер</label>
             <select id="w-master" v-model="form.master_id">
-              <option value="" disabled>Выберите мастера</option>
+              <option value="">В очередь мастерам</option>
               <option v-for="m in activeMasters" :key="m.id" :value="m.id">{{ m.full_name }}</option>
             </select>
           </div>
@@ -814,7 +1071,13 @@ onMounted(load)
             <tr v-if="!isOwner || !masterFilter || Number(masterFilter) === w.master_id">
               <td>
                 <div>{{ clientName(w.client_id) }}</div>
-                <div v-if="isOwner" class="muted" style="font-size: 12px">{{ masterName(w.master_id) }}</div>
+                <div v-if="isOwner && w.master_id" class="muted" style="font-size: 12px">
+                  {{ masterName(w.master_id) }}
+                </div>
+                <template v-if="isOwner && !w.master_id">
+                  <div class="badge badge-muted" style="margin-top: 4px">ищет мастера</div>
+                  <div class="muted" style="font-size: 12px; margin-top: 2px">{{ queueState(w.id) }}</div>
+                </template>
               </td>
               <td>
                 <div>{{ w.size_length_cm }}×{{ w.size_height_cm }} см · {{ w.complexity }}</div>
@@ -828,8 +1091,16 @@ onMounted(load)
                     — {{ s.cost != null ? money(s.cost) : (s.recommended_price != null ? `по прайсу ${money(s.recommended_price)}` : 'факт не указан') }}
                   </span>
                   <span v-if="s.is_final_session" class="badge badge-green">финал</span>
+                  <span v-if="s.status === 'completed'" class="badge badge-green">прошёл</span>
                   <button class="btn btn-sm" type="button" @click="openEditSession(w, s)">✏️</button>
                   <button class="btn btn-sm" type="button" @click="openPhotoPicker(w, s)">📷</button>
+                  <button
+                    v-if="s.status !== 'completed'"
+                    class="btn btn-sm"
+                    type="button"
+                    title="Завершить сеанс и принять оплату"
+                    @click="openFinishPanel(w, s)"
+                  >🏁</button>
                   <button
                     class="btn btn-sm"
                     type="button"
@@ -854,6 +1125,15 @@ onMounted(load)
                 <span class="badge" :class="w.status === 'completed' ? 'badge-green' : 'badge-muted'">
                   {{ STATUS_LABELS[w.status] ?? w.status }}
                 </span>
+                <div v-if="w.contract_price != null" class="muted" style="font-size: 12px; margin-top: 4px">
+                  Оплачено {{ money(paidByWork[w.id] ?? 0) }} из {{ money(w.contract_price) }}
+                </div>
+                <div v-if="w.contract_price != null && w.contract_price - (paidByWork[w.id] ?? 0) > 0" style="margin-top: 4px">
+                  <span class="badge badge-red">долг {{ money(w.contract_price - (paidByWork[w.id] ?? 0)) }}</span>
+                </div>
+                <div v-if="pendingByWork[w.id]" style="margin-top: 4px">
+                  <span class="badge badge-muted">счёт {{ money(pendingByWork[w.id]) }} ждёт</span>
+                </div>
               </td>
               <td style="text-align: right; white-space: nowrap">
                 <button class="btn btn-sm" @click="openEditWork(w)">✏️ Править</button>
@@ -901,6 +1181,16 @@ onMounted(load)
                       <select :id="`e-status-${w.id}`" v-model="editWorkForm.status">
                         <option v-for="(label, key) in STATUS_LABELS" :key="key" :value="key">{{ label }}</option>
                       </select>
+                    </div>
+                    <div class="field">
+                      <label :for="`e-contract-${w.id}`">Договорная цена, ₸</label>
+                      <input
+                        :id="`e-contract-${w.id}`"
+                        v-model="editWorkForm.contract_price"
+                        inputmode="decimal"
+                        placeholder="пусто — не задана"
+                        autocomplete="off"
+                      />
                     </div>
                   </div>
                   <p class="muted" style="font-size: 12px; margin: 8px 0 0">
@@ -987,6 +1277,83 @@ onMounted(load)
                     </div>
                   </template>
                 </form>
+              </td>
+            </tr>
+
+            <!-- Завершение сеанса: договорная цена + оплата + «сеанс прошёл» -->
+            <tr v-if="finishPanel?.workId === w.id">
+              <td colspan="6" style="background: rgba(108, 99, 255, 0.05)">
+                <form
+                  v-if="finishBalance"
+                  class="card inset"
+                  style="margin-top: 0"
+                  @submit.prevent="submitFinish(w, w.sessions.find((x) => x.id === finishPanel.sessionId))"
+                >
+                  <div class="section-title">Завершение сеанса — {{ finishBalance.client_name }}</div>
+                  <div class="form-grid">
+                    <div class="field">
+                      <label :for="`f-price-${w.id}`">Договорная цена работы, ₸</label>
+                      <input
+                        :id="`f-price-${w.id}`"
+                        v-model="finishForm.contract_price"
+                        inputmode="decimal"
+                        placeholder="за всю работу целиком"
+                        autocomplete="off"
+                      />
+                    </div>
+                    <div class="field">
+                      <label :for="`f-amount-${w.id}`">Взяли сейчас, ₸</label>
+                      <input
+                        :id="`f-amount-${w.id}`"
+                        v-model="finishForm.amount"
+                        inputmode="decimal"
+                        placeholder="0 — оплата позже"
+                        autocomplete="off"
+                      />
+                    </div>
+                    <div v-if="finishBalance.apipay_ready && finishBalance.client_phone" class="field">
+                      <label :for="`f-provider-${w.id}`">Как платит</label>
+                      <select :id="`f-provider-${w.id}`" v-model="finishForm.provider">
+                        <option value="apipay">Счёт Kaspi (push клиенту)</option>
+                        <option value="manual">Наличные / перевод — оплатил на месте</option>
+                      </select>
+                    </div>
+                  </div>
+                  <div class="muted" style="font-size: 12px">
+                    Оплачено: {{ money(finishBalance.paid_total) }}
+                    <template v-if="finishBalance.contract_price != null">
+                      из {{ money(finishBalance.contract_price) }}
+                    </template>
+                  </div>
+                  <div
+                    v-if="finishBalance.contract_price != null && finishBalance.contract_price - finishBalance.paid_total - (Number(finishForm.amount) || 0) > 0"
+                    class="muted"
+                    style="font-size: 12px; margin-top: 4px"
+                  >
+                    Остаток {{ money(finishBalance.contract_price - finishBalance.paid_total - (Number(finishForm.amount) || 0)) }}
+                    остаётся долгом работы — автоматически уйдёт в следующий сеанс.
+                  </div>
+                  <div class="field" style="margin-top: 10px">
+                    <label :for="`f-note-${w.id}`">Комментарий</label>
+                    <input
+                      :id="`f-note-${w.id}`"
+                      v-model="finishForm.note"
+                      placeholder="договорённость по оплате, необязательно"
+                      autocomplete="off"
+                    />
+                  </div>
+                  <label class="check">
+                    <input v-model="finishForm.closeWork" type="checkbox" />
+                    Работа завершена (тату готово; остаток должен быть 0)
+                  </label>
+                  <div style="display: flex; gap: 10px; margin-top: 12px">
+                    <button class="btn btn-primary" type="submit" :disabled="finishSaving">
+                      {{ finishSaving ? 'Сохраняем…' : 'Завершить сеанс' }}
+                    </button>
+                    <button class="btn btn-ghost" type="button" @click="finishPanel = null">Отмена</button>
+                  </div>
+                </form>
+                <div v-else class="muted" style="padding: 8px">Загрузка баланса…</div>
               </td>
             </tr>
 

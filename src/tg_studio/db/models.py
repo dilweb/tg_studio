@@ -125,6 +125,11 @@ class Master(Base):
     # реальную длительность задаёт конкретная запись. NULL = 60.
     default_duration_minutes: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
+    # Специализации — список стилей (строки справочника TattooStyle: те же
+    # значения, что в tattoo_works.style). Пустой список = универсал:
+    # подходит под любой стиль. Редактирует владелец в разделе «Мастера».
+    specializations: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+
     user: Mapped["User | None"] = relationship(back_populates="master")
     business: Mapped["Business"] = relationship(back_populates="masters")
     works: Mapped[list["TattooWork"]] = relationship(back_populates="master")
@@ -198,6 +203,49 @@ class TattooWorkStatus(str, enum.Enum):
     cancelled = "cancelled"
 
 
+class SessionOfferStatus(str, enum.Enum):
+    """Жизненный цикл оффера работы мастеру (распределение записей).
+
+    Очередь создаётся вся сразу (rank = позиция), но pending — только у
+    первого: принять может лишь тот, кому оффер предложен, «кто первый
+    успел» невозможно по построению.
+    """
+
+    queued = "queued"        # в очереди: станет pending после отказа/таймаута
+    pending = "pending"      # предложено мастеру, ждём ответа
+    accepted = "accepted"    # мастер взял работу
+    declined = "declined"    # мастер отказался
+    expired = "expired"      # не ответил за таймаут
+    closed = "closed"        # очередь закрыта: работу взял другой мастер
+
+
+class SessionOffer(Base):
+    """Оффер тату-работы конкретному мастеру.
+
+    Работа создаётся без мастера (tattoo_works.master_id = NULL), очередь
+    офферов распределяет её: специализация ∩ стиль → загрузка за месяц
+    сеанса (часы) → round-robin. Принять оффер может только тот мастер,
+    кому он сейчас предложен. Все офферы умирают вместе с работой
+    (ondelete=CASCADE).
+    """
+
+    __tablename__ = "session_offers"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    business_id: Mapped[int] = mapped_column(ForeignKey("businesses.id"), nullable=False, index=True)
+    work_id: Mapped[int] = mapped_column(
+        ForeignKey("tattoo_works.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    master_id: Mapped[int] = mapped_column(ForeignKey("masters.id"), nullable=False, index=True)
+
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default=SessionOfferStatus.queued.value)
+    rank: Mapped[int] = mapped_column(Integer, nullable=False)  # позиция в очереди
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    responded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
 class TattooProjectStatus(str, enum.Enum):
     planned = "planned"
     in_progress = "in_progress"
@@ -216,7 +264,8 @@ class TattooWork(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     client_id: Mapped[int] = mapped_column(ForeignKey("clients.id"), nullable=False, index=True)
-    master_id: Mapped[int] = mapped_column(ForeignKey("masters.id"), nullable=False, index=True)
+    # NULL = мастер ещё не назначен: работа в очереди офферов (session_offers)
+    master_id: Mapped[int | None] = mapped_column(ForeignKey("masters.id"), nullable=True, index=True)
     business_id: Mapped[int] = mapped_column(ForeignKey("businesses.id"), nullable=False, index=True)
 
     # Размер тату в сантиметрах: длина × высота (выбирается числами, не enum)
@@ -231,6 +280,12 @@ class TattooWork(Base):
     status: Mapped[TattooWorkStatus] = mapped_column(
         Enum(TattooWorkStatus), nullable=False, default=TattooWorkStatus.in_progress
     )
+
+    # Договорная цена ВСЕЙ работы (тенге). NULL — ещё не зафиксирована:
+    # фиксируется при первом счёте (POST /api/payments с contract_price),
+    # дальше меняется только явным пересмотром. Баланс считается как
+    # contract_price − Σ оплаченных платежей и нигде не хранится.
+    contract_price: Mapped[float | None] = mapped_column(Numeric(12, 2), nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
@@ -290,6 +345,69 @@ class TattooSession(Base):
     files: Mapped[list["TattooFile"]] = relationship(
         back_populates="session", cascade="all, delete-orphan"
     )
+
+
+class PaymentKind(str, enum.Enum):
+    """Тип платежа. Хранится строкой (.value) — как clients.source."""
+
+    prepay = "prepay"    # предоплата брони
+    partial = "partial"  # доплата в ходе работы (не закрывает баланс)
+    final = "final"      # финальный расчёт
+
+
+class PaymentStatus(str, enum.Enum):
+    pending = "pending"      # счёт выставлен, ждёт оплаты
+    paid = "paid"
+    cancelled = "cancelled"  # счёт отменили (сами), не оплата
+    expired = "expired"      # истёк по сроку (платёжная система)
+
+
+class PaymentProvider(str, enum.Enum):
+    manual = "manual"  # наличные / перевод — подтверждает мастер или владелец
+    apipay = "apipay"  # счёт Kaspi по номеру — оплату подтверждает вебхук
+
+
+class Payment(Base):
+    """Платёж по тату-работе: счёт (pending) и его оплата (paid).
+
+    Единственные хранимые факты о деньгах — договорная цена работы
+    (TattooWork.contract_price) и платежи. Баланс («сколько клиент должен»)
+    нигде не хранится: считается как contract_price − Σ платежей со
+    статусом paid, чтобы журнал не мог разойтись с балансом.
+
+    Работа/сеанс — ondelete=SET NULL: удаление работы не должно ломать
+    историю платежей (деньги уже прошли, теряется только ссылка).
+    """
+
+    __tablename__ = "payments"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    business_id: Mapped[int] = mapped_column(ForeignKey("businesses.id"), nullable=False, index=True)
+    work_id: Mapped[int | None] = mapped_column(
+        ForeignKey("tattoo_works.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    session_id: Mapped[int | None] = mapped_column(
+        ForeignKey("tattoo_sessions.id", ondelete="SET NULL"), nullable=True
+    )
+    amount: Mapped[float] = mapped_column(Numeric(12, 2), nullable=False)
+    kind: Mapped[str] = mapped_column(String(16), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False)
+    provider: Mapped[str] = mapped_column(String(32), nullable=False)
+    # Id счёта у платёжной системы (apipay); у manual — NULL
+    external_invoice_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    payment_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    # Кто выставил счёт (обе роли — Users) и чьё подтверждение оплаты
+    created_by_user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False)
+    master_id: Mapped[int | None] = mapped_column(ForeignKey("masters.id"), nullable=True)
+    confirmed_by_user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    paid_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    note: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    master: Mapped["Master | None"] = relationship()
 
 
 class SupplyMovementKind(str, enum.Enum):
