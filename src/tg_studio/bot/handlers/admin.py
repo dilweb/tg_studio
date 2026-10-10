@@ -25,5 +25,7 @@ async def _is_master(telegram_id: int) -> Master | None:
 @router.message(Command("help"))
 async def cmd_help(message: Message):
     await message.answer(
-        "/help — помощь"
+        "/help — помощь\n"
+        "/switchrole — переключить режим: владелец/мастер ↔ клиент "
+        "(тестирование клиентского чата и AI-агента)"
     )

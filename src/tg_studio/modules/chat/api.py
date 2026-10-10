@@ -5,10 +5,13 @@ from urllib.parse import quote
 from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import Response
 
-from tg_studio.api.admin_deps import MasterBusinessDep, get_master_business
+from tg_studio.api.admin_deps import (
+    MasterBusinessAndSelfDep,
+    get_master_business_and_self,
+)
 from tg_studio.api.auth import CurrentUserOptionalDep
 from tg_studio.api.deps import SessionDep
-from tg_studio.modules.chat import service
+from tg_studio.modules.chat import assignments, service
 from tg_studio.modules.chat.schemas import ChatMessageCreate, ChatMessageOut, ChatThreadOut
 
 router = APIRouter(prefix="/admin/chats", tags=["admin • chats"])
@@ -23,11 +26,28 @@ async def _get_client_or_404(session, client_id: int):
     return client
 
 
+async def _ensure_chat_access(session, master, client_id: int) -> None:
+    """Мастеру — только чаты, закреплённые за ним (404, чтобы не раскрывать чужие)."""
+    if master is None:
+        return
+    assignment = await assignments.get_open_assignment(session, client_id)
+    if assignment is None or assignment.master_id != master.id:
+        raise HTTPException(status_code=404, detail="Чат не найден")
+
+
 @router.get("", response_model=list[ChatThreadOut])
-async def list_chats(session: SessionDep, _business: MasterBusinessDep) -> list[ChatThreadOut]:
-    # Клиенты не привязаны к бизнесу (Client без business_id) — один бизнес,
-    # auth-зависимость здесь только проверяет доступ owner/master
-    return [ChatThreadOut(**t) for t in await service.list_threads(session)]
+async def list_chats(
+    session: SessionDep, business_and_self: MasterBusinessAndSelfDep
+) -> list[ChatThreadOut]:
+    # Клиенты не привязаны к бизнесу (Client без business_id) — один бизнес.
+    # Владелец видит все чаты, мастер — только закреплённые за ним.
+    _business, master = business_and_self
+    return [
+        ChatThreadOut(**t)
+        for t in await service.list_threads(
+            session, master_id=master.id if master else None
+        )
+    ]
 
 
 @router.get("/files/{message_id}")
@@ -51,7 +71,8 @@ async def get_message_file(
         # Без валидного токена — обычная авторизация owner/master
         if user is None:
             raise HTTPException(status_code=401, detail="Authorization required")
-        await get_master_business(user, session)
+        _business, master = await get_master_business_and_self(user, session)
+        await _ensure_chat_access(session, master, msg.client_id)
     try:
         data = await service.download_photo(msg.telegram_file_id)
     except service.TelegramSendError:
@@ -80,10 +101,12 @@ async def get_message_file(
 async def get_messages(
     client_id: int,
     session: SessionDep,
-    _business: MasterBusinessDep,
+    business_and_self: MasterBusinessAndSelfDep,
     after_id: int | None = Query(default=None),
 ) -> list[ChatMessageOut]:
+    _business, master = business_and_self
     await _get_client_or_404(session, client_id)
+    await _ensure_chat_access(session, master, client_id)
     msgs = await service.list_messages(session, client_id, after_id=after_id)
     return [_to_out(m) for m in msgs]
 
@@ -93,9 +116,11 @@ async def post_message(
     client_id: int,
     body: ChatMessageCreate,
     session: SessionDep,
-    _business: MasterBusinessDep,
+    business_and_self: MasterBusinessAndSelfDep,
 ) -> ChatMessageOut:
+    _business, master = business_and_self
     client = await _get_client_or_404(session, client_id)
+    await _ensure_chat_access(session, master, client_id)
     try:
         msg = await service.send_text_message(session, client, body.content)
     except service.TelegramSendError as exc:
@@ -107,11 +132,13 @@ async def post_message(
 async def post_photo(
     client_id: int,
     session: SessionDep,
-    _business: MasterBusinessDep,
+    business_and_self: MasterBusinessAndSelfDep,
     file: UploadFile = File(...),
     caption: str | None = Form(default=None),
 ) -> ChatMessageOut:
+    _business, master = business_and_self
     client = await _get_client_or_404(session, client_id)
+    await _ensure_chat_access(session, master, client_id)
     if file.content_type and not file.content_type.startswith("image/"):
         raise HTTPException(status_code=400, detail="Только изображения")
     data = await file.read()
@@ -128,9 +155,11 @@ async def post_photo(
 
 @router.post("/{client_id}/read")
 async def mark_read(
-    client_id: int, session: SessionDep, _business: MasterBusinessDep
+    client_id: int, session: SessionDep, business_and_self: MasterBusinessAndSelfDep
 ) -> dict:
+    _business, master = business_and_self
     await _get_client_or_404(session, client_id)
+    await _ensure_chat_access(session, master, client_id)
     marked = await service.mark_thread_read(session, client_id)
     return {"marked": marked}
 

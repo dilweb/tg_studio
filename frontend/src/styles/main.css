@@ -137,6 +137,16 @@ a {
   border-color: var(--accent);
 }
 
+/* Чекбоксы внутри .field — не текстовые инпуты: без растягивания и паддингов */
+.field input[type="checkbox"] {
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  border-radius: 4px;
+  accent-color: var(--accent);
+  flex-shrink: 0;
+}
+
 .field select,
 .field textarea {
   background: var(--surface2);

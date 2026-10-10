@@ -209,13 +209,16 @@ async function load() {
     if (isOwner.value) jobs.push(api.get('/api/admin/masters'))
     // Офферы — обеим ролям: мастер принимает/отказывается, владелец видит очередь
     jobs.push(api.get('/api/tattoo/offers'))
-    const [w, c, o, m, offs] = await Promise.all(jobs)
-    works.value = w.works
-    clients.value = c
-    styleOptions.value = o.styles
-    placementOptions.value = o.placements
-    complexityOptions.value = o.complexities
-    masters.value = m ?? []
+    // Пачка разной длины (masters — только владельцу), разбираем по индексам:
+    // последний ответ всегда офферы, masters (если есть) — предпоследний
+    const results = await Promise.all(jobs)
+    const offs = results[results.length - 1]
+    works.value = results[0].works
+    clients.value = results[1]
+    styleOptions.value = results[2].styles
+    placementOptions.value = results[2].placements
+    complexityOptions.value = results[2].complexities
+    masters.value = results.length > 4 ? results[3] : []
     offers.value = offs.offers
     await loadPayments()
   } catch (err) {

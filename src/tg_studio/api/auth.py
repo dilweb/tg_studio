@@ -3,10 +3,12 @@ Authentication module.
 
 Supports two auth strategies:
 - JWT Bearer tokens (web panel for owners/masters)
-- Telegram initData HMAC (Mini App: подпись валидируется, роль берётся из ALLOWED_USERS)
+- Telegram initData HMAC (Mini App: подпись валидируется, роль из БД/ALLOWED_USERS)
 
-Доступ и роли решает env ALLOWED_USERS (JSON: [{"id": <tg_id>, "role": "owner"|"master"}]).
-Соответствующая строка User в БД создаётся/синхронизируется автоматически.
+Роли: владелец — из env ALLOWED_USERS (JSON [{"id": <tg_id>, "role": "owner"}]),
+мастера — из БД: активная строка Master с этим telegram_id (заводится владельцем
+в разделе «Мастера», без правок env и деплоя). Соответствующая строка User
+создаётся/привязывается автоматически.
 
 Clients authenticate via Telegram bot natively (telegram_id from message.from_user.id).
 """
@@ -27,7 +29,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from tg_studio.config import settings
-from tg_studio.db.models import User, UserRole
+from tg_studio.db.models import Master, User, UserRole
 from tg_studio.db.session import get_session
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
@@ -202,12 +204,45 @@ def resolve_allowed_role(tg_id: int) -> UserRole | None:
     return None
 
 
+async def resolve_master_role(session: AsyncSession, tg_id: int) -> UserRole | None:
+    """Мастер не в env — роль решает БД: активный (не удалённый) мастер
+    с таким telegram_id, заведённый владельцем в разделе «Мастера»."""
+    result = await session.execute(
+        select(Master.id).where(
+            Master.telegram_id == tg_id,
+            Master.is_active.is_(True),
+            Master.deleted_at.is_(None),
+        )
+    )
+    return UserRole.master if result.scalar_one_or_none() is not None else None
+
+
+async def _bind_master_user(session: AsyncSession, user: User) -> None:
+    """Привязать Master.user_id при входе мастера (initData даёт telegram_id,
+    а дальше панель ищет мастер-профиль по user_id)."""
+    if user.role != UserRole.master or not user.telegram_id:
+        return
+    result = await session.execute(
+        select(Master).where(
+            Master.telegram_id == user.telegram_id,
+            Master.user_id.is_(None),
+            Master.is_active.is_(True),
+            Master.deleted_at.is_(None),
+        )
+    )
+    master = result.scalar_one_or_none()
+    if master:
+        master.user_id = user.id
+        await session.commit()
+
+
 async def _provision_allowed_user(
     session: AsyncSession,
     tg_user: dict,
     role: UserRole,
 ) -> User:
-    """Найти или создать User по telegram_id; роль всегда синхронизируем с env."""
+    """Найти или создать User по telegram_id; роль синхронизируем
+    (env — источник правды для владельца, для мастера приходит из БД)."""
     result = await session.execute(
         select(User).where(User.telegram_id == tg_user["id"])
     )
@@ -289,15 +324,19 @@ async def get_current_user(
                 status_code=401,
                 detail="No credentials and ALLOWED_USERS is empty (set X-Debug-User-Id)",
             )
-        role = resolve_allowed_role(debug_tg_id)
+        role = resolve_allowed_role(debug_tg_id) or await resolve_master_role(
+            session, debug_tg_id
+        )
         if role is None:
             raise HTTPException(
                 status_code=403,
-                detail=f"tg_id {debug_tg_id} отсутствует в ALLOWED_USERS",
+                detail=f"tg_id {debug_tg_id} отсутствует в ALLOWED_USERS и среди мастеров",
             )
-        return await _provision_allowed_user(
+        user = await _provision_allowed_user(
             session, {"id": debug_tg_id, "first_name": f"Debug {debug_tg_id}"}, role
         )
+        await _bind_master_user(session, user)
+        return user
 
     # Path 1: JWT Bearer or HttpOnly access cookie
     bearer_or_cookie: str | None = None
@@ -320,17 +359,20 @@ async def get_current_user(
         _require_email_verified_if_applicable(request, user)
         return user
 
-    # Path 2: Telegram initData (Mini App) — tg_id матчим с ALLOWED_USERS
+    # Path 2: Telegram initData (Mini App) — владелец из env, мастер из БД
     if authorization and authorization.startswith("TelegramInitData "):
         init_data = authorization.removeprefix("TelegramInitData ")
         tg_user = _validate_init_data(init_data, settings.bot_token)
-        role = resolve_allowed_role(tg_user["id"])
+        role = resolve_allowed_role(tg_user["id"]) or await resolve_master_role(
+            session, tg_user["id"]
+        )
         if role is None:
             raise HTTPException(
                 status_code=403,
-                detail="Этот Telegram-аккаунт не добавлен в ALLOWED_USERS",
+                detail="Этот Telegram-аккаунт не добавлен в ALLOWED_USERS и не числится мастером",
             )
         user = await _provision_allowed_user(session, tg_user, role)
+        await _bind_master_user(session, user)
         return user
 
     raise HTTPException(

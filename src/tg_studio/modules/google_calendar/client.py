@@ -6,6 +6,7 @@ the key JSON is stored on the Business record and credentials self-refresh
 via JWT — no OAuth consent flow involved.
 """
 import json
+import logging
 from datetime import datetime
 from pathlib import Path
 
@@ -16,6 +17,8 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
 from tg_studio.config import settings
+
+logger = logging.getLogger(__name__)
 
 # Full read/write access to Google Calendar
 SCOPES = ["https://www.googleapis.com/auth/calendar"]
@@ -262,6 +265,32 @@ async def create_calendar(credentials_json: str, summary: str) -> str | None:
         return created.get("id")
     except HttpError:
         return None
+
+
+async def delete_calendar(credentials_json: str, calendar_id: str) -> bool:
+    """
+    Delete a secondary calendar by its ID (used when a master is deleted).
+
+    Best-effort: any failure (network included — googleapiclient raises
+    OSError before HttpError ever appears) → False, master deletion proceeds.
+    """
+    creds = _load_credentials(credentials_json)
+    if not creds:
+        return False
+
+    refresh_if_expired(creds)
+
+    try:
+        service = build("calendar", "v3", credentials=creds)
+        service.calendars().delete(calendarId=calendar_id).execute()
+        return True
+    except Exception:
+        logger.warning(
+            "Не удалось удалить календарь %s — его можно убрать вручную в Google Calendar",
+            calendar_id,
+            exc_info=True,
+        )
+        return False
 
 
 async def share_calendar(

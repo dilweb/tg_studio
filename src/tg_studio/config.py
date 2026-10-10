@@ -34,8 +34,17 @@ class Settings(BaseSettings):
     # Database
     database_url: str = "postgresql+asyncpg://tg_studio:secret@localhost:5432/tg_studio"
 
-    # Локальное хранилище фото сеансов (tattoo-модуль): bind mount в контейнере
+    # Локальное хранилище фото сеансов (tattoo-модуль): bind mount в контейнере.
+    # Используется как fallback, если S3 не настроен.
     upload_dir: str = "/app/uploads"
+
+    # S3/MinIO — файловое хранилище (фото сеансов, портфолио, аватары).
+    # Все четыре переменные заданы → файлы пишутся в бакет, метаданные
+    # остаются в Postgres. Пусто → диск (upload_dir).
+    s3_endpoint_url: str = ""  # напр. http://minio:9000
+    s3_bucket: str = "tg-studio"
+    s3_access_key: str = ""
+    s3_secret_key: str = ""
 
     # Redis / Celery
     redis_url: str = "redis://localhost:6379/0"
@@ -45,10 +54,19 @@ class Settings(BaseSettings):
     # Public URL for email verification links
     public_url: str = ""
 
+    # Публичный URL API (для абсолютных ссылок из бота, напр. портфолио мастеров)
+    api_public_url: str = ""
+
     # LLM (OpenAI-compatible: OpenAI, Gemini, etc.)
     llm_api_key: str = ""
     llm_base_url: str = ""
     llm_model: str = ""
+    # Основная модель AI-ассистента: мультимодальная — видит фото клиентов
+    # (эскизы, референсы). Пусто = использовать llm_model
+    llm_multimodal_model: str = ""
+    # Лёгкая модель-классификатор (роутер клиентских сообщений агент/мастер);
+    # пусто = использовать llm_model
+    llm_router_model: str = ""
 
     # JWT
     jwt_secret_key: str = "change-me-in-production"
@@ -91,6 +109,18 @@ class Settings(BaseSettings):
             msg = "COOKIE_SAMESITE=none requires COOKIE_SECURE=true"
             raise ValueError(msg)
         return self
+
+    @property
+    def s3_enabled(self) -> bool:
+        return bool(
+            self.s3_endpoint_url and self.s3_bucket and self.s3_access_key and self.s3_secret_key
+        )
+
+    @property
+    def assistant_model(self) -> str:
+        """Модель AI-ассистента: мультимодальная, если задана (видит фото
+        клиентов — эскизы и референсы), иначе обычная llm_model."""
+        return self.llm_multimodal_model or self.llm_model
 
 
 settings = Settings()

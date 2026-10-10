@@ -14,12 +14,22 @@ from datetime import datetime
 
 from aiogram import Bot
 from aiogram.exceptions import TelegramAPIError
-from aiogram.types import BufferedInputFile
+from aiogram.types import BufferedInputFile, InlineKeyboardMarkup, InputMediaPhoto
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from tg_studio.config import settings
-from tg_studio.db.models import Business, ChatDirection, ChatMessage, Client, User, UserRole
+from tg_studio.db.models import (
+    Business,
+    ChatAssignment,
+    ChatAssignmentStatus,
+    ChatDirection,
+    ChatMessage,
+    Client,
+    Master,
+    User,
+    UserRole,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -106,11 +116,13 @@ async def _close_bot(bot: Bot) -> None:
 # Telegram I/O — нижний уровень
 # ---------------------------------------------------------------------------
 
-async def send_text_to_telegram(telegram_id: int, text: str) -> int:
+async def send_text_to_telegram(
+    telegram_id: int, text: str, reply_markup: InlineKeyboardMarkup | None = None
+) -> int:
     """Отправить текст клиенту. Возвращает telegram message_id."""
     bot = _new_bot()
     try:
-        msg = await bot.send_message(telegram_id, text)
+        msg = await bot.send_message(telegram_id, text, reply_markup=reply_markup)
         return msg.message_id
     except TelegramAPIError as exc:
         raise TelegramSendError(str(exc)) from exc
@@ -131,6 +143,31 @@ async def send_photo_to_telegram(
         )
         photo_file_id = msg.photo[-1].file_id if msg.photo else ""
         return msg.message_id, photo_file_id
+    except TelegramAPIError as exc:
+        raise TelegramSendError(str(exc)) from exc
+    finally:
+        await _close_bot(bot)
+
+
+async def send_media_group_to_telegram(
+    telegram_id: int, photos: list[bytes], caption: str | None = None
+) -> list[tuple[int, str]]:
+    """Отправить альбом (2-10 фото, подпись — у первого). Возвращает
+    [(message_id, file_id), ...] в порядке отправки."""
+    bot = _new_bot()
+    try:
+        media = [
+            InputMediaPhoto(
+                media=BufferedInputFile(data, filename="photo.jpg"),
+                caption=caption if i == 0 else None,
+            )
+            for i, data in enumerate(photos)
+        ]
+        msgs = await bot.send_media_group(telegram_id, media=media)
+        return [
+            (m.message_id, m.photo[-1].file_id if m.photo else "")
+            for m in msgs
+        ]
     except TelegramAPIError as exc:
         raise TelegramSendError(str(exc)) from exc
     finally:
@@ -168,14 +205,21 @@ async def upsert_client_from_telegram(
     full_name = " ".join(n for n in (first_name, last_name) if n) or f"tg_{telegram_id}"
 
     if client is None:
-        user = User(
-            telegram_id=telegram_id,
-            first_name=first_name or full_name,
-            last_name=last_name,
-            role=UserRole.client,
+        # User с этим telegram_id мог уже существовать (owner/мастер тестируют
+        # бот в режиме клиента через /switchrole) — переиспользуем его
+        user_result = await session.execute(
+            select(User).where(User.telegram_id == telegram_id)
         )
-        session.add(user)
-        await session.flush()
+        user = user_result.scalar_one_or_none()
+        if user is None:
+            user = User(
+                telegram_id=telegram_id,
+                first_name=first_name or full_name,
+                last_name=last_name,
+                role=UserRole.client,
+            )
+            session.add(user)
+            await session.flush()
         client = Client(
             user_id=user.id,
             telegram_id=telegram_id,
@@ -229,6 +273,49 @@ async def save_incoming_message(
         content=content,
         telegram_file_id=telegram_file_id,
         file_kind=file_kind,
+    )
+    session.add(msg)
+    await session.commit()
+    return msg
+
+
+async def get_single_business(session: AsyncSession) -> Business | None:
+    """Единственный бизнес (клиенты не привязаны к бизнесу — один бизнес)."""
+    result = await session.execute(select(Business).limit(1))
+    return result.scalar_one_or_none()
+
+
+async def save_ai_message(
+    session: AsyncSession, client: Client, content: str, *, telegram_message_id: int | None
+) -> ChatMessage:
+    """Ответ AI-агента клиенту: зеркало в chat_messages (direction=from_ai)."""
+    msg = ChatMessage(
+        client_id=client.id,
+        direction=ChatDirection.from_ai,
+        content=content,
+        telegram_message_id=telegram_message_id,
+    )
+    session.add(msg)
+    await session.commit()
+    return msg
+
+
+async def save_ai_photo_message(
+    session: AsyncSession,
+    client: Client,
+    caption: str | None,
+    *,
+    telegram_message_id: int,
+    telegram_file_id: str,
+) -> ChatMessage:
+    """Фото от AI-агента (портфолио мастера): зеркало с file_kind=photo."""
+    msg = ChatMessage(
+        client_id=client.id,
+        direction=ChatDirection.from_ai,
+        content=caption,
+        file_kind="photo",
+        telegram_message_id=telegram_message_id,
+        telegram_file_id=telegram_file_id,
     )
     session.add(msg)
     await session.commit()
@@ -330,10 +417,12 @@ async def send_photo_message(
 # Чтение (API)
 # ---------------------------------------------------------------------------
 
-async def list_threads(session: AsyncSession) -> list[dict]:
+async def list_threads(session: AsyncSession, master_id: int | None = None) -> list[dict]:
     """Список чатов: клиент + последнее сообщение + непрочитанные.
 
-    Без DISTINCT ON (sqlite-тесты): последний id через подзапрос MAX(id).
+    master_id — фильтр для мастера: только чаты, закреплённые за ним открытым
+    assignment'ом (владелец видит все). Без DISTINCT ON (sqlite-тесты):
+    последний id через подзапрос MAX(id).
     """
     result = await session.execute(
         select(ChatMessage).where(
@@ -345,6 +434,23 @@ async def list_threads(session: AsyncSession) -> list[dict]:
     last_by_client = {m.client_id: m for m in result.scalars().all()}
     if not last_by_client:
         return []
+
+    # Мастер: только клиенты с открытым закреплением за ним
+    if master_id is not None:
+        pinned = await session.execute(
+            select(ChatAssignment.client_id).where(
+                ChatAssignment.master_id == master_id,
+                ChatAssignment.status == ChatAssignmentStatus.open,
+            )
+        )
+        # set() один раз: повторный .all() по тому же Result вернёт пустоту —
+        # курсор уже исчерпан, и фильтр выкинет все чаты
+        pinned_ids = set(pinned.scalars().all())
+        last_by_client = {
+            cid: msg for cid, msg in last_by_client.items() if cid in pinned_ids
+        }
+        if not last_by_client:
+            return []
 
     clients = await session.execute(
         select(Client).where(Client.id.in_(last_by_client.keys()))
@@ -360,6 +466,17 @@ async def list_threads(session: AsyncSession) -> list[dict]:
         .group_by(ChatMessage.client_id)
     )
     unread_by_client = dict(unread.all())
+
+    # Открытые закрепления чатов за мастерами (после эскалации AI-агентом)
+    assignment_rows = await session.execute(
+        select(ChatAssignment.client_id, Master.full_name)
+        .join(Master, Master.id == ChatAssignment.master_id)
+        .where(
+            ChatAssignment.client_id.in_(last_by_client.keys()),
+            ChatAssignment.status == ChatAssignmentStatus.open,
+        )
+    )
+    assigned_by_client = dict(assignment_rows.all())
 
     threads = []
     for client_id, last in sorted(
@@ -380,6 +497,7 @@ async def list_threads(session: AsyncSession) -> list[dict]:
                 "last_message_preview": _preview(last),
                 "last_direction": last.direction.value,
                 "unread_count": unread_by_client.get(client_id, 0),
+                "assigned_master_name": assigned_by_client.get(client_id),
             }
         )
     return threads

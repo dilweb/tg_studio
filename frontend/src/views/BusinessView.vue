@@ -7,6 +7,46 @@ const info = ref(null)
 const loading = ref(true)
 const error = ref('')
 
+// ── Профиль бизнеса: название, описание, телефон ─────────────────────────────
+// description — база знаний AI-агента (ресепшн бота): он отвечает клиентам
+// о студии только из этого текста.
+const editingInfo = ref(false)
+const infoBusy = ref(false)
+const infoSaved = ref(false)
+const infoForm = reactive({ name: '', description: '', phone: '' })
+
+function openEditInfo() {
+  infoForm.name = info.value.name
+  infoForm.description = info.value.description ?? ''
+  infoForm.phone = info.value.phone ?? ''
+  infoSaved.value = false
+  editingInfo.value = true
+}
+
+async function saveInfo() {
+  if (!infoForm.name.trim()) {
+    error.value = 'Введите название студии'
+    return
+  }
+  infoBusy.value = true
+  infoSaved.value = false
+  error.value = ''
+  try {
+    info.value = await api.put('/api/admin/business', {
+      name: infoForm.name.trim(),
+      description: infoForm.description.trim(),
+      phone: infoForm.phone.trim() || null,
+    })
+    editingInfo.value = false
+    infoSaved.value = true
+    setTimeout(() => (infoSaved.value = false), 3000)
+  } catch (err) {
+    error.value = err.detail ?? err.message
+  } finally {
+    infoBusy.value = false
+  }
+}
+
 // ── Прайс: глобальный % и все коэффициенты ───────────────────────────────────
 const pricing = reactive({
   global_percent: 100,
@@ -179,21 +219,57 @@ onMounted(async () => {
       <div class="card" style="margin-bottom: 16px">
         <div class="section-head">
           <h2>{{ info.name }}</h2>
-          <span class="badge" :class="info.is_active ? 'badge-green' : 'badge-muted'">
-            {{ info.is_active ? 'Активен' : 'Выключен' }}
+          <span style="display: flex; gap: 8px; align-items: center">
+            <span v-if="infoSaved" class="badge badge-green">Сохранено</span>
+            <span class="badge" :class="info.is_active ? 'badge-green' : 'badge-muted'">
+              {{ info.is_active ? 'Активен' : 'Выключен' }}
+            </span>
+            <button class="btn btn-sm" @click="editingInfo ? (editingInfo = false) : openEditInfo()">
+              {{ editingInfo ? 'Отмена' : 'Изменить' }}
+            </button>
           </span>
         </div>
-        <div v-if="info.description" style="margin-bottom: 12px">{{ info.description }}</div>
-        <div style="display: flex; gap: 24px; flex-wrap: wrap; font-size: 13px">
-          <div>
-            <div class="muted">Телефон</div>
-            <div>{{ info.phone ?? '—' }}</div>
+
+        <form v-if="editingInfo" @submit.prevent="saveInfo">
+          <div class="field">
+            <label for="b-name">Название</label>
+            <input id="b-name" v-model="infoForm.name" autocomplete="off" />
           </div>
-          <div>
-            <div class="muted">Telegram владельца</div>
-            <div>{{ info.owner_telegram_id }}</div>
+          <div class="field">
+            <label for="b-desc">Описание студии</label>
+            <textarea id="b-desc" v-model="infoForm.description" rows="5"></textarea>
+            <div class="muted" style="font-size: 12px; margin-top: 4px">
+              Этот текст знает AI-ассистент в боте: адрес, как найти вход, условия студии.
+              Клиенту о том, чего здесь нет (цены и т.п.), он скажет «обсудите с мастером».
+            </div>
           </div>
-        </div>
+          <div class="field" style="max-width: 280px">
+            <label for="b-phone">Телефон</label>
+            <input id="b-phone" v-model="infoForm.phone" autocomplete="off" />
+          </div>
+          <button class="btn btn-primary" type="submit" :disabled="infoBusy">
+            {{ infoBusy ? 'Сохраняем…' : 'Сохранить' }}
+          </button>
+        </form>
+
+        <template v-else>
+          <div v-if="info.description" style="margin-bottom: 12px; white-space: pre-line">
+            {{ info.description }}
+          </div>
+          <div v-else class="muted" style="margin-bottom: 12px; font-size: 13px">
+            Описание не заполнено — AI-ассистенту нечего рассказать клиентам о студии
+          </div>
+          <div style="display: flex; gap: 24px; flex-wrap: wrap; font-size: 13px">
+            <div>
+              <div class="muted">Телефон</div>
+              <div>{{ info.phone ?? '—' }}</div>
+            </div>
+            <div>
+              <div class="muted">Telegram владельца</div>
+              <div>{{ info.owner_telegram_id }}</div>
+            </div>
+          </div>
+        </template>
       </div>
 
       <div class="card">

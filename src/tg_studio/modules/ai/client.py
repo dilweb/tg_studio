@@ -3,6 +3,7 @@ AI chat orchestrator — manages the OpenAI conversation loop with function call
 Tool calls execute immediately without user confirmation (read-only SQL is already validated).
 """
 
+import base64
 import inspect
 import json
 import logging
@@ -53,6 +54,41 @@ class ChatResult:
     awaiting_confirmation: bool
 
 
+@dataclass
+class ChatImage:
+    """Картинка от пользователя (эскиз, референс): байты + mime.
+
+    Уходит в модель как image_url с data-URI — хранить её в ai_messages
+    не нужно: достаточно текстового факта, что клиент прислал фото
+    (история после хода — только текст).
+    """
+
+    data: bytes
+    mime: str = "image/jpeg"
+    description: str | None = None  # подпись клиента, идёт текстом перед фото
+
+
+def _user_content(
+    text: str, images: list[ChatImage] | None
+) -> str | list[dict[str, Any]]:
+    """Контент user-сообщения: строка, а с фото — multipart-массив
+    (OpenAI-совместимый vision-формат, data-URI вместо загрузки файлов)."""
+    if not images:
+        return text
+    parts: list[dict[str, Any]] = []
+    if text:
+        parts.append({"type": "text", "text": text})
+    for img in images:
+        b64 = base64.b64encode(img.data).decode("ascii")
+        parts.append(
+            {
+                "type": "image_url",
+                "image_url": {"url": f"data:{img.mime};base64,{b64}"},
+            }
+        )
+    return parts
+
+
 def get_openai_client() -> AsyncOpenAI:
     global _openai_client
     if _openai_client is None:
@@ -61,6 +97,12 @@ def get_openai_client() -> AsyncOpenAI:
             kwargs["base_url"] = settings.llm_base_url
         _openai_client = AsyncOpenAI(**kwargs)
     return _openai_client
+
+
+def assistant_model() -> str:
+    """Модель хода ассистента: мультимодальная (settings.assistant_model),
+    если задана, иначе llm_model."""
+    return settings.assistant_model
 
 
 class ConversationNotFoundError(Exception):
@@ -91,6 +133,23 @@ async def _load_or_create_conversation(
         raise ConversationNotFoundError(
             f"Conversation #{conversation_id} not found"
         )
+
+    # Без явного conversation_id клиентский агент продолжает последнюю беседу
+    # клиента: история хранится в ai_messages и переживает перезапуски
+    if client_id is not None:
+        result = await session.execute(
+            select(AIConversation)
+            .options(selectinload(AIConversation.messages))
+            .where(
+                AIConversation.business_id == business_id,
+                AIConversation.client_id == client_id,
+            )
+            .order_by(AIConversation.id.desc())
+            .limit(1)
+        )
+        conv = result.scalar_one_or_none()
+        if conv is not None:
+            return conv
 
     conv = AIConversation(business_id=business_id, user_id=user_id, client_id=client_id)
     session.add(conv)
@@ -231,6 +290,7 @@ async def _execute_pending_tools(
     tool_registry: dict[str, Callable],
     build_prompt: Callable[[Business], str],
     on_event: AIEvHandler = None,
+    images: list[ChatImage] | None = None,
 ) -> ChatResult:
     """Execute pending tool calls and run the analytics loop."""
     pending_msg = None
@@ -252,14 +312,31 @@ async def _execute_pending_tools(
 
     # Build message list: history BEFORE the tool_calls msg (cleaned),
     # then the tool_calls msg itself (manually, so it keeps tool_calls).
+    # history_before может кончаться «фото»-user-сообщением — превращаем его
+    # обратно в multipart с data-URI, чтобы модель видела картинки во всех
+    # раундах лупа (в БД лежит только текстовый факт).
     history_before = conversation.messages[:pending_idx]
+    rebuilt_history = []
+    for msg in _db_messages_to_openai(history_before, conversation.summary):
+        if (
+            images
+            and msg.get("role") == "user"
+            and isinstance(msg.get("content"), str)
+            and "[Клиент прислал фото" in msg["content"]
+        ):
+            rebuilt_history.append(
+                {"role": "user", "content": _user_content(msg["content"], images)}
+            )
+            images = None  # подставили один раз — дальше текстовый факт
+        else:
+            rebuilt_history.append(msg)
 
     system_prompt = build_prompt(business)
     if inspect.isawaitable(system_prompt):
         system_prompt = await system_prompt
     openai_messages = [
         {"role": "system", "content": system_prompt},
-        *_db_messages_to_openai(history_before, conversation.summary),
+        *rebuilt_history,
         {
             "role": "assistant",
             "content": pending_msg.content,
@@ -312,6 +389,7 @@ async def _execute_pending_tools(
         client,
         openai_messages,
         execute_tool=_tool,
+        model=assistant_model(),
         tools=tools,
         max_tool_rounds=MAX_TOOL_ROUNDS,
         on_event=on_event,
@@ -369,12 +447,16 @@ async def chat(
     build_prompt: Callable[[Business], str] = build_system_prompt,
     use_data_question_nudge: bool = True,
     on_event: AIEvHandler = None,
+    images: list[ChatImage] | None = None,
 ) -> ChatResult:
     """
     Main entry point — generic over the tool set/system prompt so both the owner
     analytics agent and other agents (e.g. client booking) can reuse the same loop.
     Tool calls execute immediately — no confirmation flow at the loop level (the
     booking profile enforces confirmation via its own system prompt instead).
+
+    images — фото от пользователя (эскизы, референсы). Уходят в модель ходом
+    (нужна мультимодальная модель), в истории остаётся текстовый факт.
     """
     client = get_openai_client()
     conversation = await _load_or_create_conversation(
@@ -385,10 +467,18 @@ async def chat(
     if conversation.awaiting_confirmation:
         conversation.awaiting_confirmation = False
 
+    # В историю — только текстовый факт фото (байты в БД не складываем);
+    # сами картинки добавляются в openai_messages ниже, на текущий ход
+    stored_text = user_message
+    if images:
+        photos_part = f"[Клиент прислал фото: {len(images)}]" if len(images) > 1 else (
+            "[Клиент прислал фото]"
+        )
+        stored_text = f"{photos_part} {user_message}".strip()
     user_msg = AIMessage(
         conversation_id=conversation.id,
         role="user",
-        content=user_message,
+        content=stored_text,
     )
     session.add(user_msg)
     conversation.messages.append(user_msg)
@@ -398,11 +488,12 @@ async def chat(
         system_prompt = await system_prompt
     openai_messages = [
         {"role": "system", "content": system_prompt},
-        *_db_messages_to_openai(conversation.messages, conversation.summary),
+        *_db_messages_to_openai(conversation.messages[:-1], conversation.summary),
+        {"role": "user", "content": _user_content(user_message, images)},
     ]
 
     response = await client.chat.completions.create(
-        model=settings.llm_model,
+        model=assistant_model(),
         temperature=0,
         messages=openai_messages,
         tools=tools,
@@ -421,7 +512,7 @@ async def chat(
         )
         # Retry with stronger tool requirement but avoid full duplicate context
         response = await client.chat.completions.create(
-            model=settings.llm_model,
+            model=assistant_model(),
             temperature=0,
             messages=[
                 *openai_messages,
@@ -453,6 +544,7 @@ async def chat(
             tool_registry=tool_registry,
             build_prompt=build_prompt,
             on_event=on_event,
+            images=images,
         )
 
     # AI answered directly without needing tools (e.g. off-topic refusal, clarification)

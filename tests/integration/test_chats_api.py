@@ -6,10 +6,10 @@ Telegram-функции подменяются на уровне модуля se
 
 import pytest
 
-from tg_studio.db.models import ChatDirection, ChatMessage
+from tg_studio.db.models import ChatDirection, ChatMessage, Master
 from tg_studio.modules.chat import service
 
-from ..conftest import make_business, make_client
+from ..conftest import make_business, make_client, make_master
 
 OWNER_HEADERS = {"X-Debug-User-Id": "99999"}
 
@@ -329,3 +329,113 @@ async def test_file_proxy_signed_token(api_client, db_session, monkeypatch):
     assert resp.status_code == 401
     resp = await api_client.get(f"/api/admin/chats/files/{msg.id}")
     assert resp.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_from_ai_message_in_history(api_client, db_session, business):
+    """Ответ AI-агента виден в истории чата с direction=from_ai."""
+    client = await make_client(db_session, telegram_id=130)
+    await seed_message(db_session, client, direction=ChatDirection.from_client, content="хочу тату")
+    await seed_message(db_session, client, direction=ChatDirection.from_ai, content="Расскажите про идею")
+
+    resp = await api_client.get(
+        f"/api/admin/chats/{client.id}/messages", headers=OWNER_HEADERS
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body[-1]["direction"] == "from_ai"
+    assert body[-1]["content"] == "Расскажите про идею"
+
+
+@pytest.mark.asyncio
+async def test_thread_assigned_master_name(api_client, db_session, business):
+    """Открытое закрепление чата за мастером отдаётся в треде."""
+    from tg_studio.modules.chat import assignments as assignments_mod
+
+    client = await make_client(db_session, telegram_id=131)
+    master = Master(
+        business_id=business.id, full_name="Елена Лизунова", is_active=True
+    )
+    db_session.add(master)
+    await db_session.flush()
+    await seed_message(db_session, client, direction=ChatDirection.from_client, content="привет")
+    await assignments_mod.create_assignment(
+        db_session, business_id=business.id, client_id=client.id,
+        master_id=master.id, order_summary="минимализм",
+    )
+
+    threads = (
+        await api_client.get("/api/admin/chats", headers=OWNER_HEADERS)
+    ).json()
+    t = next(t for t in threads if t["client_id"] == client.id)
+    assert t["assigned_master_name"] == "Елена Лизунова"
+
+
+# ---------------------------------------------------------------------------
+# Фильтрация чатов по роли: мастер видит только закреплённые за ним
+# ---------------------------------------------------------------------------
+
+async def test_master_sees_only_assigned_chats(api_client, db_session, business):
+    from tg_studio.modules.chat import assignments as assignments_mod
+
+    master = await make_master(db_session, business.id, telegram_id=7777)
+    mine = await make_client(db_session, telegram_id=101, full_name="Мой клиент")
+    other = await make_client(db_session, telegram_id=102, full_name="Чужой клиент")
+    await seed_message(db_session, mine, direction=ChatDirection.from_client, content="мой")
+    await seed_message(db_session, other, direction=ChatDirection.from_client, content="чужой")
+    await assignments_mod.create_assignment(
+        db_session, business_id=business.id, client_id=mine.id,
+        master_id=master.id, order_summary="минимализм",
+    )
+
+    headers = {"X-Debug-User-Id": "7777"}
+    resp = await api_client.get("/api/admin/chats", headers=headers)
+    assert resp.status_code == 200
+    threads = resp.json()
+    assert [t["client_id"] for t in threads] == [mine.id]
+
+    # Владелец по-прежнему видит оба
+    owner_threads = (
+        await api_client.get("/api/admin/chats", headers=OWNER_HEADERS)
+    ).json()
+    assert {t["client_id"] for t in owner_threads} == {mine.id, other.id}
+
+
+async def test_master_closed_assignment_hides_chat(api_client, db_session, business):
+    from tg_studio.modules.chat import assignments as assignments_mod
+
+    master = await make_master(db_session, business.id, telegram_id=7778)
+    client = await make_client(db_session, telegram_id=103)
+    await seed_message(db_session, client, direction=ChatDirection.from_client, content="?")
+    assignment = await assignments_mod.create_assignment(
+        db_session, business_id=business.id, client_id=client.id,
+        master_id=master.id, order_summary=None,
+    )
+    await assignments_mod.close_assignment(db_session, assignment)
+
+    headers = {"X-Debug-User-Id": "7778"}
+    assert (await api_client.get("/api/admin/chats", headers=headers)).json() == []
+    # И в сам чат мастер больше не попадает
+    resp = await api_client.get(f"/api/admin/chats/{client.id}/messages", headers=headers)
+    assert resp.status_code == 404
+
+
+async def test_master_cannot_read_unassigned_chat(api_client, db_session, business):
+    from tg_studio.modules.chat import assignments as assignments_mod
+
+    master = await make_master(db_session, business.id, telegram_id=7779)
+    other_master = await make_master(db_session, business.id, full_name="Другой", telegram_id=7780)
+    client = await make_client(db_session, telegram_id=104)
+    await seed_message(db_session, client, direction=ChatDirection.from_client, content="секрет")
+    await assignments_mod.create_assignment(
+        db_session, business_id=business.id, client_id=client.id,
+        master_id=other_master.id, order_summary=None,
+    )
+
+    headers = {"X-Debug-User-Id": "7779"}
+    resp = await api_client.get(f"/api/admin/chats/{client.id}/messages", headers=headers)
+    assert resp.status_code == 404
+    resp = await api_client.post(
+        f"/api/admin/chats/{client.id}/messages", headers=headers, json={"content": "привет"}
+    )
+    assert resp.status_code == 404

@@ -30,3 +30,5 @@ class ChatThreadOut(BaseModel):
     last_message_preview: str  # текст или метка медиа ("📷 Фото", "🎙 Голосовое")
     last_direction: str
     unread_count: int
+    # Открытое закрепление чата за мастером (после эскалации AI-агентом)
+    assigned_master_name: str | None = None

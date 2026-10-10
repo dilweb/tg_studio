@@ -17,6 +17,17 @@ class AdminBusinessResponse(BusinessResponse):
     pricing_config: dict | None = None
 
 
+class BusinessUpdate(BaseModel):
+    """Правка профиля бизнеса владельцем в разделе «Бизнес».
+
+    description читает AI-агент (ресепшн бота) — это его база знаний о студии.
+    """
+
+    name: str | None = Field(None, min_length=1, max_length=200)
+    description: str | None = Field(None, max_length=4000)
+    phone: str | None = Field(None, max_length=32)
+
+
 class PricingConfigUpdate(BaseModel):
     """Правка прайса владельцем в разделе «Бизнес». Отправляется целиком —
     так видны все значения, без частичных патчей по коэффициенту."""
@@ -81,14 +92,29 @@ class MasterUpdate(BaseModel):
     specializations: list[str] | None = None
 
 
+class MasterPortfolioFileOut(BaseModel):
+    id: int
+    original_name: str
+    mime: str
+    size_bytes: int
+    created_at: str | None = None
+    # публичная ссылка на файл (без авторизации — маркетинговый материал)
+    url: str | None = None
+
+
 class MasterResponse(BaseModel):
     id: int
     full_name: str
     description: str | None
     telegram_id: int | None
     is_active: bool
+    # Мягкое удаление: строка остаётся в БД, из списков пропадает
+    deleted_at: str | None = None
+    # Фото профиля (аватар) — публичная ссылка
+    avatar_url: str | None = None
     google_calendar_id: str | None = None
     default_duration_minutes: int | None = None
     specializations: list[str] = []
     # прямая ссылка «добавить календарь в мой Google Calendar» (без письма)
     calendar_add_url: str | None = None
+    portfolio: list[MasterPortfolioFileOut] = []

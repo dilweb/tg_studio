@@ -13,7 +13,6 @@ from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, File, Form, HTTPException, Query, Response, UploadFile
-from fastapi.responses import FileResponse
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 
@@ -888,8 +887,8 @@ async def get_session_file(
     session: SessionDep,
     user: CurrentUserOptionalDep,
     t: str | None = Query(default=None),
-) -> FileResponse:
-    """Отдать фото с диска.
+) -> Response:
+    """Отдать фото (из S3/MinIO или с диска).
 
     Два способа доступа (как у файлов чатов):
     - заголовки авторизации (fetch/blob в миниаппе);
@@ -904,11 +903,11 @@ async def get_session_file(
             raise HTTPException(status_code=401, detail="Authorization required")
         await get_master_business(user, session)
 
-    path = files_storage.absolute_path(record)
-    if not path.is_file():
-        raise HTTPException(status_code=404, detail="Файл не найден на диске")
-    return FileResponse(
-        path,
+    data = files_storage.read_file(record)
+    if data is None:
+        raise HTTPException(status_code=404, detail="Файл не найден в хранилище")
+    return Response(
+        content=data,
         media_type=record.mime,
         headers={
             "Content-Disposition": f"inline; filename*=UTF-8''{quote(record.original_name)}",

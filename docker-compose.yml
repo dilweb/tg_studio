@@ -27,6 +27,27 @@ services:
       timeout: 3s
       retries: 5
 
+  # S3-совместимое файловое хранилище: фото сеансов, портфолио, аватары.
+  # Оригинальные образы minio/* удалены из Docker Hub и quay (анонимные
+  # скачивания закрыты) — используем drop-in форк pgsty/silo (тот же
+  # бинарник и env). Веб-консоль (файлы глазами): http://localhost:6006
+  minio:
+    image: pgsty/silo:RELEASE.2026-09-16T00-00-00Z
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-tgstudio}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minio-secret}
+    ports:
+      - "6006:9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
   api:
     build: .
     restart: unless-stopped
@@ -110,3 +131,4 @@ services:
 volumes:
   postgres_data:
   redis_data:
+  minio_data:

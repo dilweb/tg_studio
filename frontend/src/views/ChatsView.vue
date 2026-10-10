@@ -65,8 +65,25 @@ function mediaFailed(id) {
 }
 
 function previewText(t) {
-  const prefix = t.last_direction === 'from_master' ? 'Вы: ' : ''
+  const prefix = t.last_direction === 'from_master' ? 'Вы: ' : t.last_direction === 'from_ai' ? 'ИИ: ' : ''
   return prefix + (t.last_message_preview || '—')
+}
+
+// Ответ AI-агента — свой класс пузырька, у закреплённого чата — бейдж
+function bubbleSide(m) {
+  if (m.direction === 'from_master') return 'mine'
+  if (m.direction === 'from_ai') return 'ai'
+  return 'theirs'
+}
+
+// Подпись над сообщением: имя мастера (или «Мастер», если чат не закреплён)
+// и «ИИ ассистент» для ответов агента; у клиента подписи нет
+function senderLabel(m) {
+  if (m.direction === 'from_ai') return 'ИИ ассистент'
+  if (m.direction === 'from_master') {
+    return activeThread.value?.assigned_master_name || 'Мастер'
+  }
+  return null
 }
 
 function timeShort(iso) {
@@ -272,7 +289,14 @@ onUnmounted(() => {
               ← Назад
             </button>
             <div>
-              <div class="chat-header-name">{{ activeThread?.full_name ?? '…' }}</div>
+              <div class="chat-header-name">
+                {{ activeThread?.full_name ?? '…' }}
+                <span
+                  v-if="activeThread?.assigned_master_name"
+                  class="assigned-badge"
+                  title="Чат закреплён за мастером после эскалации AI-агентом"
+                >📌 {{ activeThread.assigned_master_name }}</span>
+              </div>
               <div v-if="activeThread?.username" class="chat-header-username">
                 @{{ activeThread.username }}
               </div>
@@ -287,9 +311,10 @@ onUnmounted(() => {
               v-for="m in messages"
               :key="m.id"
               class="bubble-row"
-              :class="m.direction === 'from_master' ? 'mine' : 'theirs'"
+              :class="bubbleSide(m)"
             >
               <div class="bubble">
+                <div v-if="senderLabel(m)" class="bubble-sender">{{ senderLabel(m) }}</div>
                 <img
                   v-if="m.file_kind === 'photo' && mediaUrls[m.id] && mediaUrls[m.id] !== 'error'"
                   :src="mediaUrls[m.id]"
@@ -560,6 +585,34 @@ onUnmounted(() => {
 .theirs .bubble {
   background: var(--surface2);
   border: 1px solid var(--border);
+}
+
+/* Ответ AI-агента записи: свой цвет, чтобы не путать с мастером */
+.ai .bubble {
+  background: rgba(0, 150, 136, 0.14);
+  border: 1px solid rgba(0, 150, 136, 0.35);
+}
+
+/* Подпись отправителя над сообщением (жирным): имя мастера / ИИ ассистент */
+.bubble-sender {
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--muted);
+  margin-bottom: 3px;
+}
+
+.assigned-badge {
+  display: inline-block;
+  font-size: 10.5px;
+  font-weight: 600;
+  color: var(--text);
+  background: rgba(0, 150, 136, 0.15);
+  border: 1px solid rgba(0, 150, 136, 0.35);
+  border-radius: 999px;
+  padding: 1px 8px;
+  margin-left: 6px;
+  vertical-align: middle;
+  white-space: nowrap;
 }
 
 .bubble-photo {

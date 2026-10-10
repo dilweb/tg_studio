@@ -115,11 +115,19 @@ class Master(Base):
     registration_token: Mapped[str | None] = mapped_column(String(64), unique=True, nullable=True)
     description: Mapped[str | None] = mapped_column(Text)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+
+    # Мягкое удаление: строка остаётся в БД (работы, платежи, портфолио —
+    # для анализа), из списков мастеров пропадает. NULL = не удалён.
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     password_hash: Mapped[str | None] = mapped_column(String(256), nullable=True)
 
     # Google Calendar — secondary calendar within Business.google_calendar_credentials_json's
     # account. NULL means "not set up yet", callers fall back to "primary".
     google_calendar_id: Mapped[str | None] = mapped_column(String(256), nullable=True)
+
+    # Фото профиля (аватар): относительный путь на диске upload_dir
+    # (masters/avatar/<master_id>/…). NULL = не задан, показываем бейдж-инициалы.
+    avatar_stored_path: Mapped[str | None] = mapped_column(String(256), nullable=True)
 
     # Дефолтная длительность записи (мин) — подставляется в форму записи,
     # реальную длительность задаёт конкретная запись. NULL = 60.
@@ -133,6 +141,9 @@ class Master(Base):
     user: Mapped["User | None"] = relationship(back_populates="master")
     business: Mapped["Business"] = relationship(back_populates="masters")
     works: Mapped[list["TattooWork"]] = relationship(back_populates="master")
+    portfolio_files: Mapped[list["MasterPortfolioFile"]] = relationship(
+        back_populates="master"
+    )
 
 
 class AIConversation(Base):
@@ -174,6 +185,67 @@ class AIMessage(Base):
 class ChatDirection(str, enum.Enum):
     from_client = "from_client"
     from_master = "from_master"
+    from_ai = "from_ai"  # ответ AI-агента записи (зеркало для «Чатов»)
+
+
+class ChatAssignmentStatus(str, enum.Enum):
+    """Закрепление чата клиента за мастером после эскалации AI-агентом."""
+
+    open = "open"      # мастер назначен, отвечает клиенту сам
+    closed = "closed"  # снято (новая эскалация или вручную)
+
+
+class ChatAssignment(Base):
+    """Кому из мастеров эскалирован клиент (закрепление чата).
+
+    Открытых строк на клиента должно быть не более одной — следит
+    chat/assignments.create_assignment(). Снимается только новой
+    эскалацией (close + новая open) или вручную из миниаппы.
+    """
+
+    __tablename__ = "chat_assignments"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    business_id: Mapped[int] = mapped_column(ForeignKey("businesses.id"), nullable=False, index=True)
+    client_id: Mapped[int] = mapped_column(ForeignKey("clients.id"), nullable=False, index=True)
+    master_id: Mapped[int] = mapped_column(ForeignKey("masters.id"), nullable=False, index=True)
+
+    status: Mapped[ChatAssignmentStatus] = mapped_column(
+        Enum(ChatAssignmentStatus), nullable=False, default=ChatAssignmentStatus.open
+    )
+    # Резюме заказа, с которым агент эскалировал клиента
+    order_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    escalated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    closed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+    client: Mapped["Client"] = relationship()
+    master: Mapped["Master"] = relationship()
+
+
+class MasterPortfolioFile(Base):
+    """Фото портфолио мастера (загружает владелец из миниаппы).
+
+    Файл лежит на диске в UPLOAD_DIR (masters/portfolio/<master_id>/),
+    в БД — метаданные и относительный путь. Отдаётся публичным
+    read-only эндпоинтом — маркетинговый материал для клиентов.
+    """
+
+    __tablename__ = "master_portfolio_files"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    master_id: Mapped[int] = mapped_column(
+        ForeignKey("masters.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+
+    stored_path: Mapped[str] = mapped_column(String(512), unique=True, nullable=False)
+    original_name: Mapped[str] = mapped_column(String(256), nullable=False)
+    mime: Mapped[str] = mapped_column(String(64), nullable=False)
+    size_bytes: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+    master: Mapped["Master"] = relationship(back_populates="portfolio_files")
 
 
 class ChatMessage(Base):

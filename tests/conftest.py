@@ -15,6 +15,11 @@ os.environ.setdefault("DEBUG", "true")
 os.environ["ALLOWED_USERS"] = '[{"id": 99999, "role": "owner"}]'
 os.environ.setdefault("MINIAPP_URL", "http://testserver")
 os.environ.setdefault("API_PUBLIC_URL", "http://testserver")
+# Тесты всегда про диск: S3 в тестовом окружении выключен (сбрасываем в
+# первую очередь — settings читает реальный .env, где S3 может быть настроен).
+os.environ["S3_ENDPOINT_URL"] = ""
+os.environ["S3_ACCESS_KEY"] = ""
+os.environ["S3_SECRET_KEY"] = ""
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -114,8 +119,14 @@ async def make_master(
     business_id: int,
     is_active: bool = True,
     full_name: str = "Test Master",
+    telegram_id: int | None = None,
 ) -> Master:
-    obj = Master(business_id=business_id, full_name=full_name, is_active=is_active)
+    obj = Master(
+        business_id=business_id,
+        full_name=full_name,
+        is_active=is_active,
+        telegram_id=telegram_id,
+    )
     session.add(obj)
     await session.flush()
     return obj
