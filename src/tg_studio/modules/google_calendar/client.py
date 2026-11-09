@@ -4,7 +4,14 @@ Google Calendar API client wrapper.
 Google Calendar is accessed with a service account key (bnztattoo project):
 the key JSON is stored on the Business record and credentials self-refresh
 via JWT — no OAuth consent flow involved.
+
+googleapiclient синхронный: каждый вызов — блокирующий сетевой I/O. Публичные
+функции async и выполняют вызовы в тредпуле (asyncio.to_thread) с таймаутом:
+один зависший запрос Google не должен замораживать весь API (один
+uvicorn-воркер) или процесс бота. Сбои fail-open (None/[]/False) и
+логируются — календарь лишь зеркало, БД — источник истины.
 """
+import asyncio
 import json
 import logging
 from datetime import datetime
@@ -26,6 +33,9 @@ SCOPES = ["https://www.googleapis.com/auth/calendar"]
 # Path to the service-account key file downloaded from Google Cloud Console
 _CREDENTIALS_FILE = Path(settings.google_calendar_credentials_path)
 
+# Таймаут одного вызова Google API (сек): защищает event loop от зависшего сокета
+GOOGLE_API_TIMEOUT_SECONDS = 30.0
+
 
 def read_service_account_key() -> dict:
     """Read the service-account key file (called once at connect time)."""
@@ -36,6 +46,8 @@ def verify_service_account(key: dict) -> None:
     """
     Check the key against Google before storing it: key is valid and the
     Calendar API is enabled for its project. Raises HttpError otherwise.
+
+    Синхронная (блокирующая) — вызывающий эндпоинт оборачивает в to_thread.
     """
     creds = service_account.Credentials.from_service_account_info(key, scopes=SCOPES)
     service = build("calendar", "v3", credentials=creds)
@@ -67,6 +79,54 @@ def refresh_if_expired(creds: Credentials) -> Credentials:
     return creds
 
 
+async def _call_google(sync_fn, *args, **kwargs):
+    """Блокирующий вызов Google API в тредпуле с таймаутом.
+
+    Таймаут защищает event loop от зависшего сокета: по истечении —
+    asyncio.TimeoutError, вызывающая функция приводит его к fail-open значению.
+    """
+    return await asyncio.wait_for(
+        asyncio.to_thread(sync_fn, *args, **kwargs),
+        timeout=GOOGLE_API_TIMEOUT_SECONDS,
+    )
+
+
+def _create_event_sync(
+    creds: Credentials,
+    calendar_id: str,
+    summary: str,
+    description: str | None,
+    start_datetime: str,
+    end_datetime: str,
+    timezone: str,
+    attendees: list[str] | None,
+    extended_properties: dict[str, str] | None,
+) -> str:
+    refresh_if_expired(creds)
+    service = build("calendar", "v3", credentials=creds)
+
+    event_body = {
+        "summary": summary,
+        "description": description or "",
+        "start": {
+            "dateTime": start_datetime,
+            "timeZone": timezone,
+        },
+        "end": {
+            "dateTime": end_datetime,
+            "timeZone": timezone,
+        },
+    }
+
+    if attendees:
+        event_body["attendees"] = [{"email": a} for a in attendees]
+    if extended_properties:
+        event_body["extendedProperties"] = {"private": extended_properties}
+
+    created_event = service.events().insert(calendarId=calendar_id, body=event_body).execute()
+    return created_event.get("id")
+
+
 async def create_event(
     credentials_json: str,
     summary: str,
@@ -91,34 +151,55 @@ async def create_event(
     if not creds:
         return None
 
-    refresh_if_expired(creds)
-
     try:
-        service = build("calendar", "v3", credentials=creds)
-
-        event_body = {
-            "summary": summary,
-            "description": description or "",
-            "start": {
-                "dateTime": start_datetime,
-                "timeZone": timezone,
-            },
-            "end": {
-                "dateTime": end_datetime,
-                "timeZone": timezone,
-            },
-        }
-
-        if attendees:
-            event_body["attendees"] = [{"email": a} for a in attendees]
-        if extended_properties:
-            event_body["extendedProperties"] = {"private": extended_properties}
-
-        created_event = service.events().insert(calendarId=calendar_id, body=event_body).execute()
-        return created_event.get("id")
-
-    except HttpError:
+        return await _call_google(
+            _create_event_sync,
+            creds=creds,
+            calendar_id=calendar_id,
+            summary=summary,
+            description=description,
+            start_datetime=start_datetime,
+            end_datetime=end_datetime,
+            timezone=timezone,
+            attendees=attendees,
+            extended_properties=extended_properties,
+        )
+    except Exception:
+        logger.warning("Google Calendar: не удалось создать событие", exc_info=True)
         return None
+
+
+def _update_event_sync(
+    creds: Credentials,
+    calendar_id: str,
+    event_id: str,
+    summary: str,
+    description: str | None,
+    start_datetime: str,
+    end_datetime: str,
+    timezone: str,
+    attendees: list[str] | None,
+) -> None:
+    refresh_if_expired(creds)
+    service = build("calendar", "v3", credentials=creds)
+
+    event_body = {
+        "summary": summary,
+        "description": description or "",
+        "start": {
+            "dateTime": start_datetime,
+            "timeZone": timezone,
+        },
+        "end": {
+            "dateTime": end_datetime,
+            "timeZone": timezone,
+        },
+    }
+
+    if attendees:
+        event_body["attendees"] = [{"email": a} for a in attendees]
+
+    service.events().update(calendarId=calendar_id, eventId=event_id, body=event_body).execute()
 
 
 async def update_event(
@@ -137,48 +218,66 @@ async def update_event(
     if not creds:
         return False
 
-    refresh_if_expired(creds)
-
     try:
-        service = build("calendar", "v3", credentials=creds)
-
-        event_body = {
-            "summary": summary,
-            "description": description or "",
-            "start": {
-                "dateTime": start_datetime,
-                "timeZone": timezone,
-            },
-            "end": {
-                "dateTime": end_datetime,
-                "timeZone": timezone,
-            },
-        }
-
-        if attendees:
-            event_body["attendees"] = [{"email": a} for a in attendees]
-
-        service.events().update(calendarId=calendar_id, eventId=event_id, body=event_body).execute()
+        await _call_google(
+            _update_event_sync,
+            creds=creds,
+            calendar_id=calendar_id,
+            event_id=event_id,
+            summary=summary,
+            description=description,
+            start_datetime=start_datetime,
+            end_datetime=end_datetime,
+            timezone=timezone,
+            attendees=attendees,
+        )
         return True
-
-    except HttpError:
+    except Exception:
+        logger.warning("Google Calendar: не удалось обновить событие %s", event_id, exc_info=True)
         return False
 
 
+def _cancel_event_sync(creds: Credentials, calendar_id: str, event_id: str) -> None:
+    refresh_if_expired(creds)
+    service = build("calendar", "v3", credentials=creds)
+    service.events().delete(calendarId=calendar_id, eventId=event_id).execute()
+
+
 async def cancel_event(credentials_json: str, event_id: str, calendar_id: str = "primary") -> bool:
-    """Delete a calendar event by its ID."""
+    """Delete a calendar event by its ID.
+
+    Любые сбои (сеть, таймаут, 5xx) → False: вызывающий не должен падать
+    на удалении события (сеанс/бронь всё равно отменяется в БД).
+    """
     creds = _load_credentials(credentials_json)
     if not creds:
         return False
 
-    refresh_if_expired(creds)
-
     try:
-        service = build("calendar", "v3", credentials=creds)
-        service.events().delete(calendarId=calendar_id, eventId=event_id).execute()
+        await _call_google(_cancel_event_sync, creds=creds, calendar_id=calendar_id, event_id=event_id)
         return True
-    except HttpError:
+    except Exception:
+        logger.warning("Google Calendar: не удалось удалить событие %s", event_id, exc_info=True)
         return False
+
+
+def _get_busy_periods_sync(
+    creds: Credentials, calendar_id: str, time_min: str, time_max: str
+) -> list[tuple[datetime, datetime]]:
+    refresh_if_expired(creds)
+    service = build("calendar", "v3", credentials=creds)
+    result = service.freebusy().query(
+        body={
+            "timeMin": time_min,
+            "timeMax": time_max,
+            "items": [{"id": calendar_id}],
+        }
+    ).execute()
+    busy = result["calendars"][calendar_id]["busy"]
+    return [
+        (datetime.fromisoformat(b["start"]), datetime.fromisoformat(b["end"]))
+        for b in busy
+    ]
 
 
 async def get_busy_periods(
@@ -197,24 +296,32 @@ async def get_busy_periods(
     if not creds:
         return []
 
-    refresh_if_expired(creds)
-
     try:
-        service = build("calendar", "v3", credentials=creds)
-        result = service.freebusy().query(
-            body={
-                "timeMin": time_min,
-                "timeMax": time_max,
-                "items": [{"id": calendar_id}],
-            }
-        ).execute()
-        busy = result["calendars"][calendar_id]["busy"]
-        return [
-            (datetime.fromisoformat(b["start"]), datetime.fromisoformat(b["end"]))
-            for b in busy
-        ]
-    except HttpError:
+        return await _call_google(
+            _get_busy_periods_sync,
+            creds=creds,
+            calendar_id=calendar_id,
+            time_min=time_min,
+            time_max=time_max,
+        )
+    except Exception:
+        logger.warning("Google Calendar: freebusy query failed", exc_info=True)
         return []
+
+
+def _list_events_sync(
+    creds: Credentials, calendar_id: str, time_min: str, time_max: str
+) -> list[dict]:
+    refresh_if_expired(creds)
+    service = build("calendar", "v3", credentials=creds)
+    result = service.events().list(
+        calendarId=calendar_id,
+        timeMin=time_min,
+        timeMax=time_max,
+        singleEvents=True,
+        orderBy="startTime",
+    ).execute()
+    return result.get("items", [])
 
 
 async def list_events(
@@ -231,20 +338,24 @@ async def list_events(
     if not creds:
         return []
 
-    refresh_if_expired(creds)
-
     try:
-        service = build("calendar", "v3", credentials=creds)
-        result = service.events().list(
-            calendarId=calendar_id,
-            timeMin=time_min,
-            timeMax=time_max,
-            singleEvents=True,
-            orderBy="startTime",
-        ).execute()
-        return result.get("items", [])
-    except HttpError:
+        return await _call_google(
+            _list_events_sync,
+            creds=creds,
+            calendar_id=calendar_id,
+            time_min=time_min,
+            time_max=time_max,
+        )
+    except Exception:
+        logger.warning("Google Calendar: list_events failed", exc_info=True)
         return []
+
+
+def _create_calendar_sync(creds: Credentials, summary: str) -> str:
+    refresh_if_expired(creds)
+    service = build("calendar", "v3", credentials=creds)
+    created = service.calendars().insert(body={"summary": summary}).execute()
+    return created.get("id")
 
 
 async def create_calendar(credentials_json: str, summary: str) -> str | None:
@@ -257,14 +368,17 @@ async def create_calendar(credentials_json: str, summary: str) -> str | None:
     if not creds:
         return None
 
-    refresh_if_expired(creds)
-
     try:
-        service = build("calendar", "v3", credentials=creds)
-        created = service.calendars().insert(body={"summary": summary}).execute()
-        return created.get("id")
-    except HttpError:
+        return await _call_google(_create_calendar_sync, creds=creds, summary=summary)
+    except Exception:
+        logger.warning("Google Calendar: не удалось создать календарь", exc_info=True)
         return None
+
+
+def _delete_calendar_sync(creds: Credentials, calendar_id: str) -> None:
+    refresh_if_expired(creds)
+    service = build("calendar", "v3", credentials=creds)
+    service.calendars().delete(calendarId=calendar_id).execute()
 
 
 async def delete_calendar(credentials_json: str, calendar_id: str) -> bool:
@@ -278,11 +392,8 @@ async def delete_calendar(credentials_json: str, calendar_id: str) -> bool:
     if not creds:
         return False
 
-    refresh_if_expired(creds)
-
     try:
-        service = build("calendar", "v3", credentials=creds)
-        service.calendars().delete(calendarId=calendar_id).execute()
+        await _call_google(_delete_calendar_sync, creds=creds, calendar_id=calendar_id)
         return True
     except Exception:
         logger.warning(
@@ -293,21 +404,8 @@ async def delete_calendar(credentials_json: str, calendar_id: str) -> bool:
         return False
 
 
-async def share_calendar(
-    credentials_json: str,
-    calendar_id: str,
-    email: str,
-    role: str = "writer",
-) -> None:
-    """
-    Grant a personal address access to `calendar_id` (ACL rule), so bookings
-    made inside the service account become visible in the owner's own Google
-    Calendar. Raises HttpError on failure.
-
-    Any previous personal rule is replaced, so the calendar is shared with
-    exactly one address. Ownership rules (the SA's own access) are never touched.
-    """
-    creds = refresh_if_expired(_load_credentials(credentials_json))
+def _share_calendar_sync(creds: Credentials, calendar_id: str, email: str, role: str) -> None:
+    refresh_if_expired(creds)
     service = build("calendar", "v3", credentials=creds)
 
     rules = service.acl().list(calendarId=calendar_id).execute().get("items", [])
@@ -327,12 +425,30 @@ async def share_calendar(
     ).execute()
 
 
-async def unshare_calendar(credentials_json: str, calendar_id: str) -> None:
+async def share_calendar(
+    credentials_json: str,
+    calendar_id: str,
+    email: str,
+    role: str = "writer",
+) -> None:
     """
-    Revoke all personal ACL rules from `calendar_id` (ownership rules are kept).
-    Raises HttpError on failure.
+    Grant a personal address access to `calendar_id` (ACL rule), so bookings
+    made inside the service account become visible in the owner's own Google
+    Calendar. Raises on failure (callers handle and report per calendar).
+
+    Any previous personal rule is replaced, so the calendar is shared with
+    exactly one address. Ownership rules (the SA's own access) are never touched.
     """
-    creds = refresh_if_expired(_load_credentials(credentials_json))
+    creds = _load_credentials(credentials_json)
+    if creds is None:
+        raise ValueError("Google Calendar credentials are not configured")
+    await _call_google(
+        _share_calendar_sync, creds=creds, calendar_id=calendar_id, email=email, role=role
+    )
+
+
+def _unshare_calendar_sync(creds: Credentials, calendar_id: str) -> None:
+    refresh_if_expired(creds)
     service = build("calendar", "v3", credentials=creds)
 
     rules = service.acl().list(calendarId=calendar_id).execute().get("items", [])
@@ -340,3 +456,14 @@ async def unshare_calendar(credentials_json: str, calendar_id: str) -> None:
         scope = rule.get("scope", {})
         if scope.get("type") == "user" and rule.get("role") != "owner":
             service.acl().delete(calendarId=calendar_id, ruleId=rule["id"]).execute()
+
+
+async def unshare_calendar(credentials_json: str, calendar_id: str) -> None:
+    """
+    Revoke all personal ACL rules from `calendar_id` (ownership rules are kept).
+    Raises on failure.
+    """
+    creds = _load_credentials(credentials_json)
+    if creds is None:
+        raise ValueError("Google Calendar credentials are not configured")
+    await _call_google(_unshare_calendar_sync, creds=creds, calendar_id=calendar_id)

@@ -10,12 +10,18 @@ import hmac
 import logging
 import subprocess
 import time
-from datetime import datetime
+from datetime import UTC, datetime
 
 from aiogram import Bot
-from aiogram.exceptions import TelegramAPIError
+from aiogram.exceptions import (
+    TelegramAPIError,
+    TelegramNetworkError,
+    TelegramRetryAfter,
+    TelegramServerError,
+)
 from aiogram.types import BufferedInputFile, InlineKeyboardMarkup, InputMediaPhoto
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from tg_studio.config import settings
@@ -34,6 +40,12 @@ from tg_studio.db.models import (
 logger = logging.getLogger(__name__)
 
 MAX_PHOTO_BYTES = 10 * 1024 * 1024  # лимит Telegram для фото
+
+# Ретраи отправки в Telegram: повторяем RetryAfter (rate limit), 5xx
+# (TelegramServerError) и сетевые ошибки (TelegramNetworkError); остальные
+# TelegramAPIError (4xx — бот заблокирован, чат не найден) — сразу наружу
+TG_SEND_MAX_ATTEMPTS = 3
+TG_SEND_BACKOFF_SECONDS = 1.0
 
 # Медиа-типы для прокси GET /admin/chats/files/{id}: file_kind → mime.
 # video/video_note/animation Telegram всегда конвертирует в mp4,
@@ -112,9 +124,59 @@ async def _close_bot(bot: Bot) -> None:
     await bot.session.close()
 
 
+async def _send_with_retry(send_once):
+    """Отправка в Telegram с ретраями transient-сбоев.
+
+    RetryAfter — ждём max(backoff, retry_after); 5xx/сеть — backoff с
+    нарастанием. Последняя попытка наружу исключением. Нереповторяемые
+    4xx (TelegramBadRequest и т.п.) не перехватываются — летят сразу.
+    """
+    for attempt in range(1, TG_SEND_MAX_ATTEMPTS + 1):
+        try:
+            return await send_once()
+        except TelegramRetryAfter as exc:
+            if attempt == TG_SEND_MAX_ATTEMPTS:
+                raise
+            delay = max(TG_SEND_BACKOFF_SECONDS * attempt, exc.retry_after)
+        except (TelegramServerError, TelegramNetworkError):
+            if attempt == TG_SEND_MAX_ATTEMPTS:
+                raise
+            delay = TG_SEND_BACKOFF_SECONDS * attempt
+        logger.warning(
+            "Telegram: отправка не удалась (попытка %d/%d) — повтор через %.1fс",
+            attempt,
+            TG_SEND_MAX_ATTEMPTS,
+            delay,
+        )
+        await asyncio.sleep(delay)
+
+
 # ---------------------------------------------------------------------------
 # Telegram I/O — нижний уровень
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Метки роли для клиента в Telegram
+# ---------------------------------------------------------------------------
+
+# Клиент в Telegram видит только бота и не понимает, кто ему ответил:
+# ассистент, мастер или студия. Префикс роли ставится ТОЛЬКО в отправке в
+# Telegram; в chat_messages контент хранится чистым — в миниаппе роль и так
+# видна (цвет пузыря и подпись отправителя).
+ROLE_LABEL_AI = "🤖 Ассистент"
+ROLE_LABEL_STUDIO = "🏪 Студия"
+
+
+def master_role_label(full_name: str | None) -> str:
+    first = (full_name or "").strip().split()[0] if (full_name or "").strip() else "Мастер"
+    return f"🎨 Мастер {first}"
+
+
+def with_role_prefix(label: str, text: str | None) -> str | None:
+    if not label or not text:
+        return text
+    return f"{label}: {text}"
+
 
 async def send_text_to_telegram(
     telegram_id: int, text: str, reply_markup: InlineKeyboardMarkup | None = None
@@ -122,7 +184,9 @@ async def send_text_to_telegram(
     """Отправить текст клиенту. Возвращает telegram message_id."""
     bot = _new_bot()
     try:
-        msg = await bot.send_message(telegram_id, text, reply_markup=reply_markup)
+        msg = await _send_with_retry(
+            lambda: bot.send_message(telegram_id, text, reply_markup=reply_markup)
+        )
         return msg.message_id
     except TelegramAPIError as exc:
         raise TelegramSendError(str(exc)) from exc
@@ -136,10 +200,12 @@ async def send_photo_to_telegram(
     """Отправить фото. Возвращает (message_id, file_id отправленного фото)."""
     bot = _new_bot()
     try:
-        msg = await bot.send_photo(
-            telegram_id,
-            BufferedInputFile(photo, filename="photo.jpg"),
-            caption=caption,
+        msg = await _send_with_retry(
+            lambda: bot.send_photo(
+                telegram_id,
+                BufferedInputFile(photo, filename="photo.jpg"),
+                caption=caption,
+            )
         )
         photo_file_id = msg.photo[-1].file_id if msg.photo else ""
         return msg.message_id, photo_file_id
@@ -163,13 +229,33 @@ async def send_media_group_to_telegram(
             )
             for i, data in enumerate(photos)
         ]
-        msgs = await bot.send_media_group(telegram_id, media=media)
+        msgs = await _send_with_retry(
+            lambda: bot.send_media_group(telegram_id, media=media)
+        )
         return [
             (m.message_id, m.photo[-1].file_id if m.photo else "")
             for m in msgs
         ]
     except TelegramAPIError as exc:
         raise TelegramSendError(str(exc)) from exc
+    finally:
+        await _close_bot(bot)
+
+
+async def delete_message_from_telegram(telegram_id: int, message_id: int) -> None:
+    """Удалить сообщение в Telegram. Best-effort: сбой только логируем.
+
+    Когда сообщение уже ушло клиенту, но транзакция БД не закоммитилась
+    (сбой после отправки) — убираем «фантом», иначе клиент увидит ответ
+    без автора в CRM.
+    """
+    bot = _new_bot()
+    try:
+        await bot.delete_message(telegram_id, message_id)
+    except TelegramAPIError as exc:
+        logger.warning(
+            "Не удалось удалить сообщение %s у %s: %s", message_id, telegram_id, exc
+        )
     finally:
         await _close_bot(bot)
 
@@ -227,7 +313,19 @@ async def upsert_client_from_telegram(
             full_name=full_name,
         )
         session.add(client)
-        await session.flush()
+        try:
+            await session.flush()
+        except IntegrityError:
+            # Гонка: параллельный запрос (второе устройство клиента) создал
+            # того же клиента первым — берём его из БД
+            await session.rollback()
+            result = await session.execute(
+                select(Client).where(Client.telegram_id == telegram_id)
+            )
+            client = result.scalar_one_or_none()
+            if client is None:
+                raise
+            return client
         return client
 
     # Имя/юзернейм могли измениться в Telegram — подтягиваем
@@ -256,6 +354,22 @@ async def is_new_chat(session: AsyncSession, client_id: int) -> bool:
     return result.scalar_one() == 0
 
 
+async def message_exists(
+    session: AsyncSession, client_id: int, telegram_message_id: int
+) -> bool:
+    """Дедуп входящих: Telegram доставляет один update повторно (reconnect,
+    retry) — (client_id, telegram_message_id) уникальны в БД."""
+    result = await session.execute(
+        select(func.count())
+        .select_from(ChatMessage)
+        .where(
+            ChatMessage.client_id == client_id,
+            ChatMessage.telegram_message_id == telegram_message_id,
+        )
+    )
+    return result.scalar_one() > 0
+
+
 async def save_incoming_message(
     session: AsyncSession,
     client: Client,
@@ -263,19 +377,37 @@ async def save_incoming_message(
     content: str | None,
     telegram_file_id: str | None,
     file_kind: str | None = None,
-) -> ChatMessage:
-    """Входящее сообщение от клиента (текст, фото, стикер, голосовое)."""
+    telegram_message_id: int | None = None,
+) -> ChatMessage | None:
+    """Входящее сообщение от клиента (текст, фото, стикер, голосовое).
+
+    None — дубликат доставки: сообщение с таким telegram_message_id уже
+    сохранено (повторный update от Telegram или параллельная транзакция).
+    """
     if file_kind is None and telegram_file_id:
         file_kind = "photo"
+    # client_id захватываем до try: rollback() expire-ит client, и client.id
+    # после него в async-контексте упал бы с MissingGreenlet.
+    client_id = client.id
     msg = ChatMessage(
-        client_id=client.id,
+        client_id=client_id,
         direction=ChatDirection.from_client,
         content=content,
         telegram_file_id=telegram_file_id,
+        telegram_message_id=telegram_message_id,
         file_kind=file_kind,
     )
     session.add(msg)
-    await session.commit()
+    try:
+        await session.commit()
+    except IntegrityError:
+        await session.rollback()
+        logger.info(
+            "Дубликат входящего сообщения %s (клиент %s) — пропущен",
+            telegram_message_id,
+            client_id,
+        )
+        return None
     return msg
 
 
@@ -288,16 +420,37 @@ async def get_single_business(session: AsyncSession) -> Business | None:
 async def save_ai_message(
     session: AsyncSession, client: Client, content: str, *, telegram_message_id: int | None
 ) -> ChatMessage:
-    """Ответ AI-агента клиенту: зеркало в chat_messages (direction=from_ai)."""
-    msg = ChatMessage(
-        client_id=client.id,
-        direction=ChatDirection.from_ai,
-        content=content,
-        telegram_message_id=telegram_message_id,
-    )
+    """Ответ AI-агента клиенту: зеркало в chat_messages (direction=from_ai).
+
+    Клиенту ответ уже ушёл в Telegram — сбой коммита не должен его ронять:
+    повторная попытка в свежей транзакции, при повторном сбое — наружу.
+    """
+    client_id = client.id
+
+    def _build() -> ChatMessage:
+        return ChatMessage(
+            client_id=client_id,
+            direction=ChatDirection.from_ai,
+            content=content,
+            telegram_message_id=telegram_message_id,
+        )
+
+    msg = _build()
     session.add(msg)
-    await session.commit()
-    return msg
+    try:
+        await session.commit()
+        return msg
+    except Exception:
+        await session.rollback()
+        logger.exception("Не удалось сохранить ответ AI — повтор в новой транзакции")
+
+    from tg_studio.db.session import async_session_factory
+
+    async with async_session_factory() as fresh:
+        msg = _build()
+        fresh.add(msg)
+        await fresh.commit()
+        return msg
 
 
 async def save_ai_photo_message(
@@ -308,18 +461,39 @@ async def save_ai_photo_message(
     telegram_message_id: int,
     telegram_file_id: str,
 ) -> ChatMessage:
-    """Фото от AI-агента (портфолио мастера): зеркало с file_kind=photo."""
-    msg = ChatMessage(
-        client_id=client.id,
-        direction=ChatDirection.from_ai,
-        content=caption,
-        file_kind="photo",
-        telegram_message_id=telegram_message_id,
-        telegram_file_id=telegram_file_id,
-    )
+    """Фото от AI-агента (портфолио мастера): зеркало с file_kind=photo.
+
+    Как save_ai_message: сбой коммита не роняет доставку — повтор в новой
+    транзакции.
+    """
+    client_id = client.id
+
+    def _build() -> ChatMessage:
+        return ChatMessage(
+            client_id=client_id,
+            direction=ChatDirection.from_ai,
+            content=caption,
+            file_kind="photo",
+            telegram_message_id=telegram_message_id,
+            telegram_file_id=telegram_file_id,
+        )
+
+    msg = _build()
     session.add(msg)
-    await session.commit()
-    return msg
+    try:
+        await session.commit()
+        return msg
+    except Exception:
+        await session.rollback()
+        logger.exception("Не удалось сохранить фото AI — повтор в новой транзакции")
+
+    from tg_studio.db.session import async_session_factory
+
+    async with async_session_factory() as fresh:
+        msg = _build()
+        fresh.add(msg)
+        await fresh.commit()
+        return msg
 
 
 async def resolve_owner_telegram_id(session: AsyncSession) -> int | None:
@@ -372,8 +546,15 @@ async def notify_owner(bot: Bot, client: Client, text: str) -> None:
 # Отправка из CRM
 # ---------------------------------------------------------------------------
 
-async def send_text_message(session: AsyncSession, client: Client, content: str) -> ChatMessage:
-    """Ответ мастера: сохранить и отправить. Недоставленное НЕ сохраняем."""
+async def send_text_message(
+    session: AsyncSession, client: Client, content: str, *, role_label: str | None = None
+) -> ChatMessage:
+    """Ответ мастера/студии: сохранить и отправить. Недоставленное НЕ сохраняем.
+
+    role_label — префикс роли только в Telegram («🎨 Мастер Дилявер:»);
+    в chat_messages контент хранится чистым.
+    """
+    telegram_id = client.telegram_id
     msg = ChatMessage(
         client_id=client.id,
         direction=ChatDirection.from_master,
@@ -382,18 +563,34 @@ async def send_text_message(session: AsyncSession, client: Client, content: str)
     session.add(msg)
     await session.flush()
     try:
-        msg.telegram_message_id = await send_text_to_telegram(client.telegram_id, content)
+        msg.telegram_message_id = await send_text_to_telegram(
+            telegram_id, with_role_prefix(role_label, content)
+        )
     except TelegramSendError:
         await session.rollback()
         raise
-    await session.commit()
+    try:
+        await session.commit()
+    except Exception:
+        # Сообщение уже ушло клиенту, а БД не приняла запись: убираем
+        # «фантом» из Telegram, иначе клиент увидит ответ без автора в CRM
+        if msg.telegram_message_id:
+            await delete_message_from_telegram(telegram_id, msg.telegram_message_id)
+        await session.rollback()
+        raise
     return msg
 
 
 async def send_photo_message(
-    session: AsyncSession, client: Client, photo: bytes, caption: str | None
+    session: AsyncSession,
+    client: Client,
+    photo: bytes,
+    caption: str | None,
+    *,
+    role_label: str | None = None,
 ) -> ChatMessage:
     """Ответ мастера фото (эскизом): сохранить и отправить."""
+    telegram_id = client.telegram_id
     msg = ChatMessage(
         client_id=client.id,
         direction=ChatDirection.from_master,
@@ -403,13 +600,22 @@ async def send_photo_message(
     session.add(msg)
     await session.flush()
     try:
-        message_id, photo_file_id = await send_photo_to_telegram(client.telegram_id, photo, caption)
+        message_id, photo_file_id = await send_photo_to_telegram(
+            telegram_id, photo, with_role_prefix(role_label, caption)
+        )
         msg.telegram_message_id = message_id
         msg.telegram_file_id = photo_file_id
     except TelegramSendError:
         await session.rollback()
         raise
-    await session.commit()
+    try:
+        await session.commit()
+    except Exception:
+        # Как в send_text_message: убираем «фантом» из Telegram при сбое коммита
+        if msg.telegram_message_id:
+            await delete_message_from_telegram(telegram_id, msg.telegram_message_id)
+        await session.rollback()
+        raise
     return msg
 
 
@@ -420,9 +626,10 @@ async def send_photo_message(
 async def list_threads(session: AsyncSession, master_id: int | None = None) -> list[dict]:
     """Список чатов: клиент + последнее сообщение + непрочитанные.
 
-    master_id — фильтр для мастера: только чаты, закреплённые за ним открытым
-    assignment'ом (владелец видит все). Без DISTINCT ON (sqlite-тесты):
-    последний id через подзапрос MAX(id).
+    master_id — фильтр для мастера: только чаты, которые закреплялись за ним
+    (открытые И отвязанные — отвязанный диалог мастер продолжает видеть,
+    бейджа закрепления на нём уже нет; владелец видит все). Без DISTINCT ON
+    (sqlite-тесты): последний id через подзапрос MAX(id).
     """
     result = await session.execute(
         select(ChatMessage).where(
@@ -435,13 +642,13 @@ async def list_threads(session: AsyncSession, master_id: int | None = None) -> l
     if not last_by_client:
         return []
 
-    # Мастер: только клиенты с открытым закреплением за ним
+    # Мастер: только клиенты, закреплявшиеся за ним (открытые и отвязанные —
+    # отвязанный чат остаётся видимым, уходит лишь бейдж закрепления)
     if master_id is not None:
         pinned = await session.execute(
-            select(ChatAssignment.client_id).where(
-                ChatAssignment.master_id == master_id,
-                ChatAssignment.status == ChatAssignmentStatus.open,
-            )
+            select(ChatAssignment.client_id)
+            .where(ChatAssignment.master_id == master_id)
+            .distinct()
         )
         # set() один раз: повторный .all() по тому же Result вернёт пустоту —
         # курсор уже исчерпан, и фильтр выкинет все чаты
@@ -542,7 +749,7 @@ async def mark_thread_read(session: AsyncSession, client_id: int) -> int:
         )
     )
     rows = result.scalars().all()
-    now = datetime.now()
+    now = datetime.now(UTC)
     for row in rows:
         row.read_at = now
     await session.commit()
@@ -566,8 +773,12 @@ def _transcode_voice_to_mp3(data: bytes) -> bytes | None:
             input=data,
             capture_output=True,
             check=False,
+            timeout=60,  # зависший ffmpeg не должен держать тредпул вечно
         )
     except FileNotFoundError:
+        return None
+    except subprocess.TimeoutExpired:
+        logger.warning("ffmpeg не управился за 60с — отдаём оригинал ogg")
         return None
     if proc.returncode != 0 or not proc.stdout:
         return None
@@ -580,8 +791,10 @@ async def transcode_voice_to_mp3(data: bytes) -> bytes | None:
 
 
 async def get_message_file(session: AsyncSession, message_id: int) -> ChatMessage | None:
+    """Сообщение с вложением для прокси-файла: нужен telegram_file_id (уже
+    ушедшее в Telegram) ИЛИ stored_path (копия в своём хранилище)."""
     result = await session.execute(select(ChatMessage).where(ChatMessage.id == message_id))
     msg = result.scalar_one_or_none()
-    if msg is None or not msg.telegram_file_id:
+    if msg is None or not (msg.telegram_file_id or msg.stored_path):
         return None
     return msg

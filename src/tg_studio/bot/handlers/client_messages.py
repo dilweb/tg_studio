@@ -21,11 +21,12 @@ from aiogram.types import Message
 from sqlalchemy import select
 
 from tg_studio.api.auth import resolve_allowed_role
-from tg_studio.db.models import Master, MasterPortfolioFile
+from tg_studio.db.models import ChatMessage, Client, Master, MasterPortfolioFile
 from tg_studio.db.session import async_session_factory
 from tg_studio.modules.ai import booking
 from tg_studio.modules.ai.router import ROUTE_AGENT, classify_message
 from tg_studio.modules.business import portfolio_files
+from tg_studio.modules.chat import files as chat_files
 from tg_studio.modules.chat import service
 
 logger = logging.getLogger(__name__)
@@ -114,6 +115,34 @@ async def _is_staff(telegram_id: int) -> bool:
     return resolve_allowed_role(telegram_id) is not None
 
 
+async def _store_attachment_copy(
+    client_id: int, message_id: int, telegram_file_id: str, file_kind: str | None
+) -> None:
+    """Копия вложения в своё хранилище (Telegram — только транспорт).
+
+    Скачиваем файл из Telegram и складываем в chat/files (S3/диск) — чат
+    доступен и при недоступности Telegram, и после удаления сообщения в
+    мессенджере. Своя транзакция: сбой копии не трогает обработку сообщения
+    (оно уже сохранено, файл останется доступен через прокси по file_id).
+    """
+    mime = service.FILE_MEDIA_TYPES.get(file_kind or "", "application/octet-stream")
+    try:
+        data = await service.download_photo(telegram_file_id)
+        stored_path = chat_files.save_message_file(data, mime)
+        async with async_session_factory() as session:
+            msg = await session.get(ChatMessage, message_id)
+            if msg is None or msg.client_id != client_id:
+                return
+            msg.stored_path = stored_path
+            await session.commit()
+    except Exception:
+        # Копия — best-effort: сообщение уже сохранено, файл останется
+        # доступен через прокси по file_id
+        logger.warning(
+            "Не удалось сохранить копию вложения сообщения %s", message_id, exc_info=True
+        )
+
+
 async def _handle(
     message: Message,
     *,
@@ -142,17 +171,35 @@ async def _handle(
             last_name=tg_user.last_name,
             username=tg_user.username,
         )
+        # Дедуп: Telegram доставляет один update повторно (reconnect, retry)
+        # — не сохраняем и не дёргаем агента дважды
+        if await service.message_exists(session, client.id, message.message_id):
+            logger.info(
+                "Duplicate update %s от %s — пропущен", message.message_id, tg_user.id
+            )
+            return
         # Уведомление владельцу — только если чата с клиентом ещё не было
         is_new = await service.is_new_chat(session, client.id)
-        await service.save_incoming_message(
+        msg = await service.save_incoming_message(
             session,
             client,
             content=content,
             telegram_file_id=telegram_file_id,
             file_kind=file_kind,
+            telegram_message_id=message.message_id,
         )
+        if msg is None:
+            return  # дубликат (гонка двух обработчиков) — уже сохранён
+        if msg.telegram_file_id:
+            await _store_attachment_copy(
+                client.id, msg.id, msg.telegram_file_id, msg.file_kind
+            )
         if is_new:
-            await service.notify_owner(message.bot, client, preview)
+            try:
+                await service.notify_owner(message.bot, client, preview)
+            except Exception:
+                # Сбой уведомления не должен ронять обработку сообщения
+                logger.exception("Не удалось уведомить владельца о новом обращении")
         if allow_agent and content:
             await _maybe_agent_reply(session, message, client, content)
         elif allow_agent_with_photo and telegram_file_id:
@@ -169,9 +216,15 @@ TG_CAPTION_LIMIT = 1024
 
 
 def _master_caption(master: Master) -> str:
-    """Подпись профайл-пика: имя мастера + описание (лимит подписи TG)."""
+    """Подпись профайл-пика: метка ассистента + имя мастера + описание.
+
+    «Ассистент» в начале — клиент в Telegram видит только бота: без метки
+    фото мастера можно принять за личное сообщение от самого мастера."""
     desc = (master.description or "").strip()
-    caption = master.full_name + (f"\n{desc}" if desc else "")
+    caption = (
+        f"{service.ROLE_LABEL_AI}: знакомьтесь, {master.full_name}"
+        + (f"\n{desc}" if desc else "")
+    )
     return caption[:TG_CAPTION_LIMIT]
 
 
@@ -195,6 +248,7 @@ async def _send_photo_saved(
     session, client, data: bytes, caption: str | None
 ) -> bool:
     """Одно фото клиенту + зеркало в чат. False при ошибке отправки."""
+    client_id = client.id
     try:
         tg_msg_id, tg_file_id = await service.send_photo_to_telegram(
             client.telegram_id, data, caption=caption
@@ -202,29 +256,49 @@ async def _send_photo_saved(
     except service.TelegramSendError:
         logger.warning("Не удалось отправить фото клиенту")
         return False
-    await service.save_ai_photo_message(
-        session, client, caption=caption,
-        telegram_message_id=tg_msg_id, telegram_file_id=tg_file_id,
-    )
+    try:
+        await service.save_ai_photo_message(
+            session, client, caption=caption,
+            telegram_message_id=tg_msg_id, telegram_file_id=tg_file_id,
+        )
+    except Exception:
+        # Фото уже у клиента — сбой зеркала не откатывает доставку
+        logger.exception("Не удалось зеркалировать фото AI в чат (клиент %s)", client_id)
     return True
 
 
 async def _send_album_saved(
-    session, client, datas: list[bytes]
+    session, client, datas: list[bytes], caption: str | None = None
 ) -> list[bool]:
-    """Альбом 2-10 фото клиенту + зеркало по каждому; сбой альбома → по одному."""
+    """Альбом 2-10 фото клиенту + зеркало по каждому; сбой альбома → по одному.
+
+    caption идёт первому фото альбома (так умеет Telegram) — метка роли,
+    чтобы клиент понимал, что фото прислал ассистент."""
+    client_id = client.id
     try:
         results = await service.send_media_group_to_telegram(
-            client.telegram_id, datas
+            client.telegram_id, datas, caption=caption
         )
     except service.TelegramSendError:
         logger.warning("Альбом не отправился — отправляю по одному")
-        return [await _send_photo_saved(session, client, d, None) for d in datas]
-    for tg_msg_id, tg_file_id in results:
-        await service.save_ai_photo_message(
-            session, client, caption=None,
-            telegram_message_id=tg_msg_id, telegram_file_id=tg_file_id,
-        )
+        return [
+            await _send_photo_saved(session, client, d, caption if i == 0 else None)
+            for i, d in enumerate(datas)
+        ]
+    for i, (tg_msg_id, tg_file_id) in enumerate(results):
+        try:
+            await service.save_ai_photo_message(
+                session, client, caption=caption if i == 0 else None,
+                telegram_message_id=tg_msg_id, telegram_file_id=tg_file_id,
+            )
+        except Exception:
+            logger.exception(
+                "Не удалось зеркалировать фото AI в чат (клиент %s)", client_id
+            )
+            # rollback внутри save_ai_photo_message разрядил объект клиента
+            client = await session.get(Client, client_id)
+            if client is None:
+                break
     return [True] * len(datas)
 
 
@@ -267,10 +341,15 @@ async def _send_reply_photos(session, client, reply: str) -> tuple[str, int]:
         for i in range(0, len(photos), TG_ALBUM_LIMIT):
             chunk = photos[i : i + TG_ALBUM_LIMIT]
             datas = [d for _, d in chunk]
+            # Метка роли на первом фото альбома — фото без подписи в
+            # Telegram выглядело бы как личное сообщение мастера
+            album_caption = service.with_role_prefix(
+                service.ROLE_LABEL_AI, f"Работы мастера {master.full_name}"
+            )[:TG_CAPTION_LIMIT] if master else None
             ok_flags = (
-                await _send_album_saved(session, client, datas)
+                await _send_album_saved(session, client, datas, caption=album_caption)
                 if len(datas) > 1
-                else [await _send_photo_saved(session, client, datas[0], None)]
+                else [await _send_photo_saved(session, client, datas[0], album_caption)]
             )
             for (url, _), ok in zip(chunk, ok_flags):
                 if ok:
@@ -298,7 +377,12 @@ async def _maybe_agent_reply(
     if business is None:
         logger.warning("No business — booking agent disabled")
         return
-    route = await classify_message(session, client.id, text)
+    # Роутер текстовый: фото он не видит — даём знать маркером, иначе фото
+    # без подписи приходит к нему пустой строкой
+    route = await classify_message(
+        session, client.id,
+        f"[клиент прислал фото] {text}".strip() if photo_file_id else text,
+    )
     if route != ROUTE_AGENT:
         logger.info("Client %s message routed to %s — no agent reply", client.id, route)
         return
@@ -325,16 +409,24 @@ async def _maybe_agent_reply(
     if not reply and not photo_count:
         return
     if reply:
+        client_id = client.id
         try:
             telegram_message_id = await service.send_text_to_telegram(
-                client.telegram_id, reply
+                client.telegram_id,
+                # Роль в начале: в Telegram клиент видит только бота и иначе
+                # не поймёт, что ответил ассистент, а не мастер
+                service.with_role_prefix(service.ROLE_LABEL_AI, reply),
             )
         except service.TelegramSendError:
-            logger.exception("Failed to send agent reply to client %s", client.id)
+            logger.exception("Failed to send agent reply to client %s", client_id)
             return
-        await service.save_ai_message(
-            session, client, reply, telegram_message_id=telegram_message_id
-        )
+        try:
+            await service.save_ai_message(
+                session, client, reply, telegram_message_id=telegram_message_id
+            )
+        except Exception:
+            # Ответ уже у клиента — сбой зеркала не откатывает доставку
+            logger.exception("Не удалось зеркалировать ответ AI в чат (клиент %s)", client_id)
 
 
 @router.message(Command("switchrole"))

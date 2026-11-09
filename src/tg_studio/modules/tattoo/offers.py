@@ -24,6 +24,7 @@ from datetime import UTC, datetime, timedelta
 from sqlalchemy import func, select, update
 
 from tg_studio.config import settings
+from tg_studio.db.locks import for_update
 from tg_studio.db.models import (
     Business,
     Client,
@@ -278,29 +279,47 @@ async def escalate_to_owner(session, work: TattooWork) -> None:
 
 
 async def expire_stale_offers(session) -> int:
-    """Сгоревшие офферы → expired, очередь продвигается. Возвращает число."""
+    """Сгоревшие офферы → expired, очередь продвигается. Возвращает число.
+
+    Строки офферов блокируются (FOR UPDATE) и статус перепроверяется после
+    блокировки — между выборкой и обработкой оффер могли принять/отклонить
+    (гонка celery-sweep vs API). Уведомления отправляются ПОСЛЕ коммита:
+    сбой Telegram не откатывает распределение и не плодит дубли при ретрае.
+    """
+    now = datetime.now(UTC)
     stale = (
         await session.execute(
-            select(SessionOffer).where(
-                SessionOffer.status == SessionOfferStatus.pending.value,
-                SessionOffer.expires_at.isnot(None),
-                SessionOffer.expires_at < datetime.now().astimezone(),
+            for_update(
+                select(SessionOffer).where(
+                    SessionOffer.status == SessionOfferStatus.pending.value,
+                    SessionOffer.expires_at.isnot(None),
+                    SessionOffer.expires_at < now,
+                ),
+                session,
             )
         )
     ).scalars().all()
+    to_notify: list[SessionOffer] = []
+    to_escalate: list[TattooWork] = []
     for offer in stale:
+        if offer.status != SessionOfferStatus.pending.value:
+            continue  # статус изменился после блокировки — решила другая транзакция
         offer.status = SessionOfferStatus.expired.value
-        offer.responded_at = datetime.now().astimezone()
+        offer.responded_at = now
         work = await session.get(TattooWork, offer.work_id)
         if work is None or work.master_id is not None:
             continue
         next_offer = await advance_queue(session, work)
         if next_offer is None:
-            await escalate_to_owner(session, work)
+            to_escalate.append(work)
         else:
-            await notify_master(session, next_offer)
+            to_notify.append(next_offer)
     if stale:
         await session.commit()
+    for next_offer in to_notify:
+        await notify_master(session, next_offer)
+    for work in to_escalate:
+        await escalate_to_owner(session, work)
     return len(stale)
 
 

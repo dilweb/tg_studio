@@ -1,8 +1,8 @@
 """Integration tests: мягкое удаление мастера (запись остаётся в БД)."""
 
-from tests.conftest import make_business, make_master
+from tests.conftest import make_business, make_init_data_headers, make_master
 
-OWNER_HEADERS = {"X-Debug-User-Id": "99999"}
+OWNER_HEADERS = make_init_data_headers(99999)
 
 
 async def test_delete_master_is_soft(api_client, db_session):

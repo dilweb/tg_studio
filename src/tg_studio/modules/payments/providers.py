@@ -216,10 +216,15 @@ _APIPAY = ApipayProvider()
 
 
 def apipay_configured() -> bool:
-    """Ключ ApiPay задан в окружении — счёт Kaspi доступен."""
+    """ApiPay подключён: ключ + секрет подписи вебхука заданы.
+
+    Без webhook_secret статусы оплат не дойдут (эндпоинт отвечает 503) —
+    счёт зависнет pending и предоплата истечёт через 24ч, отменив бронь.
+    Поэтому «настроен» = оба секрета; иначе работаем только manual.
+    """
     from tg_studio.config import settings
 
-    return bool(settings.apipay_api_key)
+    return bool(settings.apipay_api_key and settings.apipay_webhook_secret)
 
 
 def get_provider(name: str):

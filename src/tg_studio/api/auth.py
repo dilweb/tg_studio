@@ -36,7 +36,12 @@ pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 bearer_scheme = HTTPBearer(auto_error=False)
 
-INIT_DATA_MAX_AGE_SECONDS = 86400
+# Telegram отдаёт initData один раз при открытии миниаппа и держит тот же
+# снапшот, пока приложение открыто (в т.ч. свёрнутое в фоне): при окне в сутки
+# мастер, не закрывавший миниапп дольше 24ч, ловил 401 «initData expired» на
+# каждом запросе. 30 дней = срок refresh-токена: по факту лимит срабатывает
+# только если initData утёк, подпись проверяется всегда.
+INIT_DATA_MAX_AGE_SECONDS = 30 * 86400
 
 
 # ---------------------------------------------------------------------------
@@ -217,6 +222,20 @@ async def resolve_master_role(session: AsyncSession, tg_id: int) -> UserRole | N
     return UserRole.master if result.scalar_one_or_none() is not None else None
 
 
+async def resolve_admin_role(session: AsyncSession, tg_id: int) -> UserRole | None:
+    """Администратор студии (коворкинг, 05): активная строка StudioAdmin
+    с таким telegram_id, заведённая владельцем (POST /api/admins)."""
+    from tg_studio.db.models import StudioAdmin
+
+    result = await session.execute(
+        select(StudioAdmin.id).where(
+            StudioAdmin.telegram_id == tg_id,
+            StudioAdmin.is_active.is_(True),
+        )
+    )
+    return UserRole.admin if result.scalar_one_or_none() is not None else None
+
+
 async def _bind_master_user(session: AsyncSession, user: User) -> None:
     """Привязать Master.user_id при входе мастера (initData даёт telegram_id,
     а дальше панель ищет мастер-профиль по user_id)."""
@@ -309,34 +328,10 @@ async def get_current_user(
     - Bearer <JWT>           — web panel login
     - TelegramInitData <...> — Mini App (роль из ALLOWED_USERS)
     """
-    # Debug mode (браузерный дев без initData): X-Debug-User-Id или первый из ALLOWED_USERS
-    if settings.debug and credentials is None and authorization is None:
-        raw_debug_id = request.headers.get("X-Debug-User-Id")
-        if raw_debug_id:
-            try:
-                debug_tg_id = int(raw_debug_id)
-            except ValueError:
-                raise HTTPException(status_code=400, detail="Invalid X-Debug-User-Id") from None
-        elif settings.allowed_users:
-            debug_tg_id = settings.allowed_users[0].id
-        else:
-            raise HTTPException(
-                status_code=401,
-                detail="No credentials and ALLOWED_USERS is empty (set X-Debug-User-Id)",
-            )
-        role = resolve_allowed_role(debug_tg_id) or await resolve_master_role(
-            session, debug_tg_id
-        )
-        if role is None:
-            raise HTTPException(
-                status_code=403,
-                detail=f"tg_id {debug_tg_id} отсутствует в ALLOWED_USERS и среди мастеров",
-            )
-        user = await _provision_allowed_user(
-            session, {"id": debug_tg_id, "first_name": f"Debug {debug_tg_id}"}, role
-        )
-        await _bind_master_user(session, user)
-        return user
+    # Debug-доступ (X-Debug-User-Id и fallback на ALLOWED_USERS[0] без заголовка)
+    # удалён намеренно: в проде с DEBUG=true давал полный доступ владельца без
+    # единого credential (подтверждено smoke 2026-10-26, см. docs/ROADMAP.md).
+    # Вход только по JWT (cookie/Bearer) или подписанному Telegram initData.
 
     # Path 1: JWT Bearer or HttpOnly access cookie
     bearer_or_cookie: str | None = None
@@ -359,17 +354,19 @@ async def get_current_user(
         _require_email_verified_if_applicable(request, user)
         return user
 
-    # Path 2: Telegram initData (Mini App) — владелец из env, мастер из БД
+    # Path 2: Telegram initData (Mini App) — владелец из env, мастер/админ из БД
     if authorization and authorization.startswith("TelegramInitData "):
         init_data = authorization.removeprefix("TelegramInitData ")
         tg_user = _validate_init_data(init_data, settings.bot_token)
-        role = resolve_allowed_role(tg_user["id"]) or await resolve_master_role(
-            session, tg_user["id"]
+        role = (
+            resolve_allowed_role(tg_user["id"])
+            or await resolve_master_role(session, tg_user["id"])
+            or await resolve_admin_role(session, tg_user["id"])
         )
         if role is None:
             raise HTTPException(
                 status_code=403,
-                detail="Этот Telegram-аккаунт не добавлен в ALLOWED_USERS и не числится мастером",
+                detail="Этот Telegram-аккаунт не добавлен в ALLOWED_USERS и не числится мастером или администратором",
             )
         user = await _provision_allowed_user(session, tg_user, role)
         await _bind_master_user(session, user)

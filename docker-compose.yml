@@ -2,8 +2,11 @@ services:
   postgres:
     image: postgres:16-alpine
     restart: unless-stopped
+    # Порт только на localhost хоста: снаружи БД не торчит (раньше 6005 был
+    # открыт для мира с паролем по умолчанию — P0). Локально подключаемся
+    # psql -h localhost -p 6005, изнутри сети — postgres:5432.
     ports:
-      - "6005:5432"
+      - "127.0.0.1:6005:5432"
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-tg_studio}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-secret}
@@ -39,7 +42,9 @@ services:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER:-tgstudio}
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minio-secret}
     ports:
-      - "6006:9001"
+      # Только localhost: консоль не торчит наружу (раньше 6006 был открыт —
+      # P0). S3 API (9000) не публикуется вовсе — доступ только из сети compose.
+      - "127.0.0.1:6006:9001"
     volumes:
       - minio_data:/data
     healthcheck:

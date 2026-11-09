@@ -1,10 +1,10 @@
 """Integration tests for Google Calendar ACL sharing with the owner's address."""
 
-from tests.conftest import make_business, make_master
+from tests.conftest import make_business, make_init_data_headers, make_master
 from tg_studio.db.models import Business
 from tg_studio.modules.google_calendar import api as gc_api
 
-OWNER_HEADERS = {"X-Debug-User-Id": "99999"}
+OWNER_HEADERS = make_init_data_headers(99999)
 
 
 async def _connected_business(session, share_email: str | None = None) -> Business:

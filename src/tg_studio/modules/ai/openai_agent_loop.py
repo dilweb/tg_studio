@@ -20,6 +20,7 @@ from openai.types.chat import ChatCompletionMessageToolCall
 
 from tg_studio.config import settings
 
+from .llm_retry import chat_completion_with_retry
 from .system_prompt import REPEATED_TOOL_CALL_NUDGE, ZERO_COUNT_FOLLOWUP_NUDGE
 from .tools import AGENT_TOOLS
 
@@ -174,7 +175,8 @@ async def run_openai_analytics_loop(
                     "phase": "completions",
                 }
             )
-        response = await client.chat.completions.create(
+        response = await chat_completion_with_retry(
+            client,
             model=mdl,
             temperature=0,
             messages=openai_messages,
@@ -218,7 +220,29 @@ async def run_openai_analytics_loop(
             repeated_this_round = False
             for tc in tcalls:
                 # args парсим до эвента — в песочнице показываем SQL вызова
-                args = json.loads(tc.function.arguments)
+                try:
+                    args = json.loads(tc.function.arguments)
+                    if not isinstance(args, dict):
+                        raise ValueError("arguments is not an object")
+                except (ValueError, TypeError, AttributeError):
+                    # Битый JSON аргументов — не роняем луп: модель увидит
+                    # ошибку в tool_result и попробует ещё раз
+                    logger.warning("Broken tool arguments in call %r", tc.id)
+                    args = {}
+                    tool_result = json.dumps(
+                        {"error": "Модель прислала некорректные аргументы инструмента"}
+                    )
+                    pending.append(
+                        PendingAIMessage(
+                            role="tool",
+                            content=tool_result,
+                            tool_call_id=tc.id,
+                        )
+                    )
+                    openai_messages.append(
+                        {"role": "tool", "content": tool_result, "tool_call_id": tc.id}
+                    )
+                    continue
                 signature = (
                     tc.function.name,
                     json.dumps(args, sort_keys=True, ensure_ascii=False),

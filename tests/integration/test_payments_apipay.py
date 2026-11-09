@@ -16,9 +16,9 @@ from tg_studio.config import settings
 from tg_studio.db.models import Payment, UserRole
 from tg_studio.modules.payments import providers
 
-from ..conftest import make_business, make_user
+from ..conftest import make_business, make_init_data_headers, make_user
 
-OWNER_HEADERS = {"X-Debug-User-Id": "99999"}
+OWNER_HEADERS = make_init_data_headers(99999)
 WEBHOOK_SECRET = "whsec-test-123"
 
 
@@ -109,6 +109,22 @@ async def test_webhook_marks_paid(api_client, db_session, business, apipay_payme
 
 
 @pytest.mark.asyncio
+async def test_webhook_amount_mismatch_not_paid(api_client, db_session, business, apipay_payment, monkeypatch):
+    """Сумма в вебхуке не совпала с нашей записью — статус paid НЕ применяется
+    (иначе можно «оплатить» счёт на 1 ₸ вместо 30 000)."""
+    monkeypatch.setattr(settings, "apipay_webhook_secret", WEBHOOK_SECRET)
+    body = webhook_body({"id": 424242, "status": "paid", "amount": "1.00"})
+    resp = await api_client.post(
+        "/api/payments/webhook/apipay", content=body, headers=signed_headers(body)
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["ignored"] == "amount_mismatch"
+
+    await db_session.refresh(apipay_payment)
+    assert apipay_payment.status == "pending"
+
+
+@pytest.mark.asyncio
 async def test_webhook_cancelled_then_paid(api_client, db_session, apipay_payment, monkeypatch):
     """Статусы могут идти назад: cancelled → paid — легальный переход."""
     monkeypatch.setattr(settings, "apipay_webhook_secret", WEBHOOK_SECRET)
@@ -187,6 +203,7 @@ def make_mock_provider(invoice: dict) -> providers.ApipayProvider:
 async def test_sync_polls_apipay(api_client, db_session, business, apipay_payment, monkeypatch):
     """Опрос как страховка вебхука: GET /invoices/{id} подтягивает paid."""
     monkeypatch.setattr(settings, "apipay_api_key", "test-key")  # sync не проверяет ключ, но env-стиль
+    monkeypatch.setattr(settings, "apipay_webhook_secret", WEBHOOK_SECRET)
     monkeypatch.setattr(providers, "_APIPAY", make_mock_provider({"id": 424242, "status": "paid"}))
     resp = await api_client.post(f"/api/payments/{apipay_payment.id}/sync", headers=OWNER_HEADERS)
     assert resp.status_code == 200, resp.text

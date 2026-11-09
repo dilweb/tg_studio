@@ -8,6 +8,7 @@ Owners can:
    owner's personal Google address (ACL), so bookings are visible there
 4. DELETE /api/admin/google-calendar/disconnect — remove Google Calendar access
 """
+import asyncio
 import json
 
 from fastapi import APIRouter, HTTPException
@@ -59,7 +60,9 @@ async def connect_service_account(
         ) from None
 
     try:
-        verify_service_account(key)
+        # Синхронный сетевой вызов Google — в тредпуле, чтобы не блокировать
+        # event loop воркера
+        await asyncio.to_thread(verify_service_account, key)
     except HttpError as exc:
         raise HTTPException(status_code=502, detail=f"Google отклонил ключ: {exc.reason}") from exc
     except Exception as exc:
@@ -162,8 +165,10 @@ async def unshare_google_calendar(
     for calendar_id in calendar_ids:
         try:
             await unshare_calendar(business.google_calendar_credentials_json, calendar_id)
-        except HttpError:
-            continue  # best-effort: правило могло быть уже снято вручную
+        except Exception:
+            # best-effort: правило могло быть уже снято вручную, сеть могла
+            # упасть — доступ отзывается в любом случае
+            continue
 
     business.google_share_email = None
     await session.commit()
@@ -180,8 +185,10 @@ async def disconnect_google_calendar(
         for calendar_id in calendar_ids:
             try:
                 await unshare_calendar(business.google_calendar_credentials_json, calendar_id)
-            except HttpError:
-                continue  # best-effort: ключ мог стать невалидным
+            except Exception:
+                # best-effort: ключ мог стать невалидным, сеть могла упасть —
+                # credentials всё равно очищаем
+                continue
 
     business.google_calendar_credentials_json = None
     business.google_calendar_email = None

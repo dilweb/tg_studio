@@ -13,11 +13,17 @@ import pytest
 from tg_studio.config import AllowedUser, settings
 from tg_studio.db.models import UserRole
 
-from ..conftest import make_business, make_client, make_master, make_user
+from ..conftest import (
+    make_business,
+    make_client,
+    make_init_data_headers,
+    make_master,
+    make_user,
+)
 
-OWNER_HEADERS = {"X-Debug-User-Id": "99999"}
+OWNER_HEADERS = make_init_data_headers(99999)
 MASTER_TG_ID = 88888
-MASTER_HEADERS = {"X-Debug-User-Id": str(MASTER_TG_ID)}
+MASTER_HEADERS = make_init_data_headers(MASTER_TG_ID)
 
 
 @pytest.fixture
@@ -279,6 +285,42 @@ async def test_master_scoped_to_own_works(db_session, api_client, business, mast
         f"/api/payments/works/{other_work['id']}/balance", headers=MASTER_HEADERS
     )
     assert resp.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_master_cannot_touch_foreign_payment_actions(
+    db_session, api_client, business, master, client_row
+):
+    """Мастер не может mark-paid/cancel/sync счета ЧУЖОЙ работы — только список
+    фильтруется, сами действия тоже должны быть скоуплены (иначе отметка чужой
+    оплаты или отмена чужого счёта — 404)."""
+    other_master = await make_master(db_session, business_id=business.id, full_name="Другой Мастер")
+    other_work = await create_work(api_client, business, other_master, client_row)
+    resp = await api_client.post(
+        "/api/payments",
+        json={"work_id": other_work["id"], "amount": 5000, "contract_price": 5000},
+        headers=OWNER_HEADERS,
+    )
+    payment_id = resp.json()["id"]
+
+    resp = await api_client.post(
+        f"/api/payments/{payment_id}/mark-paid", headers=MASTER_HEADERS
+    )
+    assert resp.status_code == 404
+    resp = await api_client.post(
+        f"/api/payments/{payment_id}/cancel", json={}, headers=MASTER_HEADERS
+    )
+    assert resp.status_code == 404
+    resp = await api_client.post(
+        f"/api/payments/{payment_id}/sync", headers=MASTER_HEADERS
+    )
+    assert resp.status_code == 404
+
+    # Владелец по-прежнему может (счёт остаётся pending)
+    resp = await api_client.post(
+        f"/api/payments/{payment_id}/mark-paid", headers=OWNER_HEADERS
+    )
+    assert resp.status_code == 200
 
 
 @pytest.mark.asyncio

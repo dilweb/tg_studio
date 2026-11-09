@@ -3,11 +3,10 @@ import { reactive } from 'vue'
 import { fetchMe, hasInitData } from '../api/client'
 
 const ME_KEY = 'tg_studio.me'
-const DEBUG_ID_KEY = 'tg_studio.debugUserId'
 
 // Роли, которые понимает роутер (nav.js). Всё остальное — протухший кэш
 // со старой схемы ролей: его выбрасываем, иначе guard уводит в /login и зацикливается.
-const VALID_ROLES = new Set(['owner', 'master'])
+const VALID_ROLES = new Set(['owner', 'master', 'admin'])
 
 function loadMe() {
   try {
@@ -34,19 +33,14 @@ export const authStore = reactive({
     localStorage.setItem(ME_KEY, JSON.stringify(me))
   },
 
-  setDebugUserId(id) {
-    localStorage.setItem(DEBUG_ID_KEY, String(id))
-  },
-
   logout() {
     this.me = null
     localStorage.removeItem(ME_KEY)
-    localStorage.removeItem(DEBUG_ID_KEY)
   },
 })
 
 /**
- * Попытка входа: initData (Telegram) или debug-заголовок (браузер).
+ * Попытка входа: только initData (Telegram Mini App).
  * Возвращает me или бросает ошибку из apiFetch.
  */
 export async function login() {

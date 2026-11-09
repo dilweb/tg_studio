@@ -1,4 +1,5 @@
-// Fetch-обёртка: Telegram initData → Authorization, иначе DEBUG-заголовок.
+// Fetch-обёртка: Telegram initData → Authorization. Других способов входа нет —
+// debug-заголовок X-Debug-User-Id удалён из бэкенда (давал доступ без токена).
 
 function tg() {
   return window.Telegram?.WebApp ?? null
@@ -9,18 +10,12 @@ export function hasInitData() {
 }
 
 /**
- * Заголовки для запросов к API.
- * Внутри Telegram — initData (единственный надёжный способ в проде).
- * В браузере (dev, DEBUG=true на бэкенде) — X-Debug-User-Id.
+ * Заголовки для запросов к API — только подписанный Telegram initData.
  */
 function authHeaders() {
   const initData = tg()?.initData
   if (initData) {
     return { Authorization: `TelegramInitData ${initData}` }
-  }
-  const debugId = localStorage.getItem('tg_studio.debugUserId')
-  if (debugId) {
-    return { 'X-Debug-User-Id': debugId }
   }
   return {}
 }

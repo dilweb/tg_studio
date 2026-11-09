@@ -5,12 +5,17 @@ Each test gets a fresh SQLite in-memory database (StaticPool) so tests are
 fully isolated without needing a running Postgres instance.
 """
 
+import hashlib
+import hmac
+import json
 import os
+import time
+from urllib.parse import urlencode
 
 # Must be set BEFORE tg_studio modules are imported so pydantic-settings is satisfied.
 os.environ.setdefault("BOT_TOKEN", "1234567890:AAHtest_token_for_testing_only_ci")
 os.environ.setdefault("DEBUG", "true")
-# Роли в дебаг-заглушке решает ALLOWED_USERS; 99999 — телеграм-id владельца из make_business.
+# Роль по initData решает ALLOWED_USERS; 99999 — телеграм-id владельца из make_business.
 # Присваиваем, а не setdefault: compose прокидывает реальный .env с другими id.
 os.environ["ALLOWED_USERS"] = '[{"id": 99999, "role": "owner"}]'
 os.environ.setdefault("MINIAPP_URL", "http://testserver")
@@ -27,6 +32,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 from sqlalchemy.pool import StaticPool
 
 from tg_studio.api.app import app
+from tg_studio.config import settings
 from tg_studio.db.base import Base
 from tg_studio.db.models import (
     Business,
@@ -144,3 +150,18 @@ async def make_client(
     session.add(obj)
     await session.flush()
     return obj
+
+
+def make_init_data_headers(telegram_id: int, first_name: str = "Test") -> dict:
+    """Заголовок Authorization с подписанным Telegram initData — как в миниаппе.
+
+    Единственный способ авторизации в API: debug-доступ (X-Debug-User-Id и
+    fallback на ALLOWED_USERS[0]) удалён из api/auth.py. Роль берётся из
+    ALLOWED_USERS (owner) или из строки Master в БД (master) — как в проде.
+    """
+    user = json.dumps({"id": telegram_id, "first_name": first_name}, separators=(",", ":"))
+    params = {"auth_date": str(int(time.time())), "user": user}
+    data_check_string = "\n".join(f"{k}={v}" for k, v in sorted(params.items()))
+    secret_key = hmac.new(b"WebAppData", settings.bot_token.encode(), hashlib.sha256).digest()
+    params["hash"] = hmac.new(secret_key, data_check_string.encode(), hashlib.sha256).hexdigest()
+    return {"Authorization": f"TelegramInitData {urlencode(params)}"}

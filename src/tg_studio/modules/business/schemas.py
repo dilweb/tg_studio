@@ -1,5 +1,7 @@
 from pydantic import BaseModel, Field, field_validator
 
+from tg_studio.modules.business import portfolio_files
+
 
 class BusinessResponse(BaseModel):
     id: int
@@ -90,6 +92,10 @@ class MasterUpdate(BaseModel):
     is_active: bool | None = None
     default_duration_minutes: int | None = None
     specializations: list[str] | None = None
+    # Резидент студии (коворкинг): на него действуют резидентские скидки (03)
+    is_resident: bool | None = None
+    # Телефон для выставления счетов Kaspi (apipay) за бронь мест (коворкинг, 04)
+    phone: str | None = None
 
 
 class MasterPortfolioFileOut(BaseModel):
@@ -115,6 +121,51 @@ class MasterResponse(BaseModel):
     google_calendar_id: str | None = None
     default_duration_minutes: int | None = None
     specializations: list[str] = []
+    # Резидент студии (коворкинг) — резидентские скидки на бронь мест
+    is_resident: bool = False
+    # Телефон для Kaspi-счётов за бронь мест (коворкинг, 04)
+    phone: str | None = None
     # прямая ссылка «добавить календарь в мой Google Calendar» (без письма)
     calendar_add_url: str | None = None
     portfolio: list[MasterPortfolioFileOut] = []
+
+
+class PublicMasterResponse(BaseModel):
+    """Мастер для клиентов (бот, агент записи, миниапп) — без авторизации.
+
+    Только маркетинг: имя, описание, специализации, фото. Без PII:
+    telegram_id (писать мастеру в обход студии), google_calendar_id и
+    calendar_add_url (подписка на чужой календарь / инъекция событий).
+    """
+
+    id: int
+    full_name: str
+    description: str | None
+    avatar_url: str | None = None
+    specializations: list[str] = []
+    portfolio: list[MasterPortfolioFileOut] = []
+
+
+def _public_portfolio_out(m) -> list[MasterPortfolioFileOut]:
+    return [
+        MasterPortfolioFileOut(
+            id=f.id,
+            original_name=f.original_name,
+            mime=f.mime,
+            size_bytes=f.size_bytes,
+            created_at=f.created_at.isoformat() if f.created_at else None,
+            url=portfolio_files.portfolio_url(f),
+        )
+        for f in (m.portfolio_files or [])
+    ]
+
+
+def public_master_out(m) -> PublicMasterResponse:
+    return PublicMasterResponse(
+        id=m.id,
+        full_name=m.full_name,
+        description=m.description,
+        avatar_url=portfolio_files.avatar_url(m),
+        specializations=m.specializations or [],
+        portfolio=_public_portfolio_out(m),
+    )

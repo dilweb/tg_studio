@@ -12,11 +12,17 @@ import pytest
 from tg_studio.config import AllowedUser, settings
 from tg_studio.db.models import UserRole
 
-from ..conftest import make_business, make_client, make_master, make_user
+from ..conftest import (
+    make_business,
+    make_client,
+    make_init_data_headers,
+    make_master,
+    make_user,
+)
 
-OWNER_HEADERS = {"X-Debug-User-Id": "99999"}
+OWNER_HEADERS = make_init_data_headers(99999)
 MASTER_TG_ID = 88888
-MASTER_HEADERS = {"X-Debug-User-Id": str(MASTER_TG_ID)}
+MASTER_HEADERS = make_init_data_headers(MASTER_TG_ID)
 
 
 @pytest.fixture
@@ -26,7 +32,7 @@ async def business(db_session):
 
 @pytest.fixture
 async def master(db_session, business, monkeypatch):
-    """Мастер с привязанным User — чтобы ходить под его debug-заголовком."""
+    """Мастер с привязанным User — чтобы ходить под его initData."""
     user = await make_user(
         db_session, telegram_id=MASTER_TG_ID, first_name="Мастер Тест", role=UserRole.master
     )

@@ -2,10 +2,10 @@
 
 import pytest
 
-from ..conftest import make_client
+from ..conftest import make_client, make_init_data_headers
 
-OWNER_HEADERS = {"X-Debug-User-Id": "99999"}
-MASTER_HEADERS = {"X-Debug-User-Id": "88888"}
+OWNER_HEADERS = make_init_data_headers(99999)
+MASTER_HEADERS = make_init_data_headers(88888)
 
 
 @pytest.fixture

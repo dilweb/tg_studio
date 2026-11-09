@@ -10,7 +10,6 @@ OpenRouter) по последним 10 сообщениям с датами: п�
 """
 
 import logging
-from datetime import date
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -19,6 +18,7 @@ from tg_studio.config import settings
 from tg_studio.db.models import ChatAssignmentStatus, ChatDirection, ChatMessage
 from tg_studio.modules.chat.assignments import get_open_assignment
 from tg_studio.modules.chat.service import PREVIEW_LABELS
+from tg_studio.timeutil import studio_today, to_studio_local
 
 logger = logging.getLogger(__name__)
 
@@ -82,7 +82,7 @@ def format_history(messages: list[ChatMessage]) -> str:
         )
         if len(content) > 200:
             content = content[:197] + "…"
-        ts = msg.created_at.strftime("%d.%m.%Y %H:%M") if msg.created_at else ""
+        ts = to_studio_local(msg.created_at).strftime("%d.%m.%Y %H:%M") if msg.created_at else ""
         lines.append(f"[{ts}] {label}: {content}")
     return "\n".join(lines)
 
@@ -112,14 +112,16 @@ async def classify_message(
     history = await load_history(session, client_id)
     prompt = DISPATCHER_PROMPT.format(
         history=format_history(history),
-        today=date.today().strftime("%d.%m.%Y"),
+        today=studio_today().strftime("%d.%m.%Y"),
         new_message=new_message[:500],
     )
     try:
         from tg_studio.modules.ai.client import get_openai_client
+        from tg_studio.modules.ai.llm_retry import chat_completion_with_retry
 
         client = get_openai_client()
-        response = await client.chat.completions.create(
+        response = await chat_completion_with_retry(
+            client,
             model=settings.llm_router_model or settings.llm_model,
             temperature=0,
             messages=[{"role": "user", "content": prompt}],

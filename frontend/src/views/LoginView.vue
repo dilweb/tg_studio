@@ -3,42 +3,16 @@ import { onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 
 import { hasInitData } from '../api/client'
-import { authStore, login } from '../store/auth'
+import { login } from '../store/auth'
 
 const router = useRouter()
 
-const debugId = ref('')
 const error = ref('')
 const busy = ref(false)
 
-// В Telegram — автологин по initData, форма не показывается
+// В Telegram — автологин по initData; вне Telegram входа нет (debug-форма
+// удалена: бэкенд больше не принимает X-Debug-User-Id)
 const telegramMode = ref(hasInitData())
-
-async function submit() {
-  error.value = ''
-  const id = debugId.value.trim()
-  if (!id || !/^\d+$/.test(id)) {
-    error.value = 'Введите Telegram ID (только цифры)'
-    return
-  }
-  busy.value = true
-  try {
-    authStore.setDebugUserId(id)
-    await login()
-    router.replace('/')
-  } catch (err) {
-    if (err.status === 401) {
-      error.value = 'Откройте приложение через Telegram'
-    } else if (err.status === 403) {
-      error.value = err.detail ?? 'Доступ только для админа или мастера'
-    } else {
-      error.value = err.kind === 'network' ? 'API недоступен' : (err.detail ?? String(err.message))
-    }
-    authStore.logout()
-  } finally {
-    busy.value = false
-  }
-}
 
 onMounted(async () => {
   if (!telegramMode.value) return
@@ -71,22 +45,7 @@ onMounted(async () => {
       <div v-if="telegramMode" class="telegram-state">
         <template v-if="busy">Входим через Telegram…</template>
       </div>
-
-      <form v-else @submit.prevent="submit">
-        <div class="field">
-          <label for="tg-id">Telegram ID</label>
-          <input
-            id="tg-id"
-            v-model="debugId"
-            inputmode="numeric"
-            placeholder="Например 111111111"
-            autocomplete="off"
-          />
-        </div>
-        <button class="btn btn-primary" type="submit" :disabled="busy" style="width: 100%">
-          {{ busy ? 'Входим…' : 'Войти' }}
-        </button>
-      </form>
+      <p v-else class="telegram-state">Вход только через Telegram — откройте приложение в боте студии.</p>
     </div>
   </div>
 </template>

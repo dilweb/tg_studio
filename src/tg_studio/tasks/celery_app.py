@@ -11,6 +11,7 @@ celery_app = Celery(
         "tg_studio.tasks.email_verification",
         "tg_studio.tasks.session_offers",
         "tg_studio.tasks.prepay_expiry",
+        "tg_studio.tasks.booking_holds",
     ],
 )
 
@@ -30,6 +31,11 @@ celery_app.conf.update(
         "expire-prepay-invoices": {
             "task": "expire_prepay_invoices",
             "schedule": crontab(minute="*/15"),
+        },
+        # Истёкший hold брони места (ожидает_оплаты) → истекла_оплата, место свободно
+        "expire-booking-holds": {
+            "task": "expire_booking_holds",
+            "schedule": crontab(minute="*/5"),
         },
     },
 )

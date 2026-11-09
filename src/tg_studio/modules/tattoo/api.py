@@ -1,7 +1,7 @@
 """
 API тату-работ и сеансов (миниапп: владелец и мастера).
 
-Доступ — штатная авторизация миниаппа (TelegramInitData / debug-заголовок):
+Доступ — штатная авторизация миниаппа (TelegramInitData / JWT-cookie):
 - мастер видит и правит только свои работы;
 - владелец — все работы бизнеса, мастер выбирается параметром master_id.
 Сеансы синхронизируются с Google Calendar.
@@ -23,6 +23,7 @@ from tg_studio.api.admin_deps import (
 )
 from tg_studio.api.auth import CurrentUserDep, CurrentUserOptionalDep
 from tg_studio.api.deps import SessionDep
+from tg_studio.db.locks import for_update, lock_master_slot
 from tg_studio.db.models import (
     Business,
     Client,
@@ -36,10 +37,11 @@ from tg_studio.db.models import (
     TattooSession,
     TattooWork,
     TattooWorkStatus,
+    UserRole,
 )
+from tg_studio.modules.chat import assignments as chat_assignments
 from tg_studio.modules.chat.service import make_file_token, verify_file_token
 from tg_studio.modules.google_calendar.client import (
-    cancel_event,
     create_event,
     list_events,
     update_event,
@@ -48,6 +50,7 @@ from tg_studio.modules.payments import service as payments_service
 from tg_studio.modules.payments.service import ensure_can_complete
 from tg_studio.modules.tattoo import files as files_storage
 from tg_studio.modules.tattoo import offers
+from tg_studio.modules.tattoo.calendar import remove_session_event
 from tg_studio.modules.tattoo.pricing import effective_pricing, estimate_price
 from tg_studio.modules.tattoo.schemas import (
     COMPLEXITY_OPTIONS,
@@ -82,17 +85,32 @@ router = APIRouter(prefix="/tattoo", tags=["tattoo"])
 # ---------------------------------------------------------------------------
 
 
-async def _resolve_master(
-    session: SessionDep, business: Business, self_master: Master | None, master_id: int | None
-) -> Master:
-    """Мастер, к которому относится операция.
+async def _close_chat_if_work_completed(
+    session: SessionDep, work: TattooWork
+) -> None:
+    """Работа закрыта ЦЕЛИКОМ (финальный сеанс или status=completed) → чат
+    клиента отвязывается от мастера: работа сделана, клиент снова общается
+    с AI-агентом. Отдельные (не финальные) сеансы чат не трогают.
+    Коммит делает вызывающий эндпоинт."""
+    if work.status != TattooWorkStatus.completed:
+        return
+    await chat_assignments.close_open_assignment_for_client(
+        session, business_id=work.business_id, client_id=work.client_id
+    )
 
-    Мастер всегда действует от себя; владелец указывает master_id явно.
+
+async def _resolve_master_or_none(
+    session: SessionDep, business: Business, self_master: Master | None, master_id: int | None
+) -> Master | None:
+    """Как _resolve_master, но без ошибок: None, если мастер не задан/не найден.
+
+    Для операций, где работа без мастера — валидное состояние (очередь
+    офферов), а не ошибка запроса.
     """
     if self_master is not None:
         return self_master
     if master_id is None:
-        raise HTTPException(status_code=422, detail="Укажите master_id")
+        return None
     result = await session.execute(
         select(Master).where(
             Master.id == master_id,
@@ -100,8 +118,20 @@ async def _resolve_master(
             Master.is_active.is_(True),
         )
     )
-    master = result.scalar_one_or_none()
-    if not master:
+    return result.scalar_one_or_none()
+
+
+async def _resolve_master(
+    session: SessionDep, business: Business, self_master: Master | None, master_id: int | None
+) -> Master:
+    """Мастер, к которому относится операция.
+
+    Мастер всегда действует от себя; владелец указывает master_id явно.
+    """
+    master = await _resolve_master_or_none(session, business, self_master, master_id)
+    if master is None:
+        if self_master is None and master_id is None:
+            raise HTTPException(status_code=422, detail="Укажите master_id")
         raise HTTPException(status_code=404, detail="Мастер не найден в этом бизнесе")
     return master
 
@@ -111,8 +141,8 @@ async def _resolve_master(
 # ---------------------------------------------------------------------------
 
 STUDIO_TZ = ZoneInfo("Asia/Almaty")
-# Длительность сеанса в БД не хранится; в календарь уходит 3 часа, её же
-# используем для проверки пересечений (у мастера может быть своя дефолтная)
+# Длительность сеанса в БД не хранится: берём дефолтную мастера, иначе 3 часа.
+# Она же — длительность события в календаре и окно проверки пересечений
 SESSION_FALLBACK_MINUTES = 180
 
 
@@ -256,8 +286,7 @@ async def _sync_session_to_calendar(
     )
 
     start_dt = tattoo_session.session_date.isoformat()
-    # Длительность по умолчанию — 3 часа
-    end_dt = (tattoo_session.session_date + timedelta(hours=3)).isoformat()
+    end_dt = (tattoo_session.session_date + _master_duration(master)).isoformat()
     calendar_id = master.google_calendar_id or "primary"
 
     if tattoo_session.google_event_id:
@@ -281,20 +310,6 @@ async def _sync_session_to_calendar(
             calendar_id=calendar_id,
         )
         return event_id
-
-
-async def _remove_session_from_calendar(
-    tattoo_session: TattooSession,
-    master: Master,
-    business: Business,
-) -> None:
-    """Удалить событие из Google Calendar."""
-    if tattoo_session.google_event_id and business.google_calendar_credentials_json:
-        await cancel_event(
-            credentials_json=business.google_calendar_credentials_json,
-            event_id=tattoo_session.google_event_id,
-            calendar_id=master.google_calendar_id or "primary",
-        )
 
 
 # ---------------------------------------------------------------------------
@@ -519,6 +534,9 @@ async def create_work(
 
     first_start = _ensure_tz(body.first_session.session_date)
     if master is not None and not force:
+        # check-then-act под advisory-блокировкой мастера: параллельные
+        # запросы (вкладки, владелец + мастер) не пройдут проверку одновременно
+        await lock_master_slot(session, master.id)
         await _assert_slot_free(
             session,
             business,
@@ -556,6 +574,7 @@ async def create_work(
 
     if tattoo_session.is_final_session:
         work.status = TattooWorkStatus.completed
+        await _close_chat_if_work_completed(session, work)
 
     created_offers: list = []
     if master is None:
@@ -622,20 +641,27 @@ async def update_work(
     for field, value in update_data.items():
         setattr(work, field, value)
 
+    await _close_chat_if_work_completed(session, work)
+
     await session.commit()
 
     # Параметры работы входят в summary/description событий календаря —
-    # перезаливаем события всех сеансов, иначе календарь разойдётся с CRM
-    master = await _resolve_master(session, business, self_master, work.master_id)
-    work = await _reload_work(session, work_id)
-    for tattoo_session in work.sessions:
-        try:
-            event_id = await _sync_session_to_calendar(tattoo_session, work, master, business)
-            if event_id and event_id != tattoo_session.google_event_id:
-                tattoo_session.google_event_id = event_id
-        except Exception:
-            logger.exception("Failed to re-sync session %d to Google Calendar", tattoo_session.id)
-    await session.commit()
+    # перезаливаем события всех сеансов, иначе календарь разойдётся с CRM.
+    # У работы без мастера (очередь офферов) календаря нет — синк пропускаем
+    # вместо 422 после уже записанных изменений
+    master = await _resolve_master_or_none(session, business, self_master, work.master_id)
+    if master is not None:
+        work = await _reload_work(session, work_id)
+        for tattoo_session in work.sessions:
+            try:
+                event_id = await _sync_session_to_calendar(tattoo_session, work, master, business)
+                if event_id and event_id != tattoo_session.google_event_id:
+                    tattoo_session.google_event_id = event_id
+            except Exception:
+                logger.exception(
+                    "Failed to re-sync session %d to Google Calendar", tattoo_session.id
+                )
+        await session.commit()
     work = await _reload_work(session, work_id)
     _attach_file_urls(work.sessions)
     return TattooWorkResponse.model_validate(work)
@@ -651,11 +677,12 @@ async def delete_work(
     business, self_master = actor
     work = await _get_work_or_404(session, work_id, business, self_master)
 
-    master = await _resolve_master(session, business, self_master, work.master_id)
+    # Работа без мастера (ещё в очереди офферов) — валидна, календаря у неё нет
+    master = await _resolve_master_or_none(session, business, self_master, work.master_id)
     session_ids = [s.id for s in work.sessions]
     for tattoo_session in work.sessions:
         try:
-            await _remove_session_from_calendar(tattoo_session, master, business)
+            await remove_session_event(tattoo_session, master, business)
         except Exception:
             logger.exception("Failed to remove session %d from Google Calendar", tattoo_session.id)
 
@@ -712,6 +739,7 @@ async def create_session(
 
     new_start = _ensure_tz(body.session_date)
     if not force:
+        await lock_master_slot(session, master.id)
         await _assert_slot_free(
             session, business, master, new_start, new_start + _master_duration(master)
         )
@@ -731,6 +759,7 @@ async def create_session(
     work.status = (
         TattooWorkStatus.completed if body.is_final_session else TattooWorkStatus.in_progress
     )
+    await _close_chat_if_work_completed(session, work)
 
     try:
         event_id = await _sync_session_to_calendar(tattoo_session, work, master, business)
@@ -767,6 +796,7 @@ async def update_session(
             raise HTTPException(status_code=422, detail="Недопустимый статус сеанса")
         update_data["status"] = TattooProjectStatus(update_data["status"])
     old_date = tattoo_session.session_date
+    old_status = tattoo_session.status
 
     if update_data.get("is_final_session") is True:
         # Этим сеансом закрывается работа — с непогашенным балансом нельзя.
@@ -780,6 +810,7 @@ async def update_session(
     if not force and "session_date" in update_data:
         new_start = _ensure_tz(update_data["session_date"])
         if new_start != _ensure_tz(old_date):
+            await lock_master_slot(session, master.id)
             await _assert_slot_free(
                 session,
                 business,
@@ -799,13 +830,24 @@ async def update_session(
             if tattoo_session.is_final_session
             else TattooWorkStatus.in_progress
         )
+        await _close_chat_if_work_completed(session, work)
 
-    try:
-        event_id = await _sync_session_to_calendar(tattoo_session, work, master, business)
-        if event_id:
-            tattoo_session.google_event_id = event_id
-    except Exception:
-        logger.exception("Failed to sync session %d to Google Calendar", tattoo_session.id)
+    cancelled_now = (
+        old_status != TattooProjectStatus.cancelled
+        and tattoo_session.status == TattooProjectStatus.cancelled
+    )
+    if cancelled_now:
+        # Отмена освобождает слот в календаре; при успехе отвязываем событие,
+        # при сбое оставляем google_event_id — событие могло остаться
+        if await remove_session_event(tattoo_session, master, business):
+            tattoo_session.google_event_id = None
+    else:
+        try:
+            event_id = await _sync_session_to_calendar(tattoo_session, work, master, business)
+            if event_id:
+                tattoo_session.google_event_id = event_id
+        except Exception:
+            logger.exception("Failed to sync session %d to Google Calendar", tattoo_session.id)
 
     await session.commit()
     # updated_at после UPDATE вычитывается отдельно: на SQLite server-onupdate
@@ -827,10 +869,11 @@ async def delete_session(
     tattoo_session, _work = await _get_session_or_404(
         session, work_id, session_id, business, self_master
     )
-    master = await _resolve_master(session, business, self_master, _work.master_id)
+    master = await _resolve_master_or_none(session, business, self_master, _work.master_id)
 
     try:
-        await _remove_session_from_calendar(tattoo_session, master, business)
+        if await remove_session_event(tattoo_session, master, business):
+            tattoo_session.google_event_id = None
     except Exception:
         logger.exception("Failed to remove session %d from Google Calendar", tattoo_session.id)
 
@@ -898,10 +941,29 @@ async def get_session_file(
     if not record:
         raise HTTPException(status_code=404, detail="Файл не найден")
     if t is None or not verify_file_token(record.id, t):
-        # Без валидного токена — обычная авторизация owner/master
+        # Без валидного токена — обычная авторизация owner/master, причём
+        # мастер видит только фото СВОИХ работ (файлы сеансов — не публичные)
         if user is None:
             raise HTTPException(status_code=401, detail="Authorization required")
-        await get_master_business(user, session)
+        business = await get_master_business(user, session)
+        tattoo_session = await session.get(TattooSession, record.session_id)
+        work = (
+            await session.get(TattooWork, tattoo_session.work_id)
+            if tattoo_session
+            else None
+        )
+        if work is None or work.business_id != business.id:
+            raise HTTPException(status_code=404, detail="Файл не найден")
+        if user.role == UserRole.master and work.master_id is not None:
+            self_master = (
+                await session.execute(
+                    select(Master).where(
+                        Master.user_id == user.id, Master.is_active.is_(True)
+                    )
+                )
+            ).scalar_one_or_none()
+            if self_master is None or work.master_id != self_master.id:
+                raise HTTPException(status_code=404, detail="Файл не найден")
 
     data = files_storage.read_file(record)
     if data is None:
@@ -949,6 +1011,31 @@ async def _get_offer_or_404(
     result = await session.execute(
         select(SessionOffer).where(
             SessionOffer.id == offer_id, SessionOffer.business_id == business.id
+        )
+    )
+    offer = result.scalar_one_or_none()
+    if offer is None:
+        raise HTTPException(status_code=404, detail="Оффер не найден")
+    if self_master is not None and offer.master_id != self_master.id:
+        raise HTTPException(status_code=404, detail="Оффер не найден")
+    return offer
+
+
+async def _get_offer_locked(
+    session: SessionDep, business: Business, offer_id: int, self_master: Master | None
+) -> SessionOffer:
+    """Оффер с блокировкой строки (SELECT … FOR UPDATE) — для accept/decline.
+
+    Страховка от гонки между параллельными запросами (вкладки, бот + миниапп):
+    строка оффера залочена до конца транзакции, повторная проверка статуса
+    после блокировки — решающая.
+    """
+    result = await session.execute(
+        for_update(
+            select(SessionOffer).where(
+                SessionOffer.id == offer_id, SessionOffer.business_id == business.id
+            ),
+            session,
         )
     )
     offer = result.scalar_one_or_none()
@@ -1068,12 +1155,21 @@ async def accept_offer(
     """
     business, self_master = actor
     offer = await _get_offer_or_404(session, business, offer_id, self_master)
+    # Advisory-блокировка по мастеру + блокировка строки оффера и работы:
+    # два параллельных accept (вкладки, бот + миниапп) не должны одновременно
+    # пройти проверку слота и создать два счёта на предоплату
+    await lock_master_slot(session, offer.master_id)
+    offer = await _get_offer_locked(session, business, offer_id, self_master)
     if offer.status != SessionOfferStatus.pending.value:
         raise HTTPException(
             status_code=409,
             detail="Оффер уже не активен: работу взяли, отклонили или истёк срок",
         )
-    work = await session.get(TattooWork, offer.work_id)
+    work = (
+        await session.execute(
+            for_update(select(TattooWork).where(TattooWork.id == offer.work_id), session)
+        )
+    ).scalar_one_or_none()
     if work is None:
         raise HTTPException(status_code=404, detail="Работа не найдена")
     if work.master_id is not None:
@@ -1099,10 +1195,12 @@ async def accept_offer(
         except Exception:
             logger.exception("Failed to sync session %d to Google Calendar", first_session.id)
 
-    # Подтверждение = деньги: фиксируем цену и сразу счёт на предоплату
+    # Сначала коммит распределения (оффер принят, работа у мастера), потом —
+    # счёт на предоплату: create_prepay_invoice коммитит сам и идемпотентен
+    # (повторный accept вернёт 409 выше, но даже гонка не создаст два счёта)
+    await session.commit()
     prepay = await payments_service.create_prepay_invoice(session, work, business, user)
 
-    await session.commit()
     client = await session.get(Client, work.client_id)
     out = _offer_out(offer, master.full_name, work, client.full_name if client else "", first_session)
     if prepay is not None:
@@ -1119,6 +1217,10 @@ async def decline_offer(offer_id: int, session: SessionDep, actor: MasterBusines
     """
     business, self_master = actor
     offer = await _get_offer_or_404(session, business, offer_id, self_master)
+    # Блокируем строку оффера: параллельные accept/decline по одному офферу
+    # не должны одновременно решить «кто следующий в очереди»
+    await lock_master_slot(session, offer.master_id)
+    offer = await _get_offer_locked(session, business, offer_id, self_master)
     if offer.status != SessionOfferStatus.pending.value:
         raise HTTPException(status_code=409, detail="Этот оффер уже не активен")
     offer.status = SessionOfferStatus.declined.value

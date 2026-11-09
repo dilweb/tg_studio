@@ -20,7 +20,7 @@ from tg_studio.modules.google_calendar.client import list_events
 
 logger = logging.getLogger(__name__)
 
-# часовой пояс студии — все календарные времена в нём (Алматы, UTC+6)
+# часовой пояс студии — все календарные времена в нём (Алматы, UTC+5 с 2024-03)
 TZ = ZoneInfo("Asia/Almaty")
 
 DEFAULT_WINDOW_DAYS = 14

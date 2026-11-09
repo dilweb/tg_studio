@@ -26,6 +26,7 @@ from .compression import (
     needs_compression,
     summarise_messages,
 )
+from .llm_retry import chat_completion_with_retry
 from .openai_agent_loop import (
     looks_like_data_question,
     run_openai_analytics_loop,
@@ -58,9 +59,9 @@ class ChatResult:
 class ChatImage:
     """Картинка от пользователя (эскиз, референс): байты + mime.
 
-    Уходит в модель как image_url с data-URI — хранить её в ai_messages
-    не нужно: достаточно текстового факта, что клиент прислал фото
-    (история после хода — только текст).
+    Сначала describe_image снимает с неё текстовый анализ; в основной ход
+    байты не идут (fallback при сбое экстракции — напрямую как image_url
+    с data-URI). В ai_messages хранится только текст: факт + анализ.
     """
 
     data: bytes
@@ -95,6 +96,9 @@ def get_openai_client() -> AsyncOpenAI:
         kwargs: dict = {"api_key": settings.llm_api_key}
         if settings.llm_base_url:
             kwargs["base_url"] = settings.llm_base_url
+        # Таймаут одного вызова: дефолт SDK 600с позволял зависшему вызову
+        # часами держать per-client lock хода агента
+        kwargs["timeout"] = settings.llm_timeout_seconds
         _openai_client = AsyncOpenAI(**kwargs)
     return _openai_client
 
@@ -103,6 +107,61 @@ def assistant_model() -> str:
     """Модель хода ассистента: мультимодальная (settings.assistant_model),
     если задана, иначе llm_model."""
     return settings.assistant_model
+
+
+PHOTO_ANALYSIS_PROMPT = """You are a senior tattoo artist looking at a photo \
+a client sent to a tattoo studio's booking assistant. Write a detailed SERVICE \
+DESCRIPTION of the image in Russian: another assistant will consult the client \
+using ONLY your text — it will never see the photo itself.
+
+Cover what a master needs to plan and price the session:
+- the exact style with tattoo terminology (блэкворк, неотрэдишнл, орнаментал, \
+дотворк, лайнворк, реализм, флэш, гравюра… — "минимализм" only when it truly \
+is just that);
+- technique: line weight, solid fill vs shading/dotwork, colour palette and \
+accents, whether the design looks fresh or aged;
+- composition and motifs: what is depicted, layout, approximate size relative \
+to the body area if it is visible;
+- suggested body placement if the photo shows one;
+- the client's caption (if any) is their own words about the request.
+
+Be factual, 4-8 sentences, plain text without any markdown formatting. If the \
+photo is not tattoo-related (a meme, a screenshot, a selfie without a sketch), \
+say in one or two sentences what it actually shows instead."""
+
+
+async def describe_image(images: list[ChatImage]) -> str | None:
+    """Отдельный мультимодальный вызов: подробное описание фото текстом.
+
+    Основной ход агента идёт без картинки — в контекст попадает только этот
+    текст (ноль image-токенов ни в ходе, ни в раундах тулов). None —
+    экстракция не удалась: фото тогда уходит модели напрямую (fallback).
+    """
+    parts: list[dict[str, Any]] = []
+    for img in images:
+        if img.description:
+            parts.append({"type": "text", "text": img.description})
+        b64 = base64.b64encode(img.data).decode("ascii")
+        parts.append(
+            {
+                "type": "image_url",
+                "image_url": {"url": f"data:{img.mime};base64,{b64}"},
+            }
+        )
+    try:
+        response = await chat_completion_with_retry(
+            get_openai_client(),
+            model=assistant_model(),
+            temperature=0,
+            messages=[
+                {"role": "system", "content": PHOTO_ANALYSIS_PROMPT},
+                {"role": "user", "content": parts},
+            ],
+        )
+    except Exception:
+        logger.exception("Photo analysis call failed")
+        return None
+    return (response.choices[0].message.content or "").strip() or None
 
 
 class ConversationNotFoundError(Exception):
@@ -258,26 +317,33 @@ async def _maybe_compress(
     if not needs_compression(len(conversation.messages)):
         return
 
-    old_count = len(conversation.messages) - KEEP_RECENT_MESSAGES
-    old_messages = conversation.messages[:old_count]
+    # Сжатие — оптимизация, не часть ответа: сбой LLM/БД не должен ронять
+    # уже полученный ответ клиента — история просто останется несжатой
+    try:
+        old_count = len(conversation.messages) - KEEP_RECENT_MESSAGES
+        old_messages = conversation.messages[:old_count]
 
-    openai_msgs = _db_messages_to_openai(old_messages, conversation.summary)
-    new_summary = await summarise_messages(client, openai_msgs, conversation.summary)
+        openai_msgs = _db_messages_to_openai(old_messages, conversation.summary)
+        new_summary = await summarise_messages(client, openai_msgs, conversation.summary)
 
-    old_ids = [m.id for m in old_messages]
-    await session.execute(
-        delete(AIMessage).where(AIMessage.id.in_(old_ids))
-    )
+        old_ids = [m.id for m in old_messages]
+        await session.execute(
+            delete(AIMessage).where(AIMessage.id.in_(old_ids))
+        )
 
-    conversation.summary = new_summary
-    await session.flush()
+        conversation.summary = new_summary
+        await session.flush()
 
-    refreshed = await session.execute(
-        select(AIMessage)
-        .where(AIMessage.conversation_id == conversation.id)
-        .order_by(AIMessage.created_at)
-    )
-    conversation.messages = list(refreshed.scalars().all())
+        refreshed = await session.execute(
+            select(AIMessage)
+            .where(AIMessage.conversation_id == conversation.id)
+            .order_by(AIMessage.created_at)
+        )
+        conversation.messages = list(refreshed.scalars().all())
+    except Exception:
+        logger.exception(
+            "Сжатие контекста не удалось — отвечаем без него (история не сжата)"
+        )
 
 
 async def _execute_pending_tools(
@@ -308,13 +374,29 @@ async def _execute_pending_tools(
             awaiting_confirmation=False,
         )
 
-    tool_calls_data = json.loads(pending_msg.tool_calls_json)
+    try:
+        tool_calls_data = json.loads(pending_msg.tool_calls_json)
+        if not isinstance(tool_calls_data, list):
+            raise ValueError("tool_calls is not a list")
+    except (ValueError, TypeError):
+        # Битый JSON в tool_calls (обрезанный ответ модели) — не роняем ход,
+        # просим задать вопрос ещё раз
+        logger.exception(
+            "Broken tool_calls JSON in message %s — asking to retry", pending_msg.id
+        )
+        await session.commit()
+        return ChatResult(
+            reply="Не удалось разобрать ответ модели — задайте вопрос ещё раз.",
+            conversation_id=conversation.id,
+            awaiting_confirmation=False,
+        )
 
     # Build message list: history BEFORE the tool_calls msg (cleaned),
     # then the tool_calls msg itself (manually, so it keeps tool_calls).
     # history_before может кончаться «фото»-user-сообщением — превращаем его
     # обратно в multipart с data-URI, чтобы модель видела картинки во всех
-    # раундах лупа (в БД лежит только текстовый факт).
+    # раундах лупа (в БД лежит только текстовый факт). Путь только fallback:
+    # при успешной экстракции фото в ход не идёт вовсе (turn_images=None).
     history_before = conversation.messages[:pending_idx]
     rebuilt_history = []
     for msg in _db_messages_to_openai(history_before, conversation.summary):
@@ -347,20 +429,32 @@ async def _execute_pending_tools(
     # Batch execute initial tool calls and collect results
     tool_results = []
     for tc in tool_calls_data:
-        args = json.loads(tc["function"]["arguments"])
-        if on_event is not None:
-            # Первый раунд вне лупа — эмитим сами, иначе первый вызов невидим
-            await on_event(
-                {
-                    "type": "tool_call",
-                    "name": tc["function"]["name"],
-                    "sql": args.get("sql_query"),
-                    "args": {k: v for k, v in args.items() if k != "sql_query"},
-                }
+        try:
+            args = json.loads(tc["function"]["arguments"])
+            if not isinstance(args, dict):
+                raise ValueError("arguments is not an object")
+        except (ValueError, TypeError, KeyError):
+            # Модель прислала битый JSON аргументов — отдаём модели ошибку
+            # вместо падения: она увидит tool_result и попробует ещё раз
+            logger.warning("Broken tool arguments in call %r", tc.get("id"))
+            args = {}
+            tool_result = json.dumps(
+                {"error": "Модель прислала некорректные аргументы инструмента"}
             )
-        tool_result = await _execute_tool_call(
-            business.id, tc["function"]["name"], args, tool_registry
-        )
+        else:
+            if on_event is not None:
+                # Первый раунд вне лупа — эмитим сами, иначе первый вызов невидим
+                await on_event(
+                    {
+                        "type": "tool_call",
+                        "name": tc["function"]["name"],
+                        "sql": args.get("sql_query"),
+                        "args": {k: v for k, v in args.items() if k != "sql_query"},
+                    }
+                )
+            tool_result = await _execute_tool_call(
+                business.id, tc["function"]["name"], args, tool_registry
+            )
 
         tool_msg = AIMessage(
             conversation_id=conversation.id,
@@ -455,8 +549,11 @@ async def chat(
     Tool calls execute immediately — no confirmation flow at the loop level (the
     booking profile enforces confirmation via its own system prompt instead).
 
-    images — фото от пользователя (эскизы, референсы). Уходят в модель ходом
-    (нужна мультимодальная модель), в истории остаётся текстовый факт.
+    images — фото от пользователя (эскизы, референсы). Сначала отдельный
+    мультимодальный вызов снимает с них текстовый анализ; основной ход идёт
+    чисто текстом (ноль image-токенов даже в раундах тулов), в историю
+    остаётся факт + анализ. Экстракция не удалась — фото уходит модели
+    напрямую, как раньше (fallback).
     """
     client = get_openai_client()
     conversation = await _load_or_create_conversation(
@@ -467,14 +564,24 @@ async def chat(
     if conversation.awaiting_confirmation:
         conversation.awaiting_confirmation = False
 
-    # В историю — только текстовый факт фото (байты в БД не складываем);
-    # сами картинки добавляются в openai_messages ниже, на текущий ход
+    # Экстракция: фото → текст. Не удалось — картинки пойдут в модель напрямую
+    turn_images = images
+    photo_analysis: str | None = None
+    if images:
+        photo_analysis = await describe_image(images)
+        if photo_analysis:
+            turn_images = None
+
+    # В историю — только текстовый факт фото + анализ (байты в БД не складываем);
+    # сами картинки попадают в openai_messages лишь при fallback, на текущий ход
     stored_text = user_message
     if images:
         photos_part = f"[Клиент прислал фото: {len(images)}]" if len(images) > 1 else (
             "[Клиент прислал фото]"
         )
         stored_text = f"{photos_part} {user_message}".strip()
+        if photo_analysis:
+            stored_text += f"\n[Анализ фото: {photo_analysis}]"
     user_msg = AIMessage(
         conversation_id=conversation.id,
         role="user",
@@ -489,10 +596,15 @@ async def chat(
     openai_messages = [
         {"role": "system", "content": system_prompt},
         *_db_messages_to_openai(conversation.messages[:-1], conversation.summary),
-        {"role": "user", "content": _user_content(user_message, images)},
+        # При экстракции — stored_text (факт + анализ), иначе агент хода
+        # анализа не увидит; fallback — как раньше: текст + картинки
+        {"role": "user", "content": _user_content(
+            stored_text if photo_analysis else user_message, turn_images
+        )},
     ]
 
-    response = await client.chat.completions.create(
+    response = await chat_completion_with_retry(
+        client,
         model=assistant_model(),
         temperature=0,
         messages=openai_messages,
@@ -511,7 +623,8 @@ async def chat(
             user_message[:200],
         )
         # Retry with stronger tool requirement but avoid full duplicate context
-        response = await client.chat.completions.create(
+        response = await chat_completion_with_retry(
+            client,
             model=assistant_model(),
             temperature=0,
             messages=[
@@ -544,7 +657,7 @@ async def chat(
             tool_registry=tool_registry,
             build_prompt=build_prompt,
             on_event=on_event,
-            images=images,
+            images=turn_images,
         )
 
     # AI answered directly without needing tools (e.g. off-topic refusal, clarification)

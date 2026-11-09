@@ -155,6 +155,27 @@ async function markRead() {
   }
 }
 
+// Снять закрепление: диалог возвращается AI-агенту (кнопка в шапке).
+// У мастера чат после этого исчезает из списка — он видит только свои.
+const releasing = ref(false)
+
+async function releaseToAgent() {
+  if (!activeClientId.value || releasing.value) return
+  const ok = window.confirm(
+    'Вернуть диалог AI-агенту? Дальше сообщения клиента отвечает ассистент.',
+  )
+  if (!ok) return
+  releasing.value = true
+  try {
+    await api.post(`/api/admin/chats/${activeClientId.value}/release`, {})
+    await loadThreads() // чат пропал из списка → активный закроется сам
+  } catch (err) {
+    error.value = err.detail ?? err.message
+  } finally {
+    releasing.value = false
+  }
+}
+
 async function openChat(id) {
   activeClientId.value = id
   messages.value = []
@@ -301,6 +322,16 @@ onUnmounted(() => {
                 @{{ activeThread.username }}
               </div>
             </div>
+            <button
+              v-if="activeThread?.assigned_master_name"
+              type="button"
+              class="btn btn-sm btn-ghost release-btn"
+              :disabled="releasing"
+              title="Снять закрепление: сообщения клиента снова отвечает AI-агент"
+              @click="releaseToAgent"
+            >
+              🤖 Агенту
+            </button>
           </div>
 
           <div ref="messagesEl" class="chat-messages">
@@ -545,6 +576,11 @@ onUnmounted(() => {
 .chat-header-username {
   font-size: 11.5px;
   color: var(--muted);
+}
+
+.release-btn {
+  margin-left: auto;
+  flex-shrink: 0;
 }
 
 .chat-messages {

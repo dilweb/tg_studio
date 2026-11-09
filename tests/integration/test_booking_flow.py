@@ -181,3 +181,141 @@ async def test_conversation_persists_between_turns(db_session, business_and_mast
         ).select_from(AIConversation))
     ).scalar_one()
     assert count == 2  # новый «клиент без беседы» получил свою, а не третью
+
+
+def _fake_openai_capture(reply: str, calls: list):
+    """FakeOpenAI, запоминающий messages каждого вызова completions."""
+    from tg_studio.modules.ai import client as ai_client
+
+    class FakeCompletions:
+        async def create(self, *, model, messages, **kwargs):
+            calls.append(messages)
+            msg = type("M", (), {"content": reply, "tool_calls": None})()
+            choice = type("Choice", (), {"message": msg, "finish_reason": "stop"})()
+            return type("Resp", (), {"choices": [choice]})()
+
+    class FakeOpenAI:
+        chat = type("C", (), {"completions": FakeCompletions()})()
+
+    return FakeOpenAI
+
+
+@pytest.mark.asyncio
+async def test_photo_analysed_to_text_no_image_in_turn(
+    db_session, business_and_master, monkeypatch
+):
+    """Фото: экстрактор снимает анализ → основной ход чисто текстом (без
+    image_url), в ai_messages остаются факт + [Анализ фото: ...]."""
+    from tg_studio.modules.ai import client as ai_client
+    from tg_studio.modules.ai.client import ChatImage
+
+    business, _master = business_and_master
+    client = await make_client(db_session, telegram_id=616)
+
+    calls: list = []
+    monkeypatch.setattr(ai_client, "get_openai_client", lambda: _fake_openai_capture("Отличный блэкворк!", calls))
+
+    images = [ChatImage(data=b"\xff\xd8fake", mime="image/jpeg", description="кот")]
+    result = await ai_client.chat(
+        db_session, business, "что скажешь?", client_id=client.id, images=images
+    )
+
+    assert result.reply == "Отличный блэкворк!"
+    # Два вызова: экстрактор (system + фото) и основной ход (system + история)
+    assert len(calls) == 2
+    extractor_msgs, turn_msgs = calls
+    # Экстрактор: фото ушло только ему
+    assert any(
+        isinstance(p, dict) and p.get("type") == "image_url"
+        for p in extractor_msgs[-1]["content"]
+    )
+    # Основной ход: картинок нет, анализ пришёл текстом
+    turn_user = turn_msgs[-1]
+    assert isinstance(turn_user["content"], str)
+    assert "[Анализ фото:" in turn_user["content"]
+    assert "image_url" not in str(turn_user["content"])
+
+    # В БД — факт + анализ, без байтов
+    from tg_studio.db.models import AIMessage
+    from sqlalchemy import select
+    rows = (
+        await db_session.execute(select(AIMessage))
+    ).scalars().all()
+    user_rows = [r for r in rows if r.role == "user"]
+    assert any("[Клиент прислал фото]" in (r.content or "") for r in user_rows)
+    assert any("[Анализ фото:" in (r.content or "") for r in user_rows)
+    assert all("fake" not in (r.content or "") for r in user_rows)
+
+
+@pytest.mark.asyncio
+async def test_photo_extraction_failure_falls_back_to_image(
+    db_session, business_and_master, monkeypatch
+):
+    """Экстракция не удалась — фото уходит модели напрямую (fallback)."""
+    from tg_studio.modules.ai import client as ai_client
+    from tg_studio.modules.ai.client import ChatImage
+
+    business, _master = business_and_master
+    client = await make_client(db_session, telegram_id=617)
+
+    async def failing_describe(images):
+        return None
+
+    monkeypatch.setattr(ai_client, "describe_image", failing_describe)
+
+    calls: list = []
+    monkeypatch.setattr(ai_client, "get_openai_client", lambda: _fake_openai_capture("Вижу эскиз", calls))
+
+    images = [ChatImage(data=b"\xff\xd8fake", mime="image/jpeg")]
+    await ai_client.chat(
+        db_session, business, "смотри", client_id=client.id, images=images
+    )
+
+    assert len(calls) == 1  # экстрактор не вызывался успешно — только основной ход
+    turn_user = calls[0][-1]
+    assert isinstance(turn_user["content"], list)
+    assert any(p.get("type") == "image_url" for p in turn_user["content"])
+
+
+@pytest.mark.asyncio
+async def test_fake_handover_claim_stripped(db_session, business_and_master, monkeypatch):
+    """Эскалации не было — выдуманная «передача мастеру» вырезается из ответа.
+
+    Единственный реальный механизм эскалации — вызов escalate_to_master
+    (флаг EscalationState); свободный текст модели при не-эскалации проходит
+    через _strip_fake_handover_claims.
+    """
+    business, _master = business_and_master
+    client = await make_client(db_session, telegram_id=620)
+
+    async def fake_chat(session, business, user_message, **kwargs):
+        return ChatResult(
+            reply="По заживлению: первые 2–3 недели без борьбы. "
+                  "Точные рекомендации даст Дилявер, он уже получил вашу заявку и ответит лично.",
+            conversation_id=1, awaiting_confirmation=False,
+        )
+
+    monkeypatch.setattr(booking, "chat", fake_chat)
+
+    reply = await booking.run_booking_turn(db_session, business, client, "а если я хожу на борьбу?")
+    assert "получил вашу заявку" not in reply
+    assert "ответит лично" not in reply
+    assert "2–3 недели без борьбы" in reply  # полезный ответ остался
+    assert await assignments_mod.get_open_assignment(db_session, client.id) is None
+
+
+@pytest.mark.asyncio
+async def test_legit_master_mention_kept(db_session, business_and_master, monkeypatch):
+    """Законная формулировка «мастер оценит лично» — не выдуманная передача, остаётся."""
+    business, _master = business_and_master
+    client = await make_client(db_session, telegram_id=621)
+
+    text = "По заживлению: 2–3 недели без спорта. Мастер сможет оценить это лично на консультации."
+
+    async def fake_chat(session, business, user_message, **kwargs):
+        return ChatResult(reply=text, conversation_id=1, awaiting_confirmation=False)
+
+    monkeypatch.setattr(booking, "chat", fake_chat)
+
+    reply = await booking.run_booking_turn(db_session, business, client, "а если я хожу на борьбу?")
+    assert reply == text

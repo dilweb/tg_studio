@@ -21,6 +21,8 @@ from tg_studio.modules.business.schemas import (
     MasterResponse,
     MasterUpdate,
     PricingConfigUpdate,
+    PublicMasterResponse,
+    public_master_out,
 )
 from tg_studio.modules.google_calendar.client import (
     create_calendar,
@@ -148,6 +150,8 @@ def _master_to_response(m: Master) -> MasterResponse:
         google_calendar_id=m.google_calendar_id,
         default_duration_minutes=m.default_duration_minutes,
         specializations=m.specializations or [],
+        is_resident=bool(m.is_resident),
+        phone=m.phone,
         # прямая ссылка: открой — календарь добавится в твой Google Calendar,
         # письмо-приглашение для этого не нужно
         calendar_add_url=(
@@ -241,6 +245,10 @@ async def update_master(master_id: int, body: MasterUpdate, session: SessionDep,
         master.default_duration_minutes = body.default_duration_minutes
     if body.specializations is not None:
         master.specializations = body.specializations
+    if body.is_resident is not None:
+        master.is_resident = body.is_resident
+    if body.phone is not None:
+        master.phone = body.phone.strip() or None
     await session.commit()
     await session.refresh(master, attribute_names=["portfolio_files"])
     return _master_to_response(master)
@@ -383,10 +391,15 @@ async def _public_master_list(session: AsyncSession) -> list[Master]:
     return list(result.scalars().all())
 
 
-@_public_masters.get("", response_model=list[MasterResponse])
+@_public_masters.get("", response_model=list[PublicMasterResponse])
 async def public_masters(session: SessionDep):
-    """Активные мастера с портфолио — без авторизации (маркетинговый материал)."""
-    return [_master_to_response(m) for m in await _public_master_list(session)]
+    """Активные мастера с портфолио — без авторизации (маркетинговый материал).
+
+    Только публичные поля (имя/описание/специализации/фото): без telegram_id,
+    google_calendar_id и calendar_add_url — иначе любой подписывается на
+    календари мастеров и пишет им в обход студии.
+    """
+    return [public_master_out(m) for m in await _public_master_list(session)]
 
 
 @_public_masters.get("/{master_id}/avatar")

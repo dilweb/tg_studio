@@ -24,11 +24,14 @@ from tg_studio.api.admin_deps import MasterBusinessAndSelfDep
 from tg_studio.api.auth import CurrentUserDep
 from tg_studio.api.deps import SessionDep
 from tg_studio.config import settings
+from tg_studio.db.locks import for_update
 from tg_studio.db.models import (
     Client,
     Master,
     Payment,
     PaymentKind,
+    User,
+    UserRole,
     PaymentProvider,
     PaymentStatus,
     TattooSession,
@@ -91,6 +94,28 @@ async def _get_payment(session, business, payment_id: int) -> Payment:
     return payment
 
 
+async def _get_payment_for_actor(
+    session, business, payment_id: int, actor_user: User, self_master: Master | None
+) -> Payment:
+    """Платёж актора: мастер действует только по счетам СВОИХ работ
+    (иначе мог бы отметить чужую оплату или отменить чужой счёт).
+    Владелец и администратор студии (05) — все счета бизнеса."""
+    payment = await _get_payment(session, business, payment_id)
+    if actor_user.role == UserRole.master and self_master is not None:
+        if payment.work_id is not None:
+            work = await session.get(TattooWork, payment.work_id)
+            if work is None or work.master_id != self_master.id:
+                raise HTTPException(status_code=404, detail="Платёж не найден")
+        elif payment.booking_id is not None:
+            # Счёт за бронь места (04): мастер — только по СВОИМ броням
+            from tg_studio.db.models import Booking
+
+            booking = await session.get(Booking, payment.booking_id)
+            if booking is None or booking.master_id != self_master.id:
+                raise HTTPException(status_code=404, detail="Платёж не найден")
+    return payment
+
+
 async def _reread_payment(session, business, payment_id: int) -> PaymentOut:
     """Свежая строка с именами (SQLite не возвращает server_default)."""
     stmt = (
@@ -138,12 +163,12 @@ async def list_payments(
     status: str | None = Query(None),
     limit: int = Query(50, ge=1, le=200),
 ):
-    """Платежи бизнеса. Мастер — только по своим работам, владелец — все."""
+    """Платежи бизнеса. Мастер — только по своим работам, владелец/админ — все (05)."""
     business, self_master = actor
     stmt = (
         select(Payment, Master.full_name, Client.full_name)
-        .join(TattooWork, Payment.work_id == TattooWork.id)
-        .join(Client, TattooWork.client_id == Client.id)
+        .outerjoin(TattooWork, Payment.work_id == TattooWork.id)
+        .outerjoin(Client, TattooWork.client_id == Client.id)
         .outerjoin(Master, Payment.master_id == Master.id)
         .where(Payment.business_id == business.id)
         .order_by(Payment.id.desc())
@@ -248,11 +273,17 @@ async def apipay_webhook(request: Request, session: SessionDep):
     if not external_id or not provider_status:
         raise HTTPException(status_code=400, detail="Нет invoice.id или status")
 
+    # FOR UPDATE: вебхук и celery-sweep (expire_unpaid_prepay) не должны
+    # одновременно решать судьбу одного счёта — кто первый залочил, тот и
+    # видит актуальный статус; второй после блокировки перепроверяет
     payment = (
         await session.execute(
-            select(Payment).where(
-                Payment.external_invoice_id == external_id,
-                Payment.provider == PaymentProvider.apipay.value,
+            for_update(
+                select(Payment).where(
+                    Payment.external_invoice_id == external_id,
+                    Payment.provider == PaymentProvider.apipay.value,
+                ),
+                session,
             )
         )
     ).scalar_one_or_none()
@@ -260,21 +291,38 @@ async def apipay_webhook(request: Request, session: SessionDep):
         logger.warning("Apipay webhook for unknown invoice %s", external_id)
         return {"ok": True, "unknown": external_id}
 
+    # Сверка суммы: если вебхук сообщает amount и он не совпадает с нашей
+    # записью — это либо чужой счёт с перехваченным id, либо баг интеграции.
+    # Статус «paid» при расхождении НЕ применяем: деньги считаем по нашей сумме.
+    invoice_amount = invoice.get("amount")
+    amount_mismatch = False
+    if invoice_amount is not None:
+        try:
+            amount_mismatch = Decimal(str(invoice_amount)) != payment.amount
+        except Exception:
+            amount_mismatch = True
+    if amount_mismatch:
+        logger.warning(
+            "Apipay amount mismatch for payment %s (invoice %s): webhook %s vs db %s — "
+            "status not applied, manual review required",
+            payment.id,
+            external_id,
+            invoice_amount,
+            payment.amount,
+        )
+        return {"ok": True, "ignored": "amount_mismatch", "payment_id": payment.id}
+
     paid_at = _parse_iso(invoice.get("paid_at"))
     if paid_at is None and provider_status == "paid":
         paid_at = datetime.now(UTC)
     changed = apply_provider_status(payment, provider_status, paid_at)
+    if changed and payment.status == PaymentStatus.paid.value and payment.booking_id is not None:
+        # Коворкинг (04): счёт за бронь места оплачен → проводка topup +
+        # бронь подтверждена (дедуп: повторный вебхук — no-op в apply_payment_paid)
+        from tg_studio.modules.coworking import money
+
+        await money.apply_payment_paid(session, payment, paid_at=paid_at)
     if changed:
-        invoice_amount = invoice.get("amount")
-        if invoice_amount is not None:
-            try:
-                if Decimal(str(invoice_amount)) != payment.amount:
-                    logger.warning(
-                        "Apipay amount mismatch for payment %s: invoice %s vs %s",
-                        payment.id, invoice_amount, payment.amount,
-                    )
-            except Exception:
-                pass
         await session.commit()
     return {"ok": True, "changed": changed}
 
@@ -387,21 +435,28 @@ async def mark_paid(
     actor: MasterBusinessAndSelfDep,
     user: CurrentUserDep,
 ):
-    """Подтвердить ручную оплату: клиент отдал деньги / перевёл на карту.
+    """Подтвердить ручную оплату: клиент отдал деньги / перевёл на карту
+    (владелец, мастер — по своим работам, администратор студии — 05).
 
     Для apipay-платежей недоступно — их оплачивает вебхук платёжной системы.
     """
-    business, _self_master = actor
-    payment = await _get_payment(session, business, payment_id)
+    business, self_master = actor
+    payment = await _get_payment_for_actor(session, business, payment_id, user, self_master)
     if payment.status != PaymentStatus.pending.value:
         raise HTTPException(status_code=409, detail="Счёт уже не ожидает оплаты")
     if payment.provider != PaymentProvider.manual.value:
         raise HTTPException(
             status_code=409, detail="Оплату этого счёта подтверждает платёжная система"
         )
-    payment.status = PaymentStatus.paid.value
-    payment.paid_at = datetime.now(UTC)
-    payment.confirmed_by_user_id = user.id
+    # Коворкинг (04): ручная отметка счёта за бронь → проводка + подтверждение брони
+    if payment.booking_id is not None:
+        from tg_studio.modules.coworking import money
+
+        await money.apply_payment_paid(session, payment, actor_user_id=user.id)
+    else:
+        payment.status = PaymentStatus.paid.value
+        payment.paid_at = datetime.now(UTC)
+        payment.confirmed_by_user_id = user.id
     await session.commit()
     return await _reread_payment(session, business, payment.id)
 
@@ -412,10 +467,11 @@ async def cancel_payment(
     body: PaymentCancelRequest,
     session: SessionDep,
     actor: MasterBusinessAndSelfDep,
+    user: CurrentUserDep,
 ):
     """Отменить счёт (pending). Причина — в note."""
-    business, _self_master = actor
-    payment = await _get_payment(session, business, payment_id)
+    business, self_master = actor
+    payment = await _get_payment_for_actor(session, business, payment_id, user, self_master)
     if payment.status != PaymentStatus.pending.value:
         raise HTTPException(status_code=409, detail="Счёт уже не ожидает оплаты")
     if payment.provider == PaymentProvider.apipay.value:
@@ -436,6 +492,7 @@ async def sync_payment(
     payment_id: int,
     session: SessionDep,
     actor: MasterBusinessAndSelfDep,
+    user: CurrentUserDep,
 ):
     """Опросить ApiPay и подтянуть актуальный статус счёта.
 
@@ -443,8 +500,8 @@ async def sync_payment(
     «paid» липкий: повторный опрос уже оплаченного счёта ничего не испортит;
     из cancelled/expired в paid — разрешено (ApiPay так умеет).
     """
-    business, _self_master = actor
-    payment = await _get_payment(session, business, payment_id)
+    business, self_master = actor
+    payment = await _get_payment_for_actor(session, business, payment_id, user, self_master)
     if payment.provider != PaymentProvider.apipay.value:
         raise HTTPException(status_code=409, detail="Опрос статуса — только для счетов Kaspi")
     if not payment.external_invoice_id:
@@ -460,5 +517,10 @@ async def sync_payment(
         payment.payment_url = link
     if invoice.get("status") == "error" and invoice.get("error_message"):
         payment.note = f"ApiPay: {invoice['error_message']}"
+    # Коворкинг (04): опрос подтянул «paid» по счёту за бронь → проводка + бронь
+    if payment.status == PaymentStatus.paid.value and payment.booking_id is not None:
+        from tg_studio.modules.coworking import money
+
+        await money.apply_payment_paid(session, payment)
     await session.commit()
     return await _reread_payment(session, business, payment.id)

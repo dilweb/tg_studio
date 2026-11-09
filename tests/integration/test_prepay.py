@@ -17,9 +17,15 @@ from tg_studio.modules.payments import providers
 from tg_studio.modules.payments import service as payments_service
 from tg_studio.modules.tattoo import offers as offers_module
 
-from ..conftest import make_business, make_client, make_master, make_user
+from ..conftest import (
+    make_business,
+    make_client,
+    make_init_data_headers,
+    make_master,
+    make_user,
+)
 
-OWNER_HEADERS = {"X-Debug-User-Id": "99999"}
+OWNER_HEADERS = make_init_data_headers(99999)
 STYLE = "Лайнворк (Linework)"
 
 
@@ -142,7 +148,7 @@ async def test_accept_creates_manual_prepay(
     work = await create_work(api_client, client_row, price=100000)
     offer = await pending_offer(api_client, work["id"])
 
-    data = await accept(api_client, offer["id"], headers={"X-Debug-User-Id": "70001"})
+    data = await accept(api_client, offer["id"], headers=make_init_data_headers(70001))
     resp = await api_client.get(f"/api/tattoo/works/{work['id']}", headers=OWNER_HEADERS)
     assert resp.json()["master_id"] == master_a.id
 
@@ -174,6 +180,7 @@ async def test_accept_creates_apipay_prepay(
     """ApPay настроен и есть телефон → счёт Kaspi с external_invoice_id."""
     await make_master_with(monkeypatch, db_session, business, 70001, "Мастер А")
     monkeypatch.setattr(settings, "apipay_api_key", "test-key")
+    monkeypatch.setattr(settings, "apipay_webhook_secret", "whsec-test")
     monkeypatch.setattr(providers, "_APIPAY", mock_apipay())
     work = await create_work(api_client, client_row, price=100000)
     offer = await pending_offer(api_client, work["id"])
@@ -195,6 +202,7 @@ async def test_apipay_failure_falls_back_to_manual(
     """Сбой Kaspi не срывает подтверждение работы: тихо падаем в manual."""
     await make_master_with(monkeypatch, db_session, business, 70001, "Мастер А")
     monkeypatch.setattr(settings, "apipay_api_key", "test-key")
+    monkeypatch.setattr(settings, "apipay_webhook_secret", "whsec-test")
     monkeypatch.setattr(providers, "_APIPAY", mock_apipay(fail=True))
     work = await create_work(api_client, client_row, price=100000)
     offer = await pending_offer(api_client, work["id"])
@@ -226,6 +234,7 @@ async def test_expire_unpaid_prepay_cancels_booking(
     """Счёт не оплачен за 24ч: expired, работа и сеансы cancelled, обе стороны уведомлены."""
     await make_master_with(monkeypatch, db_session, business, 70001, "Мастер А")
     monkeypatch.setattr(settings, "apipay_api_key", "test-key")
+    monkeypatch.setattr(settings, "apipay_webhook_secret", "whsec-test")
     monkeypatch.setattr(providers, "_APIPAY", mock_apipay())
     work = await create_work(api_client, client_row, price=100000)
     offer = await pending_offer(api_client, work["id"])
@@ -268,7 +277,7 @@ async def test_paid_and_manual_prepay_survive_expiry(
     # manual-предоплата с прошедшим дедлайном — не трогается
     work = await create_work(api_client, client_row, price=100000)
     offer = await pending_offer(api_client, work["id"])
-    await accept(api_client, offer["id"], headers={"X-Debug-User-Id": "70001"})
+    await accept(api_client, offer["id"], headers=make_init_data_headers(70001))
 
     from tg_studio.db.models import Payment
 
@@ -289,3 +298,107 @@ async def test_paid_and_manual_prepay_survive_expiry(
     assert await payments_service.expire_unpaid_prepay(db_session) == 0
     resp = await api_client.get(f"/api/tattoo/works/{work['id']}", headers=OWNER_HEADERS)
     assert resp.json()["status"] == "in_progress"
+
+
+@pytest.mark.asyncio
+async def test_double_accept_is_409_and_single_payment(
+    api_client, monkeypatch, db_session, business, client_row, no_telegram
+):
+    """Повторный accept того же оффера — 409; счёт на предоплату ровно один."""
+    from sqlalchemy import select
+
+    from tg_studio.db.models import Payment
+
+    await make_master_with(monkeypatch, db_session, business, 70001, "Мастер А")
+    work = await create_work(api_client, client_row, price=100000)
+    offer = await pending_offer(api_client, work["id"])
+
+    await accept(api_client, offer["id"], headers=make_init_data_headers(70001))
+
+    # повторный accept — оффер уже не pending
+    resp = await api_client.post(
+        f"/api/tattoo/offers/{offer['id']}/accept?1=1",
+        headers=make_init_data_headers(70001),
+    )
+    assert resp.status_code == 409, resp.text
+
+    rows = (
+        await db_session.execute(select(Payment).where(Payment.work_id == work["id"]))
+    ).scalars().all()
+    assert len(rows) == 1
+
+
+@pytest.mark.asyncio
+async def test_create_prepay_invoice_is_idempotent(
+    api_client, monkeypatch, db_session, business, client_row, no_telegram
+):
+    """Повторный create_prepay_invoice возвращает существующий pending-счёт."""
+    from sqlalchemy import select
+
+    from tg_studio.db.models import Payment, TattooWork, User
+
+    await make_master_with(monkeypatch, db_session, business, 70001, "Мастер А")
+    work_data = await create_work(api_client, client_row, price=100000)
+    offer = await pending_offer(api_client, work_data["id"])
+    await accept(api_client, offer["id"])
+
+    work = await db_session.get(TattooWork, work_data["id"])
+    user = (
+        await db_session.execute(select(User).where(User.telegram_id == 99999))
+    ).scalar_one()
+
+    first = await payments_service.create_prepay_invoice(db_session, work, business, user)
+    second = await payments_service.create_prepay_invoice(db_session, work, business, user)
+    assert first is not None
+    assert second.id == first.id
+
+    rows = (
+        await db_session.execute(select(Payment).where(Payment.work_id == work.id))
+    ).scalars().all()
+    assert len(rows) == 1
+
+
+@pytest.mark.asyncio
+async def test_expire_unpaid_prepay_removes_calendar_events(
+    api_client, monkeypatch, db_session, business, client_row, no_telegram
+):
+    """Истечение предоплаты: событие сеанса удалено из Google Calendar."""
+    from sqlalchemy import select
+
+    from tg_studio.db.models import Payment, TattooProjectStatus, TattooSession
+
+    await make_master_with(monkeypatch, db_session, business, 70001, "Мастер А")
+    monkeypatch.setattr(settings, "apipay_api_key", "test-key")
+    monkeypatch.setattr(settings, "apipay_webhook_secret", "whsec-test")
+    monkeypatch.setattr(providers, "_APIPAY", mock_apipay())
+    work = await create_work(api_client, client_row, price=100000)
+    offer = await pending_offer(api_client, work["id"])
+    await accept(api_client, offer["id"])
+
+    # У сеанса — событие в календаре; дедлайн счёта наступил
+    business.google_calendar_credentials_json = "{}"
+    ts = (
+        await db_session.execute(
+            select(TattooSession).where(TattooSession.work_id == work["id"])
+        )
+    ).scalars().one()
+    ts.google_event_id = "ev-prepay"
+    pay_row = (
+        await db_session.execute(select(Payment).where(Payment.work_id == work["id"]))
+    ).scalars().one()
+    pay_row.expires_at = datetime.now(UTC) - timedelta(minutes=1)
+    await db_session.commit()
+
+    cancelled = []
+
+    async def fake_cancel_event(credentials_json, event_id, calendar_id="primary"):
+        cancelled.append(event_id)
+        return True
+
+    monkeypatch.setattr("tg_studio.modules.tattoo.calendar.cancel_event", fake_cancel_event)
+
+    assert await payments_service.expire_unpaid_prepay(db_session) == 1
+    assert cancelled == ["ev-prepay"]
+    await db_session.refresh(ts)
+    assert ts.google_event_id is None
+    assert ts.status == TattooProjectStatus.cancelled

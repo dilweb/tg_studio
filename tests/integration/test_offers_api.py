@@ -18,9 +18,15 @@ from tg_studio.db.models import (
 )
 from tg_studio.modules.tattoo import offers
 
-from ..conftest import make_business, make_client, make_master, make_user
+from ..conftest import (
+    make_business,
+    make_client,
+    make_init_data_headers,
+    make_master,
+    make_user,
+)
 
-OWNER_HEADERS = {"X-Debug-User-Id": "99999"}
+OWNER_HEADERS = make_init_data_headers(99999)
 STYLE = "Лайнворк (Linework)"
 OTHER_STYLE = "Реализм (Realism)"
 
@@ -157,14 +163,14 @@ async def test_decline_advances_queue_then_escalates(
     queue = work_offers(await list_offers(api_client), work["id"])
 
     resp = await api_client.post(
-        f"/api/tattoo/offers/{queue[0]['id']}/decline", headers={"X-Debug-User-Id": "70001"}
+        f"/api/tattoo/offers/{queue[0]['id']}/decline", headers=make_init_data_headers(70001)
     )
     assert resp.status_code == 200, resp.text
     after = work_offers(await list_offers(api_client), work["id"])
     assert [o["status"] for o in after] == ["declined", "pending"]
 
     resp = await api_client.post(
-        f"/api/tattoo/offers/{after[1]['id']}/decline", headers={"X-Debug-User-Id": "70002"}
+        f"/api/tattoo/offers/{after[1]['id']}/decline", headers=make_init_data_headers(70002)
     )
     assert resp.status_code == 200, resp.text
     _, escalated = no_telegram
@@ -185,12 +191,12 @@ async def test_accept_assigns_master_and_closes_queue(
 
     # Б не может принять оффер, предложенный А
     resp = await api_client.post(
-        f"/api/tattoo/offers/{queue[0]['id']}/accept", headers={"X-Debug-User-Id": "70002"}
+        f"/api/tattoo/offers/{queue[0]['id']}/accept", headers=make_init_data_headers(70002)
     )
     assert resp.status_code == 404
 
     resp = await api_client.post(
-        f"/api/tattoo/offers/{queue[0]['id']}/accept", headers={"X-Debug-User-Id": "70001"}
+        f"/api/tattoo/offers/{queue[0]['id']}/accept", headers=make_init_data_headers(70001)
     )
     assert resp.status_code == 200, resp.text
     assert resp.json()["status"] == "accepted"
@@ -227,7 +233,7 @@ async def test_accept_slot_conflict(
     offer = work_offers(await list_offers(api_client), offered["id"])[0]
 
     resp = await api_client.post(
-        f"/api/tattoo/offers/{offer['id']}/accept", headers={"X-Debug-User-Id": "70001"}
+        f"/api/tattoo/offers/{offer['id']}/accept", headers=make_init_data_headers(70001)
     )
     assert resp.status_code == 409
     assert "занято" in resp.json()["detail"]
@@ -250,7 +256,7 @@ async def test_accept_twice_rejected(
     await make_master_with(monkeypatch, db_session, business, 70001, "Мастер А")
     work = await create_work(api_client, client_row)
     offer = work_offers(await list_offers(api_client), work["id"])[0]
-    headers = {"X-Debug-User-Id": "70001"}
+    headers = make_init_data_headers(70001)
     resp = await api_client.post(f"/api/tattoo/offers/{offer['id']}/accept", headers=headers)
     assert resp.status_code == 200
     resp = await api_client.post(f"/api/tattoo/offers/{offer['id']}/accept", headers=headers)

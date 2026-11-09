@@ -6,7 +6,7 @@
 """
 
 import logging
-from datetime import datetime
+from datetime import UTC, datetime
 
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from sqlalchemy import select
@@ -56,7 +56,7 @@ async def create_assignment(
     )
     for row in now_open.scalars().all():
         row.status = ChatAssignmentStatus.closed
-        row.closed_at = datetime.now()
+        row.closed_at = datetime.now(UTC)
 
     assignment = ChatAssignment(
         business_id=business_id,
@@ -70,10 +70,52 @@ async def create_assignment(
     return assignment
 
 
+async def get_assignment_for_master(
+    session: AsyncSession, *, master_id: int, client_id: int
+) -> ChatAssignment | None:
+    """Любое закрепление клиента за мастером (открытое или уже отвязанное).
+
+    Мастер видит чаты, которые когда-либо эскалировались ему: отвязанный
+    диалог (кнопкой «Агенту» или закрытием работы) не исчезает из списка —
+    пропадает только бейдж закрепления.
+    """
+    result = await session.execute(
+        select(ChatAssignment)
+        .where(
+            ChatAssignment.master_id == master_id,
+            ChatAssignment.client_id == client_id,
+        )
+        .limit(1)
+    )
+    return result.scalar_one_or_none()
+
+
 async def close_assignment(session: AsyncSession, assignment: ChatAssignment) -> None:
     assignment.status = ChatAssignmentStatus.closed
-    assignment.closed_at = datetime.now()
+    assignment.closed_at = datetime.now(UTC)
     await session.commit()
+
+
+async def close_open_assignment_for_client(
+    session: AsyncSession, *, business_id: int, client_id: int
+) -> bool:
+    """Отвязать чат клиента от мастера (если закрепление открыто).
+
+    Вызывается, когда мастер закрывает ЦЕЛУЮ работу (последний сеанс
+    помечен финальным → работа completed): работа сделана — чат
+    возвращается AI-агенту. Коммит делает вызывающий код.
+    """
+    assignment = await get_open_assignment(session, client_id)
+    if assignment is None:
+        return False
+    assignment.status = ChatAssignmentStatus.closed
+    assignment.closed_at = datetime.now(UTC)
+    logger.info(
+        "Chat of client %s unpinned from master (work completed, business %s)",
+        client_id,
+        business_id,
+    )
+    return True
 
 
 async def _master_telegram_id(session: AsyncSession, master: Master) -> int | None:

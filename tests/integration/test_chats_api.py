@@ -6,12 +6,17 @@ Telegram-функции подменяются на уровне модуля se
 
 import pytest
 
-from tg_studio.db.models import ChatDirection, ChatMessage, Master
+from tg_studio.db.models import (
+    ChatAssignmentStatus,
+    ChatDirection,
+    ChatMessage,
+    Master,
+)
 from tg_studio.modules.chat import service
 
-from ..conftest import make_business, make_client, make_master
+from ..conftest import make_business, make_client, make_init_data_headers, make_master
 
-OWNER_HEADERS = {"X-Debug-User-Id": "99999"}
+OWNER_HEADERS = make_init_data_headers(99999)
 
 
 async def seed_message(session, client, *, direction, content=None, file_id=None, file_kind=None):
@@ -110,6 +115,51 @@ async def test_post_text_message(api_client, db_session, business, monkeypatch):
 
     row = await db_session.get(ChatMessage, body["id"])
     assert row.telegram_message_id == 777
+
+
+@pytest.mark.asyncio
+async def test_role_prefix_in_telegram_only(api_client, db_session, business, monkeypatch):
+    """В Telegram ответ уходит с меткой роли, в chat_messages — чистым текстом."""
+    from ..conftest import make_master
+    from tg_studio.modules.chat import assignments as assignments_mod
+
+    sent: list[str] = []
+
+    async def fake_send(telegram_id, text):
+        sent.append(text)
+        # Реальный Telegram не переиспользует message_id в одном чате, а у нас
+        # unique-индекс (client_id, telegram_message_id) — фейк возвращает разные id.
+        return 778 + len(sent)
+
+    monkeypatch.setattr(service, "send_text_to_telegram", fake_send)
+
+    master = await make_master(db_session, business.id, full_name="Дилявер Мастер", telegram_id=7790)
+    client = await make_client(db_session, telegram_id=115)
+    await assignments_mod.create_assignment(
+        db_session, business_id=business.id, client_id=client.id,
+        master_id=master.id, order_summary=None,
+    )
+
+    # Владелец → «Студия», мастер → «Мастер <имя>»
+    await api_client.post(
+        f"/api/admin/chats/{client.id}/messages",
+        json={"content": "привет"},
+        headers=OWNER_HEADERS,
+    )
+    master_headers = make_init_data_headers(7790)
+    await api_client.post(
+        f"/api/admin/chats/{client.id}/messages",
+        json={"content": "из мастерской"},
+        headers=master_headers,
+    )
+    assert sent == ["🏪 Студия: привет", "🎨 Мастер Дилявер: из мастерской"]
+
+    # В БД — без префиксов (миниапп показывает роль сам)
+    rows = (
+        (await db_session.execute(__import__("sqlalchemy").select(ChatMessage)))
+        .scalars().all()
+    )
+    assert sorted(m.content for m in rows) == ["из мастерской", "привет"]
 
 
 @pytest.mark.asyncio
@@ -304,9 +354,6 @@ async def test_file_proxy(api_client, db_session, business, monkeypatch):
 async def test_file_proxy_signed_token(api_client, db_session, monkeypatch):
     """Прямая ссылка ?t= отдаёт файл без заголовков: так документ скачивает
     обычный браузер (на ноуте) и системный браузер с телефона."""
-    from tg_studio.config import settings
-
-    monkeypatch.setattr(settings, "debug", False)  # как в проде: без кредов только токен
 
     client = await make_client(db_session, telegram_id=120)
     msg = await seed_message(
@@ -388,7 +435,7 @@ async def test_master_sees_only_assigned_chats(api_client, db_session, business)
         master_id=master.id, order_summary="минимализм",
     )
 
-    headers = {"X-Debug-User-Id": "7777"}
+    headers = make_init_data_headers(7777)
     resp = await api_client.get("/api/admin/chats", headers=headers)
     assert resp.status_code == 200
     threads = resp.json()
@@ -399,25 +446,6 @@ async def test_master_sees_only_assigned_chats(api_client, db_session, business)
         await api_client.get("/api/admin/chats", headers=OWNER_HEADERS)
     ).json()
     assert {t["client_id"] for t in owner_threads} == {mine.id, other.id}
-
-
-async def test_master_closed_assignment_hides_chat(api_client, db_session, business):
-    from tg_studio.modules.chat import assignments as assignments_mod
-
-    master = await make_master(db_session, business.id, telegram_id=7778)
-    client = await make_client(db_session, telegram_id=103)
-    await seed_message(db_session, client, direction=ChatDirection.from_client, content="?")
-    assignment = await assignments_mod.create_assignment(
-        db_session, business_id=business.id, client_id=client.id,
-        master_id=master.id, order_summary=None,
-    )
-    await assignments_mod.close_assignment(db_session, assignment)
-
-    headers = {"X-Debug-User-Id": "7778"}
-    assert (await api_client.get("/api/admin/chats", headers=headers)).json() == []
-    # И в сам чат мастер больше не попадает
-    resp = await api_client.get(f"/api/admin/chats/{client.id}/messages", headers=headers)
-    assert resp.status_code == 404
 
 
 async def test_master_cannot_read_unassigned_chat(api_client, db_session, business):
@@ -432,10 +460,173 @@ async def test_master_cannot_read_unassigned_chat(api_client, db_session, busine
         master_id=other_master.id, order_summary=None,
     )
 
-    headers = {"X-Debug-User-Id": "7779"}
+    headers = make_init_data_headers(7779)
     resp = await api_client.get(f"/api/admin/chats/{client.id}/messages", headers=headers)
     assert resp.status_code == 404
     resp = await api_client.post(
         f"/api/admin/chats/{client.id}/messages", headers=headers, json={"content": "привет"}
     )
     assert resp.status_code == 404
+
+
+async def test_master_release_returns_chat_to_agent(api_client, db_session, business):
+    from tg_studio.modules.chat import assignments as assignments_mod
+
+    master = await make_master(db_session, business.id, telegram_id=7781)
+    client = await make_client(db_session, telegram_id=105)
+    await seed_message(db_session, client, direction=ChatDirection.from_client, content="?")
+    await assignments_mod.create_assignment(
+        db_session, business_id=business.id, client_id=client.id,
+        master_id=master.id, order_summary=None,
+    )
+
+    headers = make_init_data_headers(7781)
+    resp = await api_client.post(f"/api/admin/chats/{client.id}/release", headers=headers)
+    assert resp.status_code == 200
+    assert resp.json() == {"released": True}
+
+    # Отвязанный чат мастер продолжает видеть — но уже без бейджа закрепления
+    threads = (await api_client.get("/api/admin/chats", headers=headers)).json()
+    [thread] = threads
+    assert thread["client_id"] == client.id
+    assert thread["assigned_master_name"] is None
+    # Историю и отправку мастер тоже не теряет
+    resp = await api_client.get(f"/api/admin/chats/{client.id}/messages", headers=headers)
+    assert resp.status_code == 200
+
+    # Повторный release — закрепления уже нет, но без ошибки
+    resp = await api_client.post(f"/api/admin/chats/{client.id}/release", headers=headers)
+    assert resp.status_code == 200
+    assert resp.json() == {"released": False}
+
+
+async def test_master_closed_assignment_chat_stays_visible(api_client, db_session, business):
+    """Закрытие работы отвязывает чат, но из списка мастера он не пропадает."""
+    from tg_studio.modules.chat import assignments as assignments_mod
+
+    master = await make_master(db_session, business.id, telegram_id=7778)
+    client = await make_client(db_session, telegram_id=103)
+    await seed_message(db_session, client, direction=ChatDirection.from_client, content="?")
+    assignment = await assignments_mod.create_assignment(
+        db_session, business_id=business.id, client_id=client.id,
+        master_id=master.id, order_summary=None,
+    )
+    await assignments_mod.close_assignment(db_session, assignment)
+
+    headers = make_init_data_headers(7778)
+    threads = (await api_client.get("/api/admin/chats", headers=headers)).json()
+    [thread] = threads
+    assert thread["client_id"] == client.id
+    assert thread["assigned_master_name"] is None
+    resp = await api_client.get(f"/api/admin/chats/{client.id}/messages", headers=headers)
+    assert resp.status_code == 200
+
+
+async def test_master_cannot_release_foreign_chat(api_client, db_session, business):
+    from tg_studio.modules.chat import assignments as assignments_mod
+
+    master = await make_master(db_session, business.id, telegram_id=7782)
+    other_master = await make_master(db_session, business.id, full_name="Другой", telegram_id=7783)
+    client = await make_client(db_session, telegram_id=106)
+    await seed_message(db_session, client, direction=ChatDirection.from_client, content="?")
+    assignment = await assignments_mod.create_assignment(
+        db_session, business_id=business.id, client_id=client.id,
+        master_id=other_master.id, order_summary=None,
+    )
+
+    headers = make_init_data_headers(7782)
+    resp = await api_client.post(f"/api/admin/chats/{client.id}/release", headers=headers)
+    assert resp.status_code == 404
+    assert assignment.status == ChatAssignmentStatus.open
+
+
+async def test_owner_release_unpins_any_chat(api_client, db_session, business):
+    from tg_studio.modules.chat import assignments as assignments_mod
+
+    other_master = await make_master(db_session, business.id, full_name="Другой", telegram_id=7784)
+    client = await make_client(db_session, telegram_id=107)
+    await seed_message(db_session, client, direction=ChatDirection.from_client, content="?")
+    assignment = await assignments_mod.create_assignment(
+        db_session, business_id=business.id, client_id=client.id,
+        master_id=other_master.id, order_summary=None,
+    )
+
+    resp = await api_client.post(
+        f"/api/admin/chats/{client.id}/release", headers=OWNER_HEADERS
+    )
+    assert resp.status_code == 200
+    assert resp.json() == {"released": True}
+    assert assignment.status == ChatAssignmentStatus.closed
+
+
+@pytest.mark.asyncio
+async def test_message_created_at_has_utc_offset(api_client, db_session, business):
+    """created_at отдаётся со смещением UTC (aware datetime из БД).
+
+    Регрессия: колонки без таймзоны хранят UTC wall-clock, но раньше API отдавал
+    наивный ISO — фронтенд парсил его как локальное время и в Алматы показывал
+    время на 5 часов раньше реального.
+    """
+    client = await make_client(db_session, telegram_id=114)
+    await seed_message(db_session, client, direction=ChatDirection.from_client, content="привет")
+
+    from datetime import datetime
+
+    resp = await api_client.get(f"/api/admin/chats/{client.id}/messages", headers=OWNER_HEADERS)
+    assert resp.status_code == 200
+    created_at = resp.json()[0]["created_at"]
+    assert datetime.fromisoformat(created_at).tzinfo is not None  # UTC-aware ("Z" или "+00:00")
+
+    resp = await api_client.get("/api/admin/chats", headers=OWNER_HEADERS)
+    assert resp.status_code == 200
+    last_at = resp.json()[0]["last_message_at"]
+    assert datetime.fromisoformat(last_at).tzinfo is not None
+
+
+@pytest.mark.asyncio
+async def test_file_proxy_serves_stored_copy(
+    api_client, db_session, business, monkeypatch, tmp_path
+):
+    """Копия в своём хранилище отдаётся без обращения к Telegram."""
+    from tg_studio.config import settings
+    from tg_studio.modules.chat import files as chat_files
+
+    monkeypatch.setattr(settings, "upload_dir", str(tmp_path))
+    client = await make_client(db_session, telegram_id=132)
+    stored = chat_files.save_message_file(b"stored-bytes", "image/jpeg")
+    msg = await seed_message(
+        db_session, client, direction=ChatDirection.from_client, file_id="fid_stored"
+    )
+    msg.stored_path = stored
+    await db_session.commit()
+
+    async def fail_download(file_id):
+        raise AssertionError("Telegram не должен вызываться при наличии копии")
+
+    monkeypatch.setattr(service, "download_photo", fail_download)
+
+    resp = await api_client.get(f"/api/admin/chats/files/{msg.id}", headers=OWNER_HEADERS)
+    assert resp.status_code == 200
+    assert resp.content == b"stored-bytes"
+    assert resp.headers["content-type"] == "image/jpeg"
+
+
+@pytest.mark.asyncio
+async def test_file_proxy_falls_back_to_telegram(api_client, db_session, business, monkeypatch):
+    """Копии нет в хранилище → fallback: скачиваем из Telegram по file_id."""
+    client = await make_client(db_session, telegram_id=133)
+    msg = await seed_message(
+        db_session, client, direction=ChatDirection.from_client, file_id="fid_fb"
+    )
+    msg.stored_path = "chat/messages/missing.jpg"
+    await db_session.commit()
+
+    async def fake_download(file_id):
+        assert file_id == "fid_fb"
+        return b"tg-bytes"
+
+    monkeypatch.setattr(service, "download_photo", fake_download)
+
+    resp = await api_client.get(f"/api/admin/chats/files/{msg.id}", headers=OWNER_HEADERS)
+    assert resp.status_code == 200
+    assert resp.content == b"tg-bytes"

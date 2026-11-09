@@ -6,17 +6,9 @@ from tg_studio.modules.ai import api as ai_api
 from tg_studio.modules.ai.client import ChatResult
 from tg_studio.modules.ai.system_prompt import build_client_prompt, build_system_prompt
 
-from ..conftest import make_business, make_client
+from ..conftest import make_business, make_client, make_init_data_headers
 
-OWNER_HEADERS = {"X-Debug-User-Id": "99999"}
-
-
-@pytest.fixture
-def disable_debug_auth_stub(monkeypatch):
-    """Иначе get_current_user в DEBUG подпустит юзера из ALLOWED_USERS без токена."""
-    from tg_studio.config import settings
-
-    monkeypatch.setattr(settings, "debug", False)
+OWNER_HEADERS = make_init_data_headers(99999)
 
 
 @pytest.fixture
@@ -25,21 +17,21 @@ async def business(db_session):
 
 
 class TestAIChatRoutesAuth:
-    async def test_post_json_requires_auth(self, api_client, disable_debug_auth_stub) -> None:
+    async def test_post_json_requires_auth(self, api_client) -> None:
         response = await api_client.post(
             "/api/admin/ai-chat",
             json={"message": "test"},
         )
         assert response.status_code == 401
 
-    async def test_post_stream_requires_auth(self, api_client, disable_debug_auth_stub) -> None:
+    async def test_post_stream_requires_auth(self, api_client) -> None:
         response = await api_client.post(
             "/api/admin/ai-chat/stream",
             json={"message": "test"},
         )
         assert response.status_code == 401
 
-    async def test_list_clients_requires_auth(self, api_client, disable_debug_auth_stub) -> None:
+    async def test_list_clients_requires_auth(self, api_client) -> None:
         response = await api_client.get("/api/admin/ai-chat/clients")
         assert response.status_code == 401
 

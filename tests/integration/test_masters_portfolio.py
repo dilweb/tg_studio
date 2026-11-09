@@ -6,9 +6,9 @@ from tg_studio.config import settings
 from tg_studio.db.models import MasterPortfolioFile
 from tg_studio.modules.business import portfolio_files
 
-from ..conftest import make_business, make_master
+from ..conftest import make_business, make_init_data_headers, make_master
 
-OWNER_HEADERS = {"X-Debug-User-Id": "99999"}
+OWNER_HEADERS = make_init_data_headers(99999)
 
 PNG_BYTES = b"\x89PNG\r\n\x1a\nfakepng"
 
@@ -76,9 +76,8 @@ async def test_upload_too_large(api_client, setup):
 
 
 @pytest.mark.asyncio
-async def test_upload_requires_owner(api_client, setup, monkeypatch):
-    """Без заголовков и вне debug — нельзя (как в проде)."""
-    monkeypatch.setattr(settings, "debug", False)
+async def test_upload_requires_owner(api_client, setup):
+    """Без авторизации — нельзя (как в проде)."""
     business, master = setup
     resp = await api_client.post(
         f"/api/admin/masters/{master.id}/portfolio",
@@ -96,12 +95,18 @@ async def test_public_masters_and_file(api_client, db_session, setup):
         headers=OWNER_HEADERS,
     )
 
-    # публичный список без авторизации
+    # публичный список без авторизации — только маркетинговые поля (без PII:
+    # telegram_id/google_calendar_id/calendar_add_url не отдаём клиентам)
     resp = await api_client.get("/api/public/masters")
     assert resp.status_code == 200
     masters = resp.json()
     assert len(masters) == 1
-    url = masters[0]["portfolio"][0]["url"]
+    public = masters[0]
+    assert public["full_name"] == "Мастер Портфолио"
+    assert "telegram_id" not in public
+    assert "google_calendar_id" not in public
+    assert "calendar_add_url" not in public
+    url = public["portfolio"][0]["url"]
     assert url.startswith("http://testserver/api/public/masters/")
 
     # файл отдаётся без авторизации

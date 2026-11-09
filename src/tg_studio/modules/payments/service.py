@@ -17,9 +17,11 @@ from decimal import ROUND_HALF_UP, Decimal
 from fastapi import HTTPException
 from sqlalchemy import func, select
 
+from tg_studio.db.locks import for_update
 from tg_studio.db.models import (
     Business,
     Client,
+    Master,
     Payment,
     PaymentKind,
     PaymentProvider,
@@ -37,6 +39,7 @@ from tg_studio.modules.payments.providers import (
     apipay_configured,
     get_provider,
 )
+from tg_studio.modules.tattoo.calendar import remove_session_event
 
 logger = logging.getLogger(__name__)
 
@@ -153,7 +156,27 @@ async def create_prepay_invoice(
     срывает подтверждение работы: тихо падаем в manual.
 
     None — счёта нет (цена 0 или неизвестна): бронь живёт без предоплаты.
+
+    Идемпотентен: повторный вызов (ретрай запроса, параллельные транзакции)
+    возвращает уже созданный pending-счёт, а не плодит дубли. Платёж
+    коммитится ДО вызова провайдера: сбой ApiPay переводит счёт в manual,
+    а счёт в ApiPay без записи в БД (orphan) не создаётся.
     """
+    existing = (
+        await session.execute(
+            for_update(
+                select(Payment).where(
+                    Payment.work_id == work.id,
+                    Payment.kind == PaymentKind.prepay.value,
+                    Payment.status == PaymentStatus.pending.value,
+                ),
+                session,
+            )
+        )
+    ).scalar_one_or_none()
+    if existing is not None:
+        return existing
+
     price = _dec(work.contract_price) if work.contract_price is not None else None
     if price is None:
         price = await contract_price_for_work(session, work)
@@ -190,7 +213,8 @@ async def create_prepay_invoice(
         note=f"Автосчёт на предоплату {percent.normalize()}%",
     )
     session.add(payment)
-    await session.flush()
+    # Счёт записан до обращения к провайдеру: дальше либо успех, либо manual
+    await session.commit()
 
     if provider_name == PaymentProvider.apipay.value:
         try:
@@ -208,10 +232,12 @@ async def create_prepay_invoice(
             payment.provider = PaymentProvider.manual.value
             payment.external_invoice_id = None
             payment.expires_at = datetime.now(UTC) + PREPAY_TTL
+            await session.commit()
         else:
             payment.external_invoice_id = created.external_id
             payment.payment_url = created.payment_url
             payment.expires_at = created.expires_at or payment.expires_at
+            await session.commit()
     return payment
 
 
@@ -227,24 +253,37 @@ async def _notify(telegram_id: int | None, text: str) -> None:
 async def expire_unpaid_prepay(session) -> int:
     """Неоплаченные apipay-предоплаты старше дедлайна.
 
-    Счёт → expired, бронь отменяется (сеансы → cancelled — слот свободен),
-    клиент и владелец уведомлены. Только apipay: manual-платёж мастер
-    подтверждает сам, за него машина не отвечает.
+    Счёт → expired, бронь отменяется (сеансы → cancelled — слот свободен,
+    события сеансов удаляются из Google Calendar), клиент и владелец
+    уведомлены. Только apipay: manual-платёж мастер подтверждает сам,
+    за него машина не отвечает.
+
+    Строки счетов блокируются (FOR UPDATE) и статус перепроверяется —
+    между выборкой и отметкой счёт могли оплатить (webhook). Уведомления
+    и чистка календаря — ПОСЛЕ коммита: сетевые сбои не откатывают отмену
+    брони и не плодят дубли при ретрае celery.
     """
     stale = (
         await session.execute(
-            select(Payment).where(
-                Payment.status == PaymentStatus.pending.value,
-                Payment.kind == PaymentKind.prepay.value,
-                Payment.provider == PaymentProvider.apipay.value,
-                Payment.expires_at.isnot(None),
-                Payment.expires_at < datetime.now(UTC),
+            for_update(
+                select(Payment).where(
+                    Payment.status == PaymentStatus.pending.value,
+                    Payment.kind == PaymentKind.prepay.value,
+                    Payment.provider == PaymentProvider.apipay.value,
+                    Payment.expires_at.isnot(None),
+                    Payment.expires_at < datetime.now(UTC),
+                ),
+                session,
             )
         )
     ).scalars().all()
 
-    owner_tg_id = None
+    notifications: list[tuple[int | None, str]] = []
+    cancelled_events: list[tuple[TattooSession, Master | None, Business]] = []
+    owner_tg_id: int | None = None
     for payment in stale:
+        if payment.status != PaymentStatus.pending.value:
+            continue  # счёт оплатили после блокировки (webhook) — не трогаем
         payment.status = PaymentStatus.expired.value
         work = await session.get(TattooWork, payment.work_id) if payment.work_id else None
         if work is None:
@@ -252,7 +291,7 @@ async def expire_unpaid_prepay(session) -> int:
         client = await session.get(Client, work.client_id)
         if work.status == TattooWorkStatus.in_progress.value:
             work.status = TattooWorkStatus.cancelled.value
-            # Слот освобождается: все живые сеансы работы отменяются
+            # Слот освобождается: живые сеансы отменяются, их события — из календаря
             sessions = (
                 await session.execute(
                     select(TattooSession).where(
@@ -261,22 +300,40 @@ async def expire_unpaid_prepay(session) -> int:
                     )
                 )
             ).scalars().all()
-            for ts in sessions:
-                ts.status = TattooProjectStatus.cancelled.value
+            if sessions:
+                master = await session.get(Master, work.master_id) if work.master_id else None
+                business = await session.get(Business, work.business_id)
+                for ts in sessions:
+                    ts.status = TattooProjectStatus.cancelled.value
+                    if business is not None and ts.google_event_id:
+                        cancelled_events.append((ts, master, business))
         client_name = client.full_name if client else "?"
-        await _notify(
-            client.telegram_id if client else None,
-            f"Счёт на предоплату {float(payment.amount):,.0f} ₸ не оплачен за 24 часа — "
-            f"запись на тату отменена. Хочешь другое время — напиши.",
+        notifications.append(
+            (
+                client.telegram_id if client else None,
+                f"Счёт на предоплату {float(payment.amount):,.0f} ₸ не оплачен за 24 часа — "
+                f"запись на тату отменена. Хочешь другое время — напиши.",
+            )
         )
         if owner_tg_id is None:
             owner_tg_id = await resolve_owner_telegram_id(session)
-        await _notify(
-            owner_tg_id,
-            f"Предоплата не пришла за 24ч — запись отменена: "
-            f"{client_name}, счёт {float(payment.amount):,.0f} ₸ (работа #{work.id}).",
+        notifications.append(
+            (
+                owner_tg_id,
+                f"Предоплата не пришла за 24ч — запись отменена: "
+                f"{client_name}, счёт {float(payment.amount):,.0f} ₸ (работа #{work.id}).",
+            )
         )
     if stale:
+        await session.commit()
+    for telegram_id, text in notifications:
+        await _notify(telegram_id, text)
+    removed_any = False
+    for ts, master, business in cancelled_events:
+        if await remove_session_event(ts, master, business):
+            ts.google_event_id = None
+            removed_any = True
+    if removed_any:
         await session.commit()
     return len(stale)
 

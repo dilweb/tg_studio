@@ -3,11 +3,19 @@
 import shutil
 import subprocess
 import time
+from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import select
 
-from tg_studio.db.models import Business, ChatDirection, ChatMessage, User, UserRole
+from tg_studio.db.models import (
+    Business,
+    ChatDirection,
+    ChatMessage,
+    Client,
+    User,
+    UserRole,
+)
 from tg_studio.modules.chat import service
 
 from ..conftest import make_client
@@ -230,3 +238,201 @@ async def test_list_messages_after_id(db_session):
     newer = await service.list_messages(db_session, client.id, after_id=m1.id)
     assert len(newer) == 1
     assert newer[0].content == "2"
+
+
+# ---------------------------------------------------------------------------
+# Надёжность (P1): дедуп входящих, ретраи отправки в Telegram,
+# компенсация «фантомов» при сбое коммита, ретрай зеркала AI-ответа
+# ---------------------------------------------------------------------------
+
+
+class _FakeBotSession:
+    def __init__(self):
+        self.closed = False
+
+    async def close(self):
+        self.closed = True
+
+
+class _FakeBot:
+    """Подмена _new_bot: без сети, исходы send_message заданы списком."""
+
+    def __init__(self, outcomes):
+        self._outcomes = list(outcomes)
+        self.calls: list[tuple[int, str]] = []
+        self.deleted: list[tuple[int, int]] = []
+        self.delete_outcome: Exception | None = None
+        self.session = _FakeBotSession()
+
+    async def send_message(self, chat_id, text, reply_markup=None):
+        self.calls.append((chat_id, text))
+        outcome = self._outcomes.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return SimpleNamespace(message_id=outcome)
+
+    async def delete_message(self, chat_id, message_id):
+        self.deleted.append((chat_id, message_id))
+        if self.delete_outcome is not None:
+            raise self.delete_outcome
+
+
+@pytest.mark.asyncio
+async def test_incoming_message_dedup_by_telegram_id(db_session):
+    """Повторная доставка того же update (reconnect Telegram) — не дубль в БД."""
+    client = await make_client(db_session, telegram_id=123)
+    # client_id захватываем сразу: при дубликате save_incoming_message делает
+    # rollback, после которого client.id в async упал бы с MissingGreenlet.
+    client_id = client.id
+
+    first = await service.save_incoming_message(
+        db_session, client, content="привет", telegram_file_id=None,
+        telegram_message_id=555,
+    )
+    assert first is not None
+    assert await service.message_exists(db_session, client_id, 555) is True
+    assert await service.message_exists(db_session, client_id, 556) is False
+
+    # тот же telegram_message_id — дубликат доставки, None
+    dup = await service.save_incoming_message(
+        db_session, client, content="привет", telegram_file_id=None,
+        telegram_message_id=555,
+    )
+    assert dup is None
+    # rollback в save_incoming_message expire-ит client — как в боевом хендлере
+    # (новый update = новая сессия), перчитываем клиента перед следующим вызовом
+    client = await db_session.get(Client, client_id)
+    # другое сообщение — ок
+    other = await service.save_incoming_message(
+        db_session, client, content="второе", telegram_file_id=None,
+        telegram_message_id=556,
+    )
+    assert other is not None
+
+    rows = (
+        await db_session.execute(
+            select(ChatMessage).where(ChatMessage.client_id == client_id)
+        )
+    ).scalars().all()
+    assert len(rows) == 2
+
+
+@pytest.mark.asyncio
+async def test_send_text_retries_retry_after(monkeypatch):
+    """RetryAfter (rate limit) — ретрай; успех на 3-й попытке, бот закрыт."""
+    from aiogram.exceptions import TelegramRetryAfter
+    from aiogram.methods import SendMessage
+
+    monkeypatch.setattr(service, "TG_SEND_BACKOFF_SECONDS", 0)
+    method = SendMessage(chat_id=1, text="x")
+    bot = _FakeBot(
+        [TelegramRetryAfter(method, "retry", 0), TelegramRetryAfter(method, "retry", 0), 555]
+    )
+    monkeypatch.setattr(service, "_new_bot", lambda: bot)
+
+    assert await service.send_text_to_telegram(42, "привет") == 555
+    assert len(bot.calls) == 3
+    assert bot.session.closed  # aiohttp-коннекторы не текут
+
+
+@pytest.mark.asyncio
+async def test_send_text_retries_server_error(monkeypatch):
+    """5xx Telegram — ретрай, затем успех."""
+    from aiogram.exceptions import TelegramServerError
+    from aiogram.methods import SendMessage
+
+    monkeypatch.setattr(service, "TG_SEND_BACKOFF_SECONDS", 0)
+    bot = _FakeBot([TelegramServerError(SendMessage(chat_id=1, text="x"), "boom"), 777])
+    monkeypatch.setattr(service, "_new_bot", lambda: bot)
+
+    assert await service.send_text_to_telegram(42, "привет") == 777
+    assert len(bot.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_send_text_non_retryable_4xx_raises_immediately(monkeypatch):
+    """4xx (чат не найден, бот заблокирован) — без ретраев, сразу TelegramSendError."""
+    from aiogram.exceptions import TelegramBadRequest
+    from aiogram.methods import SendMessage
+
+    bot = _FakeBot([TelegramBadRequest(SendMessage(chat_id=1, text="x"), "chat not found")])
+    monkeypatch.setattr(service, "_new_bot", lambda: bot)
+
+    with pytest.raises(service.TelegramSendError):
+        await service.send_text_to_telegram(42, "привет")
+    assert len(bot.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_delete_message_from_telegram_is_best_effort(monkeypatch):
+    """Удаление «фантома» после сбоя коммита: вызов есть, сбой не бросаем."""
+    from aiogram.exceptions import TelegramBadRequest
+    from aiogram.methods import DeleteMessage
+
+    bot = _FakeBot([])
+    monkeypatch.setattr(service, "_new_bot", lambda: bot)
+
+    await service.delete_message_from_telegram(42, 900)
+    assert bot.deleted == [(42, 900)]
+
+    bot.delete_outcome = TelegramBadRequest(
+        DeleteMessage(chat_id=42, message_id=901), "message to delete not found"
+    )
+    await service.delete_message_from_telegram(42, 901)  # не бросает
+    assert bot.deleted == [(42, 900), (42, 901)]
+
+
+@pytest.mark.asyncio
+async def test_send_text_message_commit_failure_deletes_phantom(db_session, monkeypatch):
+    """Сбой коммита после отправки: «фантом» удалён из Telegram, транзакция откачена."""
+    client = await make_client(db_session, telegram_id=124)
+
+    async def fake_send(telegram_id, text):
+        return 4242
+
+    deleted = []
+
+    async def fake_delete(telegram_id, message_id):
+        deleted.append((telegram_id, message_id))
+
+    async def fail_commit():
+        raise RuntimeError("db down")
+
+    monkeypatch.setattr(service, "send_text_to_telegram", fake_send)
+    monkeypatch.setattr(service, "delete_message_from_telegram", fake_delete)
+    monkeypatch.setattr(db_session, "commit", fail_commit)
+
+    with pytest.raises(RuntimeError):
+        await service.send_text_message(db_session, client, "привет")
+    assert deleted == [(124, 4242)]
+
+    rows = (await db_session.execute(select(ChatMessage))).scalars().all()
+    assert rows == []
+
+
+@pytest.mark.asyncio
+async def test_save_ai_message_retries_in_fresh_session(db_session, monkeypatch):
+    """Сбой коммита зеркала AI-ответа → повтор в новой транзакции (ответ не теряем)."""
+    from sqlalchemy.ext.asyncio import async_sessionmaker
+
+    client = await make_client(db_session, telegram_id=125)
+
+    async def fail_commit():
+        raise RuntimeError("db down")
+
+    monkeypatch.setattr(db_session, "commit", fail_commit)
+    monkeypatch.setattr(
+        "tg_studio.db.session.async_session_factory",
+        async_sessionmaker(db_session.bind, expire_on_commit=False),
+    )
+
+    msg = await service.save_ai_message(
+        db_session, client, "ответ агента", telegram_message_id=900
+    )
+    assert msg.content == "ответ агента"
+    assert msg.telegram_message_id == 900
+
+    # в БД ровно одна запись — старая транзакция откачена
+    rows = (await db_session.execute(select(ChatMessage))).scalars().all()
+    assert len(rows) == 1
+    assert rows[0].direction == ChatDirection.from_ai

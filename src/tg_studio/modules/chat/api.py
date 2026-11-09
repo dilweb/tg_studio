@@ -1,5 +1,6 @@
 """Чаты с клиентами: admin-API для миниаппа."""
 
+import logging
 from urllib.parse import quote
 
 from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile
@@ -11,8 +12,10 @@ from tg_studio.api.admin_deps import (
 )
 from tg_studio.api.auth import CurrentUserOptionalDep
 from tg_studio.api.deps import SessionDep
-from tg_studio.modules.chat import assignments, service
+from tg_studio.modules.chat import assignments, files as chat_files, service
 from tg_studio.modules.chat.schemas import ChatMessageCreate, ChatMessageOut, ChatThreadOut
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/admin/chats", tags=["admin • chats"])
 
@@ -27,12 +30,23 @@ async def _get_client_or_404(session, client_id: int):
 
 
 async def _ensure_chat_access(session, master, client_id: int) -> None:
-    """Мастеру — только чаты, закреплённые за ним (404, чтобы не раскрывать чужие)."""
+    """Мастеру — только чаты, которые закреплялись за ним (открытые и уже
+    отвязанные: отвязанный диалог мастер продолжает видеть и читать, бейджа
+    закрепления на нём больше нет). 404, чтобы не раскрывать чужие."""
     if master is None:
         return
-    assignment = await assignments.get_open_assignment(session, client_id)
-    if assignment is None or assignment.master_id != master.id:
+    assignment = await assignments.get_assignment_for_master(
+        session, master_id=master.id, client_id=client_id
+    )
+    if assignment is None:
         raise HTTPException(status_code=404, detail="Чат не найден")
+
+
+def _role_label(master) -> str:
+    """Метка роли в Telegram: клиент должен понимать, кто ему ответил."""
+    if master is None:
+        return service.ROLE_LABEL_STUDIO
+    return service.master_role_label(master.full_name)
 
 
 @router.get("", response_model=list[ChatThreadOut])
@@ -73,10 +87,26 @@ async def get_message_file(
             raise HTTPException(status_code=401, detail="Authorization required")
         _business, master = await get_master_business_and_self(user, session)
         await _ensure_chat_access(session, master, msg.client_id)
-    try:
-        data = await service.download_photo(msg.telegram_file_id)
-    except service.TelegramSendError:
-        raise HTTPException(status_code=502, detail="Не удалось скачать файл из Telegram") from None
+    data: bytes | None = None
+    if msg.stored_path:
+        # Копия в своём хранилище: Telegram не нужен — файл доступен и при
+        # недоступности Telegram, и после удаления сообщения в мессенджере
+        data = chat_files.read_message_file(msg.stored_path)
+        if data is None:
+            logger.warning(
+                "stored_path %s для сообщения %s не найден — fallback в Telegram",
+                msg.stored_path,
+                msg.id,
+            )
+    if data is None:
+        if not msg.telegram_file_id:
+            raise HTTPException(status_code=404, detail="Файл не найден")
+        try:
+            data = await service.download_photo(msg.telegram_file_id)
+        except service.TelegramSendError:
+            raise HTTPException(
+                status_code=502, detail="Не удалось скачать файл из Telegram"
+            ) from None
     media_type = service.FILE_MEDIA_TYPES.get(msg.file_kind or "", "application/octet-stream")
     # Голосовое (ogg/opus) не играет в WebKit (iOS, Telegram на macOS) —
     # перекодируем в mp3; не удалось (нет ffmpeg) — отдаём оригинал
@@ -122,7 +152,9 @@ async def post_message(
     client = await _get_client_or_404(session, client_id)
     await _ensure_chat_access(session, master, client_id)
     try:
-        msg = await service.send_text_message(session, client, body.content)
+        msg = await service.send_text_message(
+            session, client, body.content, role_label=_role_label(master)
+        )
     except service.TelegramSendError as exc:
         raise HTTPException(status_code=502, detail=f"Telegram не принял сообщение: {exc}") from exc
     return _to_out(msg)
@@ -147,10 +179,34 @@ async def post_photo(
     if len(data) > MAX_PHOTO_BYTES:
         raise HTTPException(status_code=400, detail="Файл больше 10 МБ")
     try:
-        msg = await service.send_photo_message(session, client, data, caption)
+        msg = await service.send_photo_message(
+            session, client, data, caption, role_label=_role_label(master)
+        )
     except service.TelegramSendError as exc:
         raise HTTPException(status_code=502, detail=f"Telegram не принял фото: {exc}") from exc
     return _to_out(msg)
+
+
+@router.post("/{client_id}/release")
+async def release_chat(
+    client_id: int,
+    session: SessionDep,
+    business_and_self: MasterBusinessAndSelfDep,
+) -> dict:
+    """Вернуть диалог AI-агенту: мастер сам снимает закрепление кнопкой в шапке.
+
+    Не дожидаемся закрытия работы — мастер сам решает, что клиенту снова
+    отвечает агент. Владелец может отвязать любой чат, мастер — только
+    закреплённый за ним (иначе 404).
+    """
+    business, master = business_and_self
+    client = await _get_client_or_404(session, client_id)
+    await _ensure_chat_access(session, master, client_id)
+    released = await assignments.close_open_assignment_for_client(
+        session, business_id=business.id, client_id=client.id
+    )
+    await session.commit()
+    return {"released": released}
 
 
 @router.post("/{client_id}/read")

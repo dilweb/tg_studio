@@ -9,6 +9,7 @@
 
 import asyncio
 import logging
+import re
 from functools import partial
 
 from sqlalchemy import select
@@ -34,6 +35,59 @@ FAILURE_CLIENT_REPLY = (
 )
 
 _client_locks: dict[int, asyncio.Lock] = {}
+
+# Таймаут захвата per-client lock: зависший ход (долгий/ушедший в таймаут
+# LLM-вызов) не должен вечно блокировать следующие сообщения клиента
+LOCK_ACQUIRE_TIMEOUT_SECONDS = 180.0
+
+# Фразы, которыми модель заявляет о передаче кейса мастеру без реального вызова
+# escalate_to_master («он уже получил вашу заявку», «я передал заказ мастеру»).
+# Единственный настоящий механизм эскалации — флаг EscalationState, который
+# ставит только вызов тула; при эскалации клиенту уходит фиксированный текст,
+# а свободный ответ модели не показывается вовсе. Когда эскалации не было,
+# такой текст — выдумка, вырезаем его детерминированно, не надеясь на промпт.
+_FAKE_HANDOVER_RE = re.compile(
+    r"получ\w*\s+(вашу\s+)?заявк\w+"                       # «получил вашу заявку»
+    r"|уже\s+получ\w+"                                     # «уже получил»
+    r"|я\s+уже\s+(передал\w*|отправил\w*|уведомил\w*)"    # «я уже передал/отправил/уведомил»
+    r"|я\s+передал\w*(\s+ваш\w*)?\s+(заказ\w*|заявк\w*|запрос\w*|вас|мастеру)"
+    r"|я\s+(передам|отправлю|уведомлю)\s+(ваш\w*\s+)?(заказ\w*|заявк\w*|запрос\w*|вопрос\w*)(\s+мастеру)?"
+    r"|я\s+отправил\w*\s+(ваш\w*\s+)?(заказ\w*|заявк\w*|запрос\w*)"
+    r"|я\s+уведомил\w*"
+    r"|я\s+свяжу\w*\s+вас\s+с\s+мастером"
+    r"|(мы|я)\s+свяжемся\s+с\s+вами"
+    r"|передал\w*\s+(ваш\w*\s+)?(заказ\w*|заявк\w*|запрос\w*)\s+мастеру"
+    r"|уведомил\w*\s+мастера"
+    r"|мастер\w*\s+(уже\s+)?(напишет|свяжется|позвонит|ответит)"
+    r"|(заявка|заказ|запрос)\s+(уже\s+)?(отправлен\w*|передан\w*|ушёл|ушла)"
+    r"|already\s+(got|received|passed|sent|forwarded|notified)"
+    r"|the\s+master\s+(will|has)\s+(contact|write|call|reply|get back)"
+    r"|i\s+(have\s+|already\s+)?(passed|sent|forwarded|notified)"
+    r"|handed\s+(over|off)",
+    re.IGNORECASE,
+)
+
+_NO_HANDOVER_FALLBACK = "Хорошо! Если будут ещё вопросы — пишите 😊"
+
+
+def _strip_fake_handover_claims(reply: str, *, client_id: int) -> str:
+    """Вырезает из свободного ответа заявления о передаче мастеру, которой не было.
+
+    Вызывается только когда эскалации не произошло (state.escalated == False):
+    тогда единственный корректный «ответ мастера» — фиксированный текст хода,
+    а свободный ответ модели уходит клиенту как есть.
+    """
+    sentences = [s for s in re.split(r"(?<=[.!?])\s+|\n+", reply.strip()) if s]
+    kept = [s for s in sentences if not _FAKE_HANDOVER_RE.search(s)]
+    if len(kept) == len(sentences):
+        return reply
+    logger.warning(
+        "Booking agent claimed a handover without escalate_to_master "
+        "(client %s); stripped from reply: %r",
+        client_id, reply,
+    )
+    scrubbed = " ".join(kept).strip()
+    return scrubbed or _NO_HANDOVER_FALLBACK
 
 
 def _lock_for(client_id: int) -> asyncio.Lock:
@@ -65,11 +119,24 @@ async def run_booking_turn(
 ) -> str:
     """Один ход агента: ответ клиенту (текст). Исключений наружу не отдаём.
 
-    images — фото клиента (эскиз/референс): уходят модели, если та
-    мультимодальная; в истории остаётся текстовый факт.
+    images — фото клиента (эскиз/референс): сначала отдельный вызов снимает
+    с них текстовый анализ, сам ход идёт без картинки (fallback при сбое
+    экстракции — фото напрямую); в истории остаётся факт + анализ текстом.
     """
-    async with _lock_for(client.id):
+    lock = _lock_for(client.id)
+    try:
+        await asyncio.wait_for(lock.acquire(), timeout=LOCK_ACQUIRE_TIMEOUT_SECONDS)
+    except asyncio.TimeoutError:
+        logger.warning(
+            "Booking turn for client %s: lock acquire timed out after %.0fs",
+            client.id,
+            LOCK_ACQUIRE_TIMEOUT_SECONDS,
+        )
+        return FAILURE_CLIENT_REPLY
+    try:
         return await _run_turn(session, business, client, text, images=images)
+    finally:
+        lock.release()
 
 
 async def _run_turn(
@@ -107,7 +174,9 @@ async def _run_turn(
         return FAILURE_CLIENT_REPLY
 
     if not state.escalated:
-        return result.reply
+        # Эскалации не было — значит, никакой передачи мастеру не существует;
+        # вырезаем из свободного ответа выдуманные заявления о ней.
+        return _strip_fake_handover_claims(result.reply, client_id=client.id)
 
     # Эскалировано: клиенту фиксированный текст (прощание агент уже сказал
     # в transcript, клиенту отправляем только единый понятный ответ).

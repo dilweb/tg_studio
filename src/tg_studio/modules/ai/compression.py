@@ -8,6 +8,8 @@ from openai import AsyncOpenAI
 
 from tg_studio.config import settings
 
+from .llm_retry import chat_completion_with_retry
+
 logger = logging.getLogger(__name__)
 
 MAX_MESSAGES_BEFORE_COMPRESSION = 30
@@ -39,7 +41,8 @@ async def summarise_messages(
 
     conversation_text = "\n".join(text_parts)
 
-    resp = await client.chat.completions.create(
+    resp = await chat_completion_with_retry(
+        client,
         model=settings.llm_model,
         temperature=0,
         messages=[

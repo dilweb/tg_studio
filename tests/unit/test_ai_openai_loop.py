@@ -206,3 +206,51 @@ async def test_tool_call_event_carries_args_for_non_sql_tool():
     }
     assert result.final_reply == "Свободное время есть после 15:00."
 
+
+class _RecordingCompletions:
+    """create запоминает messages каждого вызова (для проверки tool_result)."""
+
+    def __init__(self, responses):
+        self._responses = list(responses)
+        self.calls: list[dict] = []
+
+    async def create(self, **kwargs):
+        self.calls.append(kwargs)
+        return self._responses.pop(0)
+
+
+@pytest.mark.asyncio
+async def test_broken_tool_arguments_become_error_result():
+    """Битый JSON аргументов тула не роняет луп: модель видит ошибку и отвечает."""
+    completions = _RecordingCompletions(
+        [
+            _resp(tool_calls=[_FakeToolCall("c1", "get_bookings", "{broken json")]),
+            _resp(content="Понял, перефразирую."),
+        ]
+    )
+    client = type(
+        "Client", (), {"chat": type("Chat", (), {"completions": completions})()}
+    )()
+    executed = []
+
+    async def execute_tool(name, args):
+        executed.append((name, args))
+        return "{}"
+
+    result = await run_openai_analytics_loop(
+        client,
+        [{"role": "user", "content": "когда свободно?"}],
+        execute_tool=execute_tool,
+        tools=None,
+    )
+
+    assert result.final_reply == "Понял, перефразирую."
+    assert executed == []  # тул не вызывался — аргументы не разобрать
+    # во второй раунд модели ушёл tool-result с ошибкой
+    tool_msgs = [m for m in completions.calls[1]["messages"] if m["role"] == "tool"]
+    assert len(tool_msgs) == 1
+    assert tool_msgs[0]["tool_call_id"] == "c1"
+    # json.dumps по умолчанию экранирует кириллицу — парсим, не ищем подстроку
+    payload = json.loads(tool_msgs[0]["content"])
+    assert "некорректные аргументы" in payload["error"]
+

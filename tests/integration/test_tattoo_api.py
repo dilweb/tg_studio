@@ -3,15 +3,22 @@
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from sqlalchemy import select
 
 from tg_studio.config import AllowedUser, settings
 from tg_studio.db.models import UserRole
 
-from ..conftest import make_business, make_client, make_master, make_user
+from ..conftest import (
+    make_business,
+    make_client,
+    make_init_data_headers,
+    make_master,
+    make_user,
+)
 
-OWNER_HEADERS = {"X-Debug-User-Id": "99999"}
+OWNER_HEADERS = make_init_data_headers(99999)
 MASTER_TG_ID = 88888
-MASTER_HEADERS = {"X-Debug-User-Id": str(MASTER_TG_ID)}
+MASTER_HEADERS = make_init_data_headers(MASTER_TG_ID)
 
 
 @pytest.fixture
@@ -21,14 +28,14 @@ async def business(db_session):
 
 @pytest.fixture
 async def master(db_session, business, monkeypatch):
-    """Мастер с привязанным User — чтобы ходить под его debug-заголовком."""
+    """Мастер с привязанным User — чтобы ходить под его initData."""
     user = await make_user(
         db_session, telegram_id=MASTER_TG_ID, first_name="Мастер Тест", role=UserRole.master
     )
     m = await make_master(db_session, business_id=business.id, full_name="Мастер Тест")
     m.user_id = user.id
     await db_session.commit()
-    # Debug-auth разрешает роль из ALLOWED_USERS — добавляем мастера к владельцу
+    # Роль по initData решает ALLOWED_USERS — добавляем мастера к владельцу
     monkeypatch.setattr(
         settings,
         "allowed_users",
@@ -337,6 +344,56 @@ async def test_owner_filters_by_master(api_client, db_session, business, master)
 
 
 @pytest.mark.asyncio
+async def test_final_session_unpins_chat_from_master(
+    api_client, db_session, business, master
+):
+    """Финальный сеанс закрывает работу → чат клиента отвязывается от мастера
+    (клиент снова общается с AI-агентом). Не-финальный сеанс чат не трогает."""
+    from tg_studio.db.models import ChatAssignment, ChatAssignmentStatus
+
+    client = await make_client(db_session, telegram_id=117)
+    db_session.add(
+        ChatAssignment(
+            business_id=business.id,
+            client_id=client.id,
+            master_id=master.id,
+            status=ChatAssignmentStatus.open,
+            order_summary="тест",
+        )
+    )
+    await db_session.commit()
+
+    resp = await api_client.post(
+        "/api/tattoo/works", json=work_payload(client.id), headers=MASTER_HEADERS
+    )
+    work_id = resp.json()["id"]
+
+    # Обычный сеанс — закрепление остаётся
+    await api_client.post(
+        f"/api/tattoo/works/{work_id}/sessions",
+        json={"session_date": _iso(3), "cost": 10000},
+        headers=MASTER_HEADERS,
+    )
+    assignment = (
+        await db_session.execute(select(ChatAssignment).where(ChatAssignment.client_id == client.id))
+    ).scalar_one()
+    assert assignment.status == ChatAssignmentStatus.open
+
+    # Финальный сеанс — работа закрыта целиком, чат отвязан
+    resp = await api_client.post(
+        f"/api/tattoo/works/{work_id}/sessions",
+        json={"session_date": _iso(7), "cost": 15000, "is_final_session": True},
+        headers=MASTER_HEADERS,
+    )
+    assert resp.status_code == 201, resp.text
+    assignment = (
+        await db_session.execute(select(ChatAssignment).where(ChatAssignment.client_id == client.id))
+    ).scalar_one()
+    assert assignment.status == ChatAssignmentStatus.closed
+    assert assignment.closed_at is not None
+
+
+@pytest.mark.asyncio
 async def test_add_final_session_completes_work(api_client, db_session, business, master):
     client = await make_client(db_session, telegram_id=116)
     resp = await api_client.post(
@@ -599,13 +656,9 @@ async def test_upload_and_get_file(
     resp = await api_client.get(f"/api/tattoo/files/{out['id']}", headers=OWNER_HEADERS)
     assert resp.status_code == 200
 
-    # Без токена и без авторизации — нельзя. Отключаем debug-фоллбэк
-    # (в тестах DEBUG=true анонимный запрос сам становится владельцем),
-    # после проверки возвращаем — остальным запросам теста нужен debug
-    monkeypatch.setattr(settings, "debug", False)
+    # Без токена и без авторизации — нельзя (debug-доступ удалён из кода)
     resp = await api_client.get(f"/api/tattoo/files/{out['id']}")
     assert resp.status_code == 401
-    monkeypatch.setattr(settings, "debug", True)
 
     # Файл на диске в папке сеанса
     stored = next((upload_dir / "tattoo" / "sessions" / str(sid)).iterdir())
@@ -616,6 +669,46 @@ async def test_upload_and_get_file(
     files = resp.json()["sessions"][0]["files"]
     assert len(files) == 1
     assert files[0]["id"] == out["id"] and "?t=" in files[0]["file_url"]
+
+
+@pytest.mark.asyncio
+async def test_file_without_token_master_scoped_to_own_work(
+    api_client, db_session, business, master, upload_dir, monkeypatch
+):
+    """Без ?t= файл доступен по авторизации, но мастер видит только фото
+    СВОЕЙ работы — чужое фото сеанса → 404 (как и чужая работа целиком)."""
+    work = await _create_work(api_client, db_session, telegram_id=119)
+    sid = work["sessions"][0]["id"]
+    resp = await api_client.post(
+        f"/api/tattoo/works/{work['id']}/sessions/{sid}/files",
+        data={"kind": "result"},
+        files=_upload_files(),
+        headers=MASTER_HEADERS,
+    )
+    assert resp.status_code == 201, resp.text
+    file_id = resp.json()["id"]
+
+    # свой мастер — видит
+    resp = await api_client.get(f"/api/tattoo/files/{file_id}", headers=MASTER_HEADERS)
+    assert resp.status_code == 200
+
+    # другой мастер бизнеса — чужое фото → 404
+    other_tg = 88889
+    other_user = await make_user(
+        db_session, telegram_id=other_tg, first_name="Мастер 2", role=UserRole.master
+    )
+    other_master = await make_master(db_session, business_id=business.id, full_name="Мастер 2")
+    other_master.user_id = other_user.id
+    await db_session.commit()
+    monkeypatch.setattr(
+        settings,
+        "allowed_users",
+        [*settings.allowed_users, AllowedUser(id=other_tg, role="master")],
+    )
+    resp = await api_client.get(
+        f"/api/tattoo/files/{file_id}", headers=make_init_data_headers(other_tg)
+    )
+    assert resp.status_code == 404
 
 
 @pytest.mark.asyncio
@@ -702,3 +795,93 @@ async def test_delete_file_and_work_cleans_disk(
     resp = await api_client.delete(f"/api/tattoo/works/{work['id']}", headers=MASTER_HEADERS)
     assert resp.status_code == 204
     assert not session_dir.exists()
+
+
+# ---------------------------------------------------------------------------
+# Надёжность (P1): работа без мастера редактируется/удаляется без 422,
+# отмена сеанса освобождает слот в Google Calendar
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_update_and_delete_work_without_master(api_client, db_session, business, monkeypatch):
+    """Работа без мастера (очередь офферов): PATCH/DELETE — не 422 после коммита."""
+    from tg_studio.modules.tattoo import offers as offers_mod
+
+    async def fake_notify(session, offer):
+        pass
+
+    async def fake_escalate(session, work):
+        pass
+
+    monkeypatch.setattr(offers_mod, "notify_master", fake_notify)
+    monkeypatch.setattr(offers_mod, "escalate_to_owner", fake_escalate)
+
+    client = await make_client(db_session, telegram_id=135)
+    resp = await api_client.post(
+        "/api/tattoo/works", json=work_payload(client.id), headers=OWNER_HEADERS
+    )
+    assert resp.status_code == 201, resp.text
+    work_id = resp.json()["id"]
+    assert resp.json()["master_id"] is None
+
+    # PATCH — 200 (раньше 422, причём изменения уже были записаны)
+    resp = await api_client.patch(
+        f"/api/tattoo/works/{work_id}",
+        json={"size_length_cm": 20},
+        headers=OWNER_HEADERS,
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["size_length_cm"] == 20.0
+
+    # DELETE — 204
+    resp = await api_client.delete(f"/api/tattoo/works/{work_id}", headers=OWNER_HEADERS)
+    assert resp.status_code == 204
+    resp = await api_client.get(f"/api/tattoo/works/{work_id}", headers=OWNER_HEADERS)
+    assert resp.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_cancel_session_removes_calendar_event(
+    api_client, db_session, business, master, monkeypatch
+):
+    """Отмена сеанса удаляет событие из Google Calendar и отвязывает google_event_id."""
+    from tg_studio.db.models import TattooSession
+
+    business.google_calendar_credentials_json = "{}"
+    await db_session.commit()
+
+    async def fake_create_event(**kwargs):
+        return "ev-123"
+
+    monkeypatch.setattr("tg_studio.modules.tattoo.api.create_event", fake_create_event)
+
+    cancelled = []
+
+    async def fake_cancel_event(credentials_json, event_id, calendar_id="primary"):
+        cancelled.append(event_id)
+        return True
+
+    monkeypatch.setattr("tg_studio.modules.tattoo.calendar.cancel_event", fake_cancel_event)
+
+    client = await make_client(db_session, telegram_id=136)
+    resp = await api_client.post(
+        "/api/tattoo/works", json=work_payload(client.id, master.id), headers=OWNER_HEADERS
+    )
+    assert resp.status_code == 201, resp.text
+    work_id = resp.json()["id"]
+    sid = resp.json()["sessions"][0]["id"]
+
+    ts = await db_session.get(TattooSession, sid)
+    assert ts.google_event_id == "ev-123"
+
+    resp = await api_client.patch(
+        f"/api/tattoo/works/{work_id}/sessions/{sid}",
+        json={"status": "cancelled"},
+        headers=MASTER_HEADERS,
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["status"] == "cancelled"
+    assert cancelled == ["ev-123"]
+    await db_session.refresh(ts)
+    assert ts.google_event_id is None

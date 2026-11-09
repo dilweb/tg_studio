@@ -20,7 +20,7 @@ from tg_studio.api.auth import (
     verify_password,
 )
 from tg_studio.api.deps import SessionDep
-from tg_studio.db.models import Business, Master, User, UserRole
+from tg_studio.db.models import Business, Master, Seat, User, UserRole
 from tg_studio.modules.identity.schemas import (
     CookieAuthResponse,
     LoginRequest,
@@ -59,6 +59,12 @@ async def register_owner(body: RegisterOwnerRequest, session: SessionDep, respon
         description=body.business_description,
     )
     session.add(business)
+    await session.flush()
+    # Коворкинг (docs/coworking/02): дефолтные 4 рабочих места
+    for i in range(4):
+        session.add(
+            Seat(business_id=business.id, name=f"Место {i + 1}", sort_order=i)
+        )
     await session.commit()
 
     try:

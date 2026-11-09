@@ -10,14 +10,7 @@ from httpx import ASGITransport, AsyncClient
 
 from tg_studio.api.app import app
 from tg_studio.api.auth import hash_password
-from tg_studio.config import settings
 from tg_studio.db.models import User, UserRole
-
-
-@pytest.fixture
-def disable_debug_auth_stub(monkeypatch):
-    """Иначе get_current_user в DEBUG вернёт первого юзера без проверки cookie."""
-    monkeypatch.setattr(settings, "debug", False)
 
 
 @pytest.fixture
@@ -30,8 +23,7 @@ def noop_verification_email_delay(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_login_returns_json_headers_and_cookies(
-    api_client, db_session, disable_debug_auth_stub
-):
+    api_client, db_session):
     u = User(
         email="owner@example.com",
         password_hash=hash_password("pass12345"),
@@ -64,7 +56,7 @@ async def test_login_returns_json_headers_and_cookies(
 
 
 @pytest.mark.asyncio
-async def test_me_with_cookie_only(api_client, db_session, disable_debug_auth_stub):
+async def test_me_with_cookie_only(api_client, db_session):
     u = User(
         email="cookie@example.com",
         password_hash=hash_password("secret"),
@@ -89,8 +81,7 @@ async def test_me_with_cookie_only(api_client, db_session, disable_debug_auth_st
 
 @pytest.mark.asyncio
 async def test_me_bearer_overrides_cookie_when_both_sent(
-    api_client, db_session, disable_debug_auth_stub
-):
+    api_client, db_session):
     owner = User(
         email="owner2@example.com",
         password_hash=hash_password("a"),
@@ -128,8 +119,7 @@ async def test_me_bearer_overrides_cookie_when_both_sent(
 
 @pytest.mark.asyncio
 async def test_refresh_with_empty_body_uses_refresh_cookie(
-    api_client, db_session, disable_debug_auth_stub
-):
+    api_client, db_session):
     u = User(
         email="refresh@example.com",
         password_hash=hash_password("x"),
@@ -158,8 +148,7 @@ async def test_refresh_with_empty_body_uses_refresh_cookie(
 
 @pytest.mark.asyncio
 async def test_refresh_accepts_refresh_token_in_body(
-    api_client, db_session, disable_debug_auth_stub
-):
+    api_client, db_session):
     u = User(
         email="refreshbody@example.com",
         password_hash=hash_password("p"),
@@ -184,15 +173,14 @@ async def test_refresh_accepts_refresh_token_in_body(
 
 
 @pytest.mark.asyncio
-async def test_refresh_missing_token_401(api_client, disable_debug_auth_stub):
+async def test_refresh_missing_token_401(api_client):
     r = await api_client.post("/api/auth/refresh", json={})
     assert r.status_code == 401
 
 
 @pytest.mark.asyncio
 async def test_logout_clears_cookies_then_me_unauthorized(
-    api_client, db_session, disable_debug_auth_stub
-):
+    api_client, db_session):
     u = User(
         email="logout@example.com",
         password_hash=hash_password("z"),
@@ -219,7 +207,7 @@ async def test_logout_clears_cookies_then_me_unauthorized(
 
 @pytest.mark.asyncio
 async def test_register_owner_sets_auth_on_response(
-    api_client, db_session, disable_debug_auth_stub, noop_verification_email_delay
+    api_client, db_session, noop_verification_email_delay
 ):
     payload = {
         "email": "newowner@example.com",
