@@ -44,7 +44,7 @@ from tg_studio.db.models import (
     Upsell,
 )
 from tg_studio.modules.coworking.pricing import CURRENCY
-from tg_studio.modules.coworking.service import studio_hours_for_date
+from tg_studio.modules.coworking.service import interval_bounds, studio_hours_for_date
 from tg_studio.timeutil import STUDIO_TZ, studio_now, to_studio_local
 
 PAID_BOOKING_STATUSES = (
@@ -173,6 +173,9 @@ async def load_report_data(session, business: Business, from_: datetime, to: dat
     """Нужные факты одним набором запросов; календарные разрезы считаем в Python."""
     bid = business.id
     data = ReportData()
+    # Колонки DateTime(timezone=True) на SQLite пишут wall-clock без перевода в UTC:
+    # границы в зоне студии (+05:00) ломали бы сравнения. UTC-границы корректны везде.
+    from_, to = utc(from_), utc(to)
 
     async def rows(stmt):
         return (await session.execute(stmt)).scalars().all()
@@ -242,31 +245,31 @@ async def load_report_data(session, business: Business, from_: datetime, to: dat
         )))
         known = {sale.id for sale in data.sales}
         data.sales.extend(sale for sale in refund_sales if sale.id not in known)
-    linked_ids = {
-        value
-        for entry in data.ledger
-        for value in (entry.payment_id, entry.booking_id, entry.sale_id)
-        if value is not None
-    }
-    linked_ids.update(
-        value
-        for event in data.events
-        if isinstance(event.details, dict)
-        for value in (event.details.get("payment_id"), event.booking_id, event.details.get("sale_id"))
-        if value is not None
-    )
-    if linked_ids:
-        # Оплата брони могла быть раньше периода выручки. Для Excel и возвратов
-        # всё равно нужны её внутренний и банковский id, но в cash за период
-        # такой платёж не попадает (money_report фильтрует по paid_at).
+    # Id из разных пространств (платёж/бронь/продажа) не смешиваем: иначе booking_id=3
+    # зацепил бы платёж с id=3. Брони и продажи периода берём целиком — их оплата
+    # могла быть раньше окна, а Excel нужны её внутренний и банковский id.
+    payment_ids = {entry.payment_id for entry in data.ledger if entry.payment_id is not None}
+    booking_ids = {booking.id for booking in data.bookings}
+    booking_ids.update(entry.booking_id for entry in data.ledger if entry.booking_id is not None)
+    booking_ids.update(event.booking_id for event in data.events if event.booking_id is not None)
+    sale_ids = {sale.id for sale in data.sales}
+    sale_ids.update(entry.sale_id for entry in data.ledger if entry.sale_id is not None)
+    for event in data.events:
+        if isinstance(event.details, dict):
+            if event.details.get("payment_id") is not None:
+                payment_ids.add(event.details["payment_id"])
+            if event.details.get("sale_id") is not None:
+                sale_ids.add(event.details["sale_id"])
+    if payment_ids or booking_ids or sale_ids:
+        # Такой платёж в cash за период не попадает (money_report фильтрует по paid_at).
         linked_payments = list(await rows(
             select(Payment).options(selectinload(Payment.master)).where(
                 Payment.business_id == bid,
                 Payment.status == PaymentStatus.paid.value,
                 or_(
-                    Payment.id.in_(linked_ids),
-                    Payment.booking_id.in_(linked_ids),
-                    Payment.sale_id.in_(linked_ids),
+                    Payment.id.in_(payment_ids),
+                    Payment.booking_id.in_(booking_ids),
+                    Payment.sale_id.in_(sale_ids),
                 ),
             )
         ))
@@ -331,7 +334,7 @@ def revenue_report(data: ReportData, from_: datetime, to: datetime) -> dict:
             day_seconds = _overlap_seconds(start, end, cursor, min(utc(to), day_finish))
             if day_seconds:
                 by_day[to_studio_local(cursor).date()]["booking_revenue"] += price * day_seconds / total_seconds
-                by_day[to_studio_local(cursor).date()]["hours"] += day_seconds / HOUR_SECONDS
+                by_day[to_studio_local(cursor).date()]["hours"] += day_seconds
             cursor = day_finish
         seat = by_seat[booking.seat_id]
         seat["revenue"] += amount
@@ -420,8 +423,7 @@ async def usage_report(session, data: ReportData, from_: datetime, to: datetime)
             local_day = to_studio_local(cursor).date()
             _, next_day = studio_day_range(local_day)
             for opening, closing in hours_by_day[local_day]:
-                start = datetime.combine(local_day, opening, tzinfo=STUDIO_TZ)
-                end = datetime.combine(local_day, closing, tzinfo=STUDIO_TZ)
+                start, end = interval_bounds(local_day, opening, closing)
                 left, right = max(start, from_), min(end, to)
                 if right > left:
                     intervals.append((left, right))

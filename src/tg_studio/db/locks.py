@@ -22,6 +22,8 @@ SEAT_LOCK_NAMESPACE = 0x7374
 SUPPLY_LOCK_NAMESPACE = 0x7370
 # Продажа: сериализация частичных возвратов по одному чеку
 SALE_LOCK_NAMESPACE = 0x7361
+# Лимит мест: сериализация создания/включения мест одного бизнеса
+SEAT_LIMIT_LOCK_NAMESPACE = 0x736c
 
 
 def _is_postgres(session: AsyncSession) -> bool:
@@ -54,6 +56,17 @@ async def lock_seat_slot(session: AsyncSession, seat_id: int) -> None:
     await session.execute(
         text("SELECT pg_advisory_xact_lock(:ns, :key)"),
         {"ns": SEAT_LOCK_NAMESPACE, "key": seat_id},
+    )
+
+
+async def lock_business_seats(session: AsyncSession, business_id: int) -> None:
+    """Блокировка набора мест бизнеса до конца транзакции: два параллельных
+    создания/включения места не обойдут лимит max_seats."""
+    if not _is_postgres(session):
+        return
+    await session.execute(
+        text("SELECT pg_advisory_xact_lock(:ns, :key)"),
+        {"ns": SEAT_LIMIT_LOCK_NAMESPACE, "key": business_id},
     )
 
 

@@ -66,9 +66,9 @@ async def seats(api_client, business):
     return created
 
 
-def _at(hour: int, minute: int = 0) -> str:
-    """Завтра в hour:minute по студии (наивное время = Asia/Almaty)."""
-    day = (datetime.now(STUDIO_TZ) + timedelta(days=1)).date()
+def _at(hour: int, minute: int = 0, days: int = 0) -> str:
+    """Завтра (+days) в hour:minute по студии (наивное время = Asia/Almaty)."""
+    day = (datetime.now(STUDIO_TZ) + timedelta(days=1 + days)).date()
     return f"{day.isoformat()}T{hour:02d}:{minute:02d}:00"
 
 
@@ -397,41 +397,14 @@ async def test_quote_rounding(api_client, business, seats, master):
 
 
 @pytest.mark.asyncio
-async def test_discount_resident_percent(api_client, business, seats, master):
-    """Резидентская скидка 10% применяется только резиденту."""
-    await _base_rule(api_client, hourly_rate=1000)
+async def test_resident_discount_not_supported(api_client, business, seats, master):
+    """Скидок резидентам нет: kind=resident отклоняется, тариф резидента владелец задаёт сам."""
     resp = await api_client.post(
         "/api/discount-rules",
-        json={"name": "Резиденты −10%", "kind": "resident", "percent": 0.10},
+        json={"name": "Резиденты", "kind": "resident", "percent": 0.10},
         headers=OWNER_HEADERS,
     )
-    assert resp.status_code == 201, resp.text
-
-    # Мастер не резидент → скидки нет
-    resp = await api_client.post(
-        "/api/pricing/quote",
-        json={"seat_id": seats[0]["id"], "start": _at(12), "end": _at(14)},
-        headers=MASTER_HEADERS,
-    )
-    assert resp.json()["final"] == 2000
-
-    # Делаем мастера резидентом через админ-эндпоинт
-    resp = await api_client.patch(
-        f"/api/admin/masters/{master.id}", json={"is_resident": True}, headers=OWNER_HEADERS
-    )
-    assert resp.status_code == 200, resp.text
-    assert resp.json()["is_resident"] is True
-
-    resp = await api_client.post(
-        "/api/pricing/quote",
-        json={"seat_id": seats[0]["id"], "start": _at(12), "end": _at(14)},
-        headers=MASTER_HEADERS,
-    )
-    q = resp.json()
-    assert q["base"] == 2000
-    assert q["discount"] == 200
-    assert q["final"] == 1800
-    assert q["discounts"][0]["kind"] == "resident"
+    assert resp.status_code == 422
 
 
 @pytest.mark.asyncio
@@ -464,16 +437,11 @@ async def test_discount_min_hours_and_fixed(api_client, business, seats, master)
 
 @pytest.mark.asyncio
 async def test_discount_capped_by_base(api_client, business, seats, master):
-    """Суммарная скидка не может быть больше base (final ≥ 0)."""
+    """Скидка не может быть больше base (final ≥ 0)."""
     await _base_rule(api_client, hourly_rate=100)
     await api_client.post(
         "/api/discount-rules",
-        json={"name": "−90%", "kind": "min_hours", "min_hours": 1, "percent": 0.9},
-        headers=OWNER_HEADERS,
-    )
-    await api_client.post(
-        "/api/discount-rules",
-        json={"name": "−1000 ₸", "kind": "min_hours", "min_hours": 1, "fixed_amount": 1000, "priority": 1},
+        json={"name": "−1000 ₸", "kind": "min_hours", "min_hours": 1, "fixed_amount": 1000},
         headers=OWNER_HEADERS,
     )
     resp = await api_client.post(
@@ -483,13 +451,33 @@ async def test_discount_capped_by_base(api_client, business, seats, master):
     )
     q = resp.json()
     assert q["base"] == 100
-    assert q["discount"] == 100  # 90 + 1000, но не больше base
+    assert q["discount"] == 100
     assert q["final"] == 0
 
 
 @pytest.mark.asyncio
+async def test_discount_tiers_pick_highest_reached(api_client, business, seats, master):
+    """Ступени не складываются: действует с наибольшим достигнутым порогом."""
+    await _base_rule(api_client, hourly_rate=1000)
+    for hours, pct in ((2, 0.05), (4, 0.10)):
+        resp = await api_client.post(
+            "/api/discount-rules",
+            json={"name": f"от {hours}", "kind": "min_hours", "min_hours": hours, "percent": pct},
+            headers=OWNER_HEADERS,
+        )
+        assert resp.status_code == 201, resp.text
+    for end_h, expected in ((13, 0), (14, 100), (16, 400)):
+        resp = await api_client.post(
+            "/api/pricing/quote",
+            json={"seat_id": seats[0]["id"], "start": _at(12), "end": _at(end_h)},
+            headers=MASTER_HEADERS,
+        )
+        assert resp.json()["discount"] == expected, end_h
+
+
+@pytest.mark.asyncio
 async def test_discount_validation(api_client, business, seats, master):
-    # kind без условия / оба размера сразу — 422
+    # без порога / оба размера сразу — 422
     resp = await api_client.post(
         "/api/discount-rules",
         json={"name": "кривая", "kind": "min_hours", "percent": 0.1},
@@ -498,17 +486,63 @@ async def test_discount_validation(api_client, business, seats, master):
     assert resp.status_code == 422
     resp = await api_client.post(
         "/api/discount-rules",
-        json={"name": "кривая2", "kind": "resident", "percent": 0.1, "fixed_amount": 100},
+        json={"name": "кривая2", "kind": "min_hours", "min_hours": 2, "percent": 0.1, "fixed_amount": 100},
         headers=OWNER_HEADERS,
     )
     assert resp.status_code == 422
     # мастер не создаёт скидки
     resp = await api_client.post(
         "/api/discount-rules",
-        json={"name": "хак", "kind": "resident", "percent": 0.5},
+        json={"name": "хак", "kind": "min_hours", "min_hours": 2, "percent": 0.5},
         headers=MASTER_HEADERS,
     )
     assert resp.status_code == 403
+    # PATCH с неизвестным kind
+    ok = await api_client.post(
+        "/api/discount-rules",
+        json={"name": "ok", "min_hours": 2, "percent": 0.1},
+        headers=OWNER_HEADERS,
+    )
+    assert ok.status_code == 201
+    resp = await api_client.patch(
+        f"/api/discount-rules/{ok.json()['id']}", json={"kind": "resident"}, headers=OWNER_HEADERS
+    )
+    assert resp.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_price_rule_until_midnight_and_patch_validation(api_client, business, seats, master):
+    """Окно до 00:00 (полночь) допустимо; кривой day_kind в PATCH — 422; квота длиннее 7 суток — 400."""
+    resp = await api_client.post(
+        "/api/price-rules",
+        json={"name": "Вечер", "day_kind": "все", "time_from": "00:00:00", "time_to": "00:00:00", "hourly_rate": 1000},
+        headers=OWNER_HEADERS,
+    )
+    assert resp.status_code == 201, resp.text
+    rule_id = resp.json()["id"]
+    resp = await api_client.post(
+        "/api/pricing/quote",
+        json={"seat_id": seats[0]["id"], "start": _at(22), "end": _at(23)},
+        headers=MASTER_HEADERS,
+    )
+    assert resp.status_code == 200 and resp.json()["final"] == 1000
+    # через полночь: окно «весь день» на обе даты — две части
+    resp = await api_client.post(
+        "/api/pricing/quote",
+        json={"seat_id": seats[0]["id"], "start": _at(22), "end": _at(23, days=1)},
+        headers=MASTER_HEADERS,
+    )
+    assert resp.status_code == 200, resp.text
+    resp = await api_client.patch(
+        f"/api/price-rules/{rule_id}", json={"day_kind": "каждый"}, headers=OWNER_HEADERS
+    )
+    assert resp.status_code == 422
+    resp = await api_client.post(
+        "/api/pricing/quote",
+        json={"seat_id": seats[0]["id"], "start": _at(12), "end": _at(12, days=30)},
+        headers=MASTER_HEADERS,
+    )
+    assert resp.status_code == 400
 
 
 # ---------------------------------------------------------------------------
@@ -623,18 +657,15 @@ async def test_reschedule_recalculates_price(api_client, business, seats, master
 
 
 @pytest.mark.asyncio
-async def test_owner_quote_with_master_id_for_resident_discount(
+async def test_owner_quote_with_master_id(
     api_client, business, seats, master
 ):
-    """Владелец считает quote для конкретного мастера — резидентская скидка."""
+    """Владелец считает quote для конкретного мастера (master_id попадает в снимок)."""
     await _base_rule(api_client, hourly_rate=1000)
     await api_client.post(
         "/api/discount-rules",
-        json={"name": "Резиденты −50%", "kind": "resident", "percent": 0.5},
+        json={"name": "От 2 ч −50%", "kind": "min_hours", "min_hours": 2, "percent": 0.5},
         headers=OWNER_HEADERS,
-    )
-    await api_client.patch(
-        f"/api/admin/masters/{master.id}", json={"is_resident": True}, headers=OWNER_HEADERS
     )
     resp = await api_client.post(
         "/api/pricing/quote",

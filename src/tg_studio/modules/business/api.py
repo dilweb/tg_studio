@@ -9,7 +9,6 @@ from sqlalchemy.orm import selectinload
 
 from tg_studio.api.admin_deps import OwnerBusinessDep
 from tg_studio.api.deps import SessionDep
-from tg_studio.config import settings
 from tg_studio.db.models import Business, Master, MasterPortfolioFile
 from tg_studio.modules.business import portfolio_files
 from tg_studio.modules.business.schemas import (
@@ -20,7 +19,6 @@ from tg_studio.modules.business.schemas import (
     MasterPortfolioFileOut,
     MasterResponse,
     MasterUpdate,
-    PricingConfigUpdate,
     PublicMasterResponse,
     public_master_out,
 )
@@ -29,7 +27,6 @@ from tg_studio.modules.google_calendar.client import (
     delete_calendar,
     share_calendar,
 )
-from tg_studio.modules.tattoo.pricing import effective_pricing
 
 router = APIRouter()
 
@@ -68,7 +65,6 @@ async def get_my_business(business: OwnerBusinessDep):
         phone=business.phone,
         is_active=business.is_active,
         owner_telegram_id=business.owner_telegram_id,
-        pricing_config=effective_pricing(business),
     )
 
 
@@ -76,11 +72,7 @@ async def get_my_business(business: OwnerBusinessDep):
 async def update_business(
     body: BusinessUpdate, session: SessionDep, business: OwnerBusinessDep
 ):
-    """Профиль бизнеса: название, описание, телефон.
-
-    Описание — база знаний AI-агента (ресепшн бота): он отвечает клиентам
-    о студии только из этого текста.
-    """
+    """Профиль бизнеса: название, описание, телефон."""
     # Пустая строка = очистить значение (description/phone — nullable)
     if body.name is not None:
         business.name = body.name
@@ -96,27 +88,7 @@ async def update_business(
         phone=business.phone,
         is_active=business.is_active,
         owner_telegram_id=business.owner_telegram_id,
-        pricing_config=effective_pricing(business),
     )
-
-
-@_admin_business.put("/pricing", response_model=AdminBusinessResponse)
-async def update_pricing(
-    body: PricingConfigUpdate, session: SessionDep, business: OwnerBusinessDep
-):
-    """Прайс-конфиг бизнеса: глобальный % и все коэффициенты. Правится целиком."""
-    business.pricing_config = body.model_dump(mode="json")
-    await session.commit()
-    return AdminBusinessResponse(
-        id=business.id,
-        name=business.name,
-        description=business.description,
-        phone=business.phone,
-        is_active=business.is_active,
-        owner_telegram_id=business.owner_telegram_id,
-        pricing_config=effective_pricing(business),
-    )
-
 
 
 # ── Admin: masters ────────────────────────────────────────────────────────────
@@ -149,7 +121,6 @@ def _master_to_response(m: Master) -> MasterResponse:
         deleted_at=m.deleted_at.isoformat() if m.deleted_at else None,
         google_calendar_id=m.google_calendar_id,
         default_duration_minutes=m.default_duration_minutes,
-        specializations=m.specializations or [],
         is_resident=bool(m.is_resident),
         phone=m.phone,
         # прямая ссылка: открой — календарь добавится в твой Google Calendar,
@@ -221,7 +192,6 @@ async def create_master(body: MasterCreate, session: SessionDep, business: Owner
         description=body.description,
         telegram_id=body.telegram_id,
         default_duration_minutes=body.default_duration_minutes,
-        specializations=body.specializations,
     )
     session.add(master)
     await _auto_create_calendar(master, business)
@@ -243,8 +213,6 @@ async def update_master(master_id: int, body: MasterUpdate, session: SessionDep,
         master.is_active = body.is_active
     if body.default_duration_minutes is not None:
         master.default_duration_minutes = body.default_duration_minutes
-    if body.specializations is not None:
-        master.specializations = body.specializations
     if body.is_resident is not None:
         master.is_resident = body.is_resident
     if body.phone is not None:
@@ -293,9 +261,7 @@ async def create_registration_link(master_id: int, session: SessionDep, business
     token = secrets.token_urlsafe(24)
     master.registration_token = token
     await session.commit()
-    payload = f"master_{token}"
-    full_link = f"https://t.me/{settings.bot_username}?start={payload}" if settings.bot_username else None
-    return {"payload": payload, "link": full_link}
+    return {"payload": f"master_{token}", "link": None}
 
 
 # ── Admin: portfolio мастеров ────────────────────────────────────────────────

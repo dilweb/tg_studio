@@ -1,7 +1,7 @@
 [project]
 name = "tg-studio"
 version = "0.1.0"
-description = "Telegram Mini App для записи на сеанс с оплатой через Kaspi Pay"
+description = "CRM коворкинга: брони мест мастерами, предоплата через Kaspi Pay"
 authors = [
     {name = "dilweb", email = "yxs.crevier@gmail.com"}
 ]
@@ -21,7 +21,6 @@ dependencies = [
     "python-dotenv>=1.0",
     "python-multipart>=0.0.20",
     "ruff (>=0.15.8,<0.16.0)",
-    "openai>=1.0",
     "pyjwt (>=2.12.1,<3.0.0)",
     "passlib[bcrypt] (>=1.7.4,<2.0.0)",
     "bcrypt (>=3.2.0,<4.0.0)",
@@ -34,20 +33,12 @@ dependencies = [
     "openpyxl (==3.1.5)",
 ]
 
-[project.optional-dependencies]
-dev = [
-    "pytest>=8.0",
-    "pytest-asyncio>=0.24",
-    "httpx>=0.28",
-    "ruff>=0.15.8",
-]
-
-[tool.poetry]
-packages = [{include = "tg_studio", from = "src"}]
-
 [build-system]
-requires = ["poetry-core>=2.0.0,<3.0.0"]
-build-backend = "poetry.core.masonry.api"
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/tg_studio"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

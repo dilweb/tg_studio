@@ -8,8 +8,6 @@ const loading = ref(true)
 const error = ref('')
 
 // ── Профиль бизнеса: название, описание, телефон ─────────────────────────────
-// description — база знаний AI-агента (ресепшн бота): он отвечает клиентам
-// о студии только из этого текста.
 const editingInfo = ref(false)
 const infoBusy = ref(false)
 const infoSaved = ref(false)
@@ -44,84 +42,6 @@ async function saveInfo() {
     error.value = err.detail ?? err.message
   } finally {
     infoBusy.value = false
-  }
-}
-
-// ── Прайс: глобальный % и все коэффициенты ───────────────────────────────────
-const pricing = reactive({
-  global_percent: 100,
-  prepay_percent: 30,
-  size_rates: { xs: 0, s: 0, m: 0, l: 0 },
-  style_factors: {},
-  zone_factors: { std: 1, elevated: 1.2, critical: 1.4 },
-  coverup_factor: 1.4,
-})
-const pricingBusy = ref(false)
-const pricingSaved = ref(false)
-const defaultStyles = [
-  'Минимализм (Minimalism)',
-  'Лайнворк (Linework)',
-  'Леттеринг (Lettering)',
-  'Хэндпоук (Handpoke)',
-  'Традиционный (Traditional / Old School)',
-  'Нью-скул (New School)',
-  'Геометрия (Geometry)',
-  'Акварель (Watercolor)',
-  'Орнаментал (Ornamental)',
-  'Дотворк (Dotwork)',
-  'Трайбл (Tribal)',
-  'Нео-традишнл (Neo-Traditional)',
-  'Чикано (Chicano)',
-  'Эскизный / Скетч стайл (Sketch style)',
-  'Реализм (Realism)',
-  'Блэкворк (Blackwork)',
-  'Графика / Гравюра (Engraving / Woodcut)',
-  'Японский (Irezumi)',
-  'Киберпанк / Трэш-полька (Cyberpunk / Trash Polka)',
-  'Биомеханика / Биоорганика (Biomechanics / Bioorganic)',
-]
-// Короткое имя стиля для подписи («Минимализм» вместо полного значения справочника)
-const shortStyle = (s) => s.split(' (')[0]
-
-async function loadPricing() {
-  if (!info.value) return
-  const cfg = info.value.pricing_config
-  if (!cfg) return
-  pricing.global_percent = cfg.global_percent ?? 100
-  pricing.prepay_percent = cfg.prepay_percent ?? 30
-  Object.assign(pricing.size_rates, cfg.size_rates ?? {})
-  pricing.style_factors = { ...(cfg.style_factors ?? {}) }
-  Object.assign(pricing.zone_factors, cfg.zone_factors ?? {})
-  pricing.coverup_factor = cfg.coverup_factor ?? 1.4
-}
-
-async function savePricing() {
-  pricingBusy.value = true
-  pricingSaved.value = false
-  error.value = ''
-  try {
-    const num = (v) => (v === '' || v == null ? 0 : Number(v))
-    info.value = await api.put('/api/admin/business/pricing', {
-      global_percent: Number(pricing.global_percent) || 100,
-      prepay_percent: num(pricing.prepay_percent),
-      size_rates: Object.fromEntries(
-        Object.entries(pricing.size_rates).map(([k, v]) => [k, num(v)]),
-      ),
-      style_factors: Object.fromEntries(
-        Object.entries(pricing.style_factors).map(([k, v]) => [k, Number(v) || 1]),
-      ),
-      zone_factors: Object.fromEntries(
-        Object.entries(pricing.zone_factors).map(([k, v]) => [k, Number(v) || 1]),
-      ),
-      coverup_factor: Number(pricing.coverup_factor) || 1.4,
-    })
-    await loadPricing()
-    pricingSaved.value = true
-    setTimeout(() => (pricingSaved.value = false), 3000)
-  } catch (err) {
-    error.value = err.detail ?? err.message
-  } finally {
-    pricingBusy.value = false
   }
 }
 
@@ -204,7 +124,6 @@ onMounted(async () => {
   } finally {
     loading.value = false
   }
-  await loadPricing()
   await loadGcalStatus()
 })
 </script>
@@ -238,10 +157,6 @@ onMounted(async () => {
           <div class="field">
             <label for="b-desc">Описание студии</label>
             <textarea id="b-desc" v-model="infoForm.description" rows="5"></textarea>
-            <div class="muted" style="font-size: 12px; margin-top: 4px">
-              Этот текст знает AI-ассистент в боте: адрес, как найти вход, условия студии.
-              Клиенту о том, чего здесь нет (цены и т.п.), он скажет «обсудите с мастером».
-            </div>
           </div>
           <div class="field" style="max-width: 280px">
             <label for="b-phone">Телефон</label>
@@ -257,7 +172,7 @@ onMounted(async () => {
             {{ info.description }}
           </div>
           <div v-else class="muted" style="margin-bottom: 12px; font-size: 13px">
-            Описание не заполнено — AI-ассистенту нечего рассказать клиентам о студии
+            Описание не заполнено
           </div>
           <div style="display: flex; gap: 24px; flex-wrap: wrap; font-size: 13px">
             <div>
@@ -270,71 +185,6 @@ onMounted(async () => {
             </div>
           </div>
         </template>
-      </div>
-
-      <div class="card">
-        <div class="section-head">
-          <h2>Прайс и коэффициенты</h2>
-          <span v-if="pricingSaved" class="badge badge-green">Сохранено</span>
-        </div>
-        <p class="muted" style="font-size: 13px; margin-bottom: 16px">
-          Рекомендуемая цена в форме записи считается по формуле:
-          ставка размера × стиль × зона × доп., затем — глобальный процент.
-          <strong>Глобальный процент 100 — базовый прайс</strong>; ниже — скидки/акции,
-          выше — наценка.
-        </p>
-
-        <div style="display: flex; gap: 16px; flex-wrap: wrap; margin-bottom: 16px">
-          <div>
-            <label class="muted" style="display: block; font-size: 13px; margin-bottom: 4px">
-              Глобальный процент, %
-            </label>
-            <input v-model="pricing.global_percent" type="number" min="10" max="500" step="1" style="max-width: 120px" />
-          </div>
-          <div>
-            <label class="muted" style="display: block; font-size: 13px; margin-bottom: 4px">
-              Предоплата брони, %
-            </label>
-            <input v-model="pricing.prepay_percent" type="number" min="0" max="100" step="5" style="max-width: 120px" />
-            <div class="muted" style="font-size: 12px; margin-top: 2px">счёт при подтверждении мастера; 0 — без предоплаты</div>
-          </div>
-          <div>
-            <label class="muted" style="display: block; font-size: 13px; margin-bottom: 4px">
-              Cover-up / шрам (×)
-            </label>
-            <input v-model="pricing.coverup_factor" type="number" min="0.1" max="10" step="0.05" style="max-width: 120px" />
-          </div>
-        </div>
-
-        <div class="muted" style="font-size: 13px; margin-bottom: 6px">Ставки размера, ₸ (по длинной стороне)</div>
-        <div style="display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 16px">
-          <div v-for="(label, key) in { xs: 'XS ≤ 5', s: 'S ≤ 10', m: 'M ≤ 20', l: 'L > 20' }" :key="key">
-            <label class="muted" style="display: block; font-size: 12px; margin-bottom: 4px">{{ label }} см</label>
-            <input v-model="pricing.size_rates[key]" type="number" min="0" style="max-width: 130px" />
-          </div>
-        </div>
-
-        <div class="muted" style="font-size: 13px; margin-bottom: 6px">Коэффициенты зон (×)</div>
-        <div style="display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 16px">
-          <div v-for="(label, key) in { std: 'Стандарт', elevated: 'Повышенная', critical: 'Критическая' }" :key="key">
-            <label class="muted" style="display: block; font-size: 12px; margin-bottom: 4px">{{ label }}</label>
-            <input v-model="pricing.zone_factors[key]" type="number" min="0.1" max="10" step="0.05" style="max-width: 110px" />
-          </div>
-        </div>
-
-        <div class="muted" style="font-size: 13px; margin-bottom: 6px">Коэффициенты стилей (×)</div>
-        <div class="styles-grid">
-          <div v-for="s in defaultStyles" :key="s">
-            <label class="muted" style="display: block; font-size: 12px; margin-bottom: 4px">{{ shortStyle(s) }}</label>
-            <input v-model="pricing.style_factors[s]" type="number" min="0.1" max="10" step="0.05" />
-          </div>
-        </div>
-
-        <div style="margin-top: 16px">
-          <button class="btn btn-primary" :disabled="pricingBusy" @click="savePricing">
-            {{ pricingBusy ? 'Сохраняем…' : 'Сохранить прайс' }}
-          </button>
-        </div>
       </div>
 
       <div class="card">
@@ -417,15 +267,3 @@ onMounted(async () => {
     </div>
   </div>
 </template>
-
-<style scoped>
-.styles-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
-  gap: 10px 12px;
-}
-.styles-grid input {
-  width: 100%;
-  max-width: 130px;
-}
-</style>

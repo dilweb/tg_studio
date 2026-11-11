@@ -64,24 +64,11 @@ services:
     volumes:
       # Ключ сервисного аккаунта Google (читается при POST /connect)
       - ./credentials.json:/app/credentials.json:ro
-      # Фото сеансов tattoo-модуля (UPLOAD_DIR): bind mount — папка видна
+      # Фото портфолио/аватары мастеров (UPLOAD_DIR): bind mount — папка видна
       # на хосте, на VPS переезжает rsync'ом целиком
       - ./data/uploads:/app/uploads
     ports:
       - "8000:8000"
-    depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-
-  bot:
-    build: .
-    restart: unless-stopped
-    command: python -m tg_studio.bot.app
-    env_file: .env
-    environment:
-      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-tg_studio}:${POSTGRES_PASSWORD:-secret}@postgres:5432/${POSTGRES_DB:-tg_studio}
     depends_on:
       postgres:
         condition: service_healthy

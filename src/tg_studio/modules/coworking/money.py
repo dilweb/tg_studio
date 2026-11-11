@@ -15,7 +15,10 @@
     что счёт есть; оплата приходит вебхуком (дедуп по external id + сверка
     суммы — в payments/api.py);
   - balance — charge с баланса (в пределах остатка, lock мастера);
-- вебхук/manual-отметка paid → topup + бронь подтверждена (paid_amount=final);
+- вебхук/manual-отметка paid → topup + charge на final + бронь подтверждена
+  (paid_amount=final; деньги счёта не остаются на балансе, излишек счёта — остаётся);
+  счёт, не покрывающий актуальную цену, бронь не подтверждает (остаётся на балансе);
+- перенос/отмена/оплата с баланса/истечение hold закрывают pending-счета брони;
 - hold_deadline прошёл → истекла_оплата + счёт expired (beat booking_holds);
 - отмена подтверждённой брони: раньше чем за cancel_full_refund_hours до
   начала → refund 100%; позже → удержание no_show_hold_percent % (т.е.
@@ -50,14 +53,14 @@ from tg_studio.db.models import (
     PaymentStatus,
 )
 from tg_studio.modules.coworking.pricing import CURRENCY
-from tg_studio.modules.coworking.service import add_booking_event, coworking_settings
+from tg_studio.modules.coworking.service import add_booking_event, coworking_settings, lock_booking
 from tg_studio.modules.payments.providers import (
     InvoiceContext,
     PaymentProviderError,
     apipay_configured,
     get_provider,
+    normalize_phone as _normalize_phone,
 )
-from tg_studio.modules.payments.service import normalize_phone as _normalize_phone
 
 logger = logging.getLogger(__name__)
 
@@ -193,6 +196,51 @@ async def create_booking_invoice(
     return payment
 
 
+async def create_topup_invoice(
+    session, business: Business, master: Master, amount: Decimal, user_id: int
+) -> Payment:
+    """Счёт apipay (Kaspi) на пополнение баланса мастера: оплата приходит вебхуком → topup.
+
+    Только онлайн: manual-счёт мастер не смог бы подтвердить сам (деньги принимает
+    владелец/админ через /masters/{id}/topup). Нет apipay / телефона → 409.
+    """
+    amount = _round2(amount)
+    if amount <= 0:
+        raise HTTPException(status_code=400, detail="Сумма пополнения должна быть положительной")
+    if amount != amount.to_integral_value():
+        raise HTTPException(status_code=400, detail="Kaspi принимает только целые тенге")
+    phone = _normalize_phone(master.phone)
+    if not (apipay_configured() and phone):
+        raise HTTPException(
+            status_code=409,
+            detail="Онлайн-пополнение недоступно (Kaspi не подключён или у мастера нет телефона) — внесите деньги у администратора",
+        )
+    payment = Payment(
+        business_id=business.id,
+        amount=float(amount),
+        kind=PaymentKind.prepay.value,
+        status=PaymentStatus.pending.value,
+        provider=PaymentProvider.apipay.value,
+        created_by_user_id=user_id,
+        master_id=master.id,
+        note="Пополнение баланса (Kaspi)",
+    )
+    session.add(payment)
+    await session.flush()
+    try:
+        created = await get_provider(PaymentProvider.apipay.value).create_invoice(
+            payment,
+            InvoiceContext(client_phone=phone, client_name=master.full_name, description="Пополнение баланса"),
+        )
+    except PaymentProviderError as exc:
+        await session.rollback()
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    payment.external_invoice_id = created.external_id
+    payment.payment_url = created.payment_url
+    payment.expires_at = created.expires_at
+    return payment
+
+
 async def apply_payment_paid(
     session, payment: Payment, *, paid_at: datetime | None = None, actor_user_id: int | None = None
 ) -> bool:
@@ -223,8 +271,10 @@ async def apply_payment_paid(
         payment.paid_at = paid_at or datetime.now(UTC)
     if actor_user_id is not None:
         payment.confirmed_by_user_id = actor_user_id
+    if payment.master_id is None:
+        return True  # счёт без мастера — счёта в ledger нет, только статус
 
-    await _add_entry(
+    topup = await _add_entry(
         session,
         business_id=payment.business_id,
         master_id=payment.master_id,
@@ -237,13 +287,44 @@ async def apply_payment_paid(
     )
 
     if payment.booking_id is not None:
-        booking = await session.get(Booking, payment.booking_id)
+        # FOR UPDATE: sweep holds не должен параллельно перевести бронь в истекла_оплата
+        booking = (
+            await session.execute(
+                for_update(
+                    select(Booking)
+                    .where(Booking.id == payment.booking_id)
+                    .execution_options(populate_existing=True),
+                    session,
+                )
+            )
+        ).scalar_one_or_none()
+        # Подтверждаем, только если счёт покрывает актуальную цену. Старый счёт
+        # (цена брони с тех пор изменилась) просто остаётся деньгами на балансе.
+        if booking is not None and booking.status != BookingStatus.pending_payment.value:
+            # оплата пришла после истечения/отмены/оплаты другим способом — деньги на балансе, скажем об этом
+            topup.note = f"{payment.note or 'Оплата счёта'} — бронь #{booking.id} уже «{booking.status}», сумма зачислена на баланс"
         if booking is not None and booking.status == BookingStatus.pending_payment.value:
             price = booking_price(booking)
-            booking.paid_amount = float(_round2(_dec(payment.amount) + _dec(booking.paid_amount)))
-            if _dec(booking.paid_amount) >= price:
+            if _dec(payment.amount) < price:
+                topup.note = f"{payment.note or 'Оплата счёта'} — не покрывает цену брони #{booking.id}, сумма зачислена на баланс"
+            if _dec(payment.amount) >= price:
+                booking.paid_amount = float(_round2(price))
                 booking.status = BookingStatus.confirmed.value
                 booking.hold_deadline = None
+                # topup положил деньги на счёт мастера — списываем стоимость брони,
+                # иначе оплаченные деньги остались бы на балансе и тратились повторно
+                await _add_entry(
+                    session,
+                    business_id=booking.business_id,
+                    master_id=booking.master_id,
+                    kind=LedgerEntryKind.charge,
+                    amount=-price,
+                    payment_id=payment.id,
+                    booking_id=booking.id,
+                    actor_user_id=actor_user_id,
+                    note=f"Оплата брони места #{booking.id} по счёту",
+                )
+                await close_booking_invoices(session, booking, PaymentStatus.cancelled)
                 add_booking_event(
                     session,
                     booking.business_id,
@@ -270,6 +351,7 @@ async def pay_booking_from_balance(
     Бронь должна быть ожидает_оплаты; цена — из снимка. Недостаточно средств
     → 409. Успех → charge + paid_amount=final + подтверждена + событие.
     """
+    await lock_booking(session, booking)
     if booking.status != BookingStatus.pending_payment.value:
         raise HTTPException(
             status_code=409, detail=f"Оплатить с баланса можно только ожидающую оплаты бронь (сейчас: {booking.status})"
@@ -293,6 +375,7 @@ async def pay_booking_from_balance(
     booking.paid_amount = float(_round2(price))
     booking.status = BookingStatus.confirmed.value
     booking.hold_deadline = None
+    await close_booking_invoices(session, booking, PaymentStatus.cancelled)
     await _add_entry(
         session,
         business_id=business.id,
@@ -318,6 +401,57 @@ async def pay_booking_from_balance(
         },
     )
     return booking
+
+
+async def settle_price_change(
+    session, business: Business, booking: Booking, new_snapshot: dict, actor_user_id: int
+) -> Decimal:
+    """Доплата/возврат разницы при продлении оплаченной брони (подтверждена/начата).
+
+    Цена пересчитана целиком по актуальным правилам: delta = новая цена − уже
+    оплаченное. delta > 0 → charge с баланса (недостаточно → 409, бронь не
+    меняется); delta < 0 → refund разницы. После: paid_amount == новая цена.
+    Возвращает delta.
+    """
+    paid = _dec(booking.paid_amount)
+    new_price = _round2(_dec(new_snapshot["final"]))
+    delta = new_price - paid
+    if delta > 0:
+        await lock_master_slot(session, booking.master_id)
+        balance = await master_balance(session, booking.master_id)
+        if balance < delta:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "message": "Недостаточно средств на балансе для продления",
+                    "balance": float(balance),
+                    "required": float(delta),
+                    "currency": CURRENCY,
+                },
+            )
+        await _add_entry(
+            session,
+            business_id=business.id,
+            master_id=booking.master_id,
+            kind=LedgerEntryKind.charge,
+            amount=-delta,
+            booking_id=booking.id,
+            actor_user_id=actor_user_id,
+            note=f"Доплата за продление брони места #{booking.id}",
+        )
+    elif delta < 0:
+        await _add_entry(
+            session,
+            business_id=business.id,
+            master_id=booking.master_id,
+            kind=LedgerEntryKind.refund,
+            amount=-delta,
+            booking_id=booking.id,
+            actor_user_id=actor_user_id,
+            note=f"Возврат разницы при продлении брони места #{booking.id}",
+        )
+    booking.paid_amount = float(new_price)
+    return delta
 
 
 def cancel_refund_amount(booking: Booking, settings: dict, *, by_studio: bool) -> Decimal:
@@ -393,9 +527,14 @@ async def apply_cancellation_refund(
     return refund
 
 
-async def expire_booking_payment(session, booking: Booking) -> Payment | None:
-    """Истёкший hold: бронь → истекла_оплата, её pending-счёт → expired."""
-    payment = (
+async def close_booking_invoices(session, booking: Booking, status: PaymentStatus) -> list[Payment]:
+    """Закрыть все pending-счета брони (cancelled/expired): бронь больше не ждёт оплаты.
+
+    Внешний счёт apipay отменяем у провайдера; если он недоступен — локально счёт
+    всё равно закрыт, а запоздалая оплата по нему станет пополнением баланса
+    (apply_payment_paid подтверждает только pending-бронь).
+    """
+    payments = (
         await session.execute(
             for_update(
                 select(Payment).where(
@@ -405,10 +544,15 @@ async def expire_booking_payment(session, booking: Booking) -> Payment | None:
                 session,
             )
         )
-    ).scalar_one_or_none()
-    if payment is not None:
-        payment.status = PaymentStatus.expired.value
-    return payment
+    ).scalars().all()
+    for payment in payments:
+        if payment.provider == PaymentProvider.apipay.value and payment.external_invoice_id:
+            try:
+                await get_provider(payment.provider).cancel_invoice(payment)
+            except PaymentProviderError as exc:
+                logger.warning("Apipay cancel failed for payment %s: %s", payment.id, exc)
+        payment.status = status.value
+    return payments
 
 
 async def manual_topup(

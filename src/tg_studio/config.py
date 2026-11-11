@@ -35,7 +35,6 @@ class Settings(BaseSettings):
 
     # Telegram
     bot_token: str
-    bot_username: str = ""  # без @, для ссылки регистрации мастера (t.me/bot_username?start=...)
     miniapp_url: str = "https://localhost:3000"
 
     # Кто допущен в панель (миниаппа/дебаг): telegram id → роль.
@@ -45,11 +44,11 @@ class Settings(BaseSettings):
     # Database
     database_url: str = "postgresql+asyncpg://tg_studio:secret@localhost:5432/tg_studio"
 
-    # Локальное хранилище фото сеансов (tattoo-модуль): bind mount в контейнере.
+    # Локальное хранилище фото портфолио/аватаров: bind mount в контейнере.
     # Используется как fallback, если S3 не настроен.
     upload_dir: str = "/app/uploads"
 
-    # S3/MinIO — файловое хранилище (фото сеансов, портфолио, аватары).
+    # S3/MinIO — файловое хранилище (портфолио, аватары).
     # Все четыре переменные заданы → файлы пишутся в бакет, метаданные
     # остаются в Postgres. Пусто → диск (upload_dir).
     s3_endpoint_url: str = ""  # напр. http://minio:9000
@@ -65,22 +64,8 @@ class Settings(BaseSettings):
     # Public URL for email verification links
     public_url: str = ""
 
-    # Публичный URL API (для абсолютных ссылок из бота, напр. портфолио мастеров)
+    # Публичный URL API (для абсолютных ссылок, напр. портфолио мастеров)
     api_public_url: str = ""
-
-    # LLM (OpenAI-compatible: OpenAI, Gemini, etc.)
-    llm_api_key: str = ""
-    llm_base_url: str = ""
-    llm_model: str = ""
-    # Основная модель AI-ассистента: мультимодальная — видит фото клиентов
-    # (эскизы, референсы). Пусто = использовать llm_model
-    llm_multimodal_model: str = ""
-    # Лёгкая модель-классификатор (роутер клиентских сообщений агент/мастер);
-    # пусто = использовать llm_model
-    llm_router_model: str = ""
-    # Таймаут одного вызова LLM (сек): дефолт SDK 600с позволял зависшему
-    # вызову часами держать per-client lock хода агента
-    llm_timeout_seconds: float = 90.0
 
     # JWT. Пустой secret не принимаем: при пустом генерируем случайный
     # (локалка/тесты) и логируем предупреждение — иначе подписи подделает
@@ -192,12 +177,6 @@ class Settings(BaseSettings):
         return bool(
             self.s3_endpoint_url and self.s3_bucket and self.s3_access_key and self.s3_secret_key
         )
-
-    @property
-    def assistant_model(self) -> str:
-        """Модель AI-ассистента: мультимодальная, если задана (видит фото
-        клиентов — эскизы и референсы), иначе обычная llm_model."""
-        return self.llm_multimodal_model or self.llm_model
 
 
 settings = Settings()

@@ -9,7 +9,7 @@
 """
 
 import logging
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime, time, timedelta
 
 from fastapi import APIRouter, HTTPException, Query, Response
 from sqlalchemy import func, select
@@ -22,8 +22,11 @@ from tg_studio.api.admin_deps import (
 )
 from tg_studio.api.auth import CurrentUserDep
 from tg_studio.api.deps import SessionDep
+from tg_studio.db.locks import lock_business_seats
+from tg_studio.timeutil import is_valid_window
 from tg_studio.db.models import (
     ACTIVE_BOOKING_STATUSES,
+    RELEASED_BOOKING_STATUSES,
     Booking,
     BookingEvent,
     Business,
@@ -55,6 +58,7 @@ from tg_studio.modules.coworking.schemas import (
     BlockOut,
     BookingCancel,
     BookingCreate,
+    BookingExtend,
     BookingEventOut,
     BookingHistoryResponse,
     BookingListResponse,
@@ -108,6 +112,8 @@ from tg_studio.modules.coworking.schemas import (
     StudioHoursResponse,
     StudioHoursUpdate,
     TopupRequest,
+    MyTopupRequest,
+    MyTopupResponse,
     TopupResponse,
 )
 
@@ -191,11 +197,21 @@ async def _booking_out(session, booking: Booking, *, with_payment: bool = False)
     )
 
 
+MAX_CALENDAR_RANGE = timedelta(days=62)
+
+
 def _range_params(from_: datetime, to: datetime) -> tuple[datetime, datetime]:
     from_ = cw.ensure_tz(from_)
     to = cw.ensure_tz(to)
     if to <= from_:
         raise HTTPException(status_code=400, detail="to должен быть позже from")
+    return from_, to
+
+
+def _calendar_range(from_: datetime, to: datetime) -> tuple[datetime, datetime]:
+    from_, to = _range_params(from_, to)
+    if to - from_ > MAX_CALENDAR_RANGE:
+        raise HTTPException(status_code=400, detail=f"Диапазон календаря — не больше {MAX_CALENDAR_RANGE.days} дней")
     return from_, to
 
 
@@ -219,6 +235,7 @@ async def list_seats(session: SessionDep, actor: MasterBusinessAndSelfDep, inclu
 async def create_seat(body: SeatCreate, session: SessionDep, business: OwnerBusinessDep):
     """Новое место. Лимит мест (max_seats, дефолт 4) — из настроек коворкинга."""
     settings = cw.coworking_settings(business)
+    await lock_business_seats(session, business.id)
     count = (
         await session.execute(
             select(Seat).where(Seat.business_id == business.id, Seat.is_active.is_(True))
@@ -233,12 +250,28 @@ async def create_seat(body: SeatCreate, session: SessionDep, business: OwnerBusi
         business_id=business.id,
         name=body.name.strip(),
         equipment=body.equipment,
-        sort_order=len(count),
+        sort_order=max((x.sort_order for x in count), default=-1) + 1,
     )
     session.add(seat)
     await session.commit()
     await session.refresh(seat)
     return SeatOut.model_validate(seat)
+
+
+async def _assert_seat_deactivation_allowed(session, seat: Seat) -> None:
+    """Место с активными бронями выключать нельзя — сначала отмените их."""
+    active = (
+        await session.execute(
+            select(func.count()).select_from(Booking).where(
+                Booking.seat_id == seat.id, Booking.status.in_(ACTIVE_BOOKING_STATUSES)
+            )
+        )
+    ).scalar_one()
+    if active:
+        raise HTTPException(
+            status_code=409,
+            detail=f"У места есть активные брони ({active} шт.) — сначала отмените их",
+        )
 
 
 @router.patch("/seats/{seat_id}", response_model=SeatOut)
@@ -247,6 +280,24 @@ async def update_seat(
 ):
     seat = await _get_seat(session, business.id, seat_id, include_inactive=True)
     data = body.model_dump(exclude_unset=True)
+    if data.get("is_active") is False and seat.is_active:
+        await cw.lock_seat_slot(session, seat.id)
+        await _assert_seat_deactivation_allowed(session, seat)
+    if data.get("is_active") is True and not seat.is_active:
+        await lock_business_seats(session, business.id)
+        active_count = (
+            await session.execute(
+                select(func.count()).select_from(Seat).where(
+                    Seat.business_id == business.id, Seat.is_active.is_(True)
+                )
+            )
+        ).scalar_one()
+        limit = cw.coworking_settings(business)["max_seats"]
+        if active_count >= limit:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Достигнут лимит мест ({limit}) — измените в настройках коворкинга",
+            )
     for field, value in data.items():
         setattr(seat, field, value)
     await session.commit()
@@ -258,18 +309,8 @@ async def update_seat(
 async def delete_seat(seat_id: int, session: SessionDep, business: OwnerBusinessDep):
     """Мягкое удаление. Нельзя удалить место с активными бронями."""
     seat = await _get_seat(session, business.id, seat_id, include_inactive=True)
-    active = (
-        await session.execute(
-            select(Booking).where(
-                Booking.seat_id == seat.id, Booking.status.in_(ACTIVE_BOOKING_STATUSES)
-            )
-        )
-    ).scalars().all()
-    if active:
-        raise HTTPException(
-            status_code=409,
-            detail=f"У места есть активные брони ({len(active)} шт.) — сначала отмените их",
-        )
+    await cw.lock_seat_slot(session, seat.id)
+    await _assert_seat_deactivation_allowed(session, seat)
     seat.is_active = False
     await session.commit()
     return Response(status_code=204)
@@ -292,7 +333,7 @@ async def update_coworking_settings(
 ):
     """Частичное обновление; None-поля не трогаем. max_seats не может быть
     меньше числа уже созданных активных мест."""
-    current = business.coworking_settings if isinstance(business.coworking_settings, dict) else {}
+    current = dict(business.coworking_settings) if isinstance(business.coworking_settings, dict) else {}
     data = body.model_dump(exclude_unset=True)
     if "max_seats" in data and data["max_seats"] is not None:
         active_count = len(
@@ -338,13 +379,25 @@ async def get_studio_hours(session: SessionDep, actor: MasterBusinessAndSelfDep)
 async def put_studio_hours(
     body: StudioHoursUpdate, session: SessionDep, business: OwnerBusinessDep
 ):
-    """Полная замена расписания. Интервал внутри одного дня (open < close)."""
+    """Полная замена расписания. Интервал внутри одного дня (open < close,
+    close 00:00 = до полуночи). День без интервалов — выходной; пустой список —
+    сброс к дефолту (10:00–22:00 каждый день)."""
+    # close_time 00:00 = «до полуночи»; иначе открытие раньше закрытия
+    by_day: dict[int, list[tuple[datetime, datetime]]] = {}
     for e in body.entries:
-        if not (e.open_time < e.close_time):
+        if e.close_time != time(0, 0) and not (e.open_time < e.close_time):
             raise HTTPException(
                 status_code=400,
                 detail=f"День {e.weekday}: открытие должно быть раньше закрытия",
             )
+        by_day.setdefault(e.weekday, []).append(cw.interval_bounds(date(2000, 1, 3), e.open_time, e.close_time))
+    for weekday, intervals in by_day.items():
+        intervals.sort()
+        for (_, prev_end), (next_start, _) in zip(intervals, intervals[1:], strict=False):
+            if next_start < prev_end:
+                raise HTTPException(
+                    status_code=400, detail=f"День {weekday}: интервалы работы пересекаются"
+                )
     # Удаляем старые и вставляем новые — полная замена
     old = (
         await session.execute(
@@ -377,9 +430,14 @@ async def _calendar_entries(
     from_: datetime,
     to: datetime,
     seat_id: int | None,
+    viewer_master_id: int | None = None,
 ) -> list[CalendarEntry]:
     """Брони + блокировки в диапазоне. seat_id=None — вся студия;
-    для календаря места добавляем блокировки всей студии (seat_id IS NULL)."""
+    для календаря места добавляем блокировки всей студии (seat_id IS NULL).
+
+    viewer_master_id — смотрит мастер: чужие брони и блокировки отдаём как
+    kind="busy" (только место и часы, без мастера, статуса и причины);
+    свои брони — полностью."""
     booking_stmt = (
         select(Booking, Seat.name, Master.full_name)
         .join(Seat, Seat.id == Booking.seat_id)
@@ -388,6 +446,8 @@ async def _calendar_entries(
             Booking.business_id == business_id,
             Booking.start < to,
             Booking.end > from_,
+            # отменённые/истёкшие брони место не занимают — в календаре им не место
+            Booking.status.notin_(RELEASED_BOOKING_STATUSES),
         )
     )
     if seat_id is not None:
@@ -431,6 +491,16 @@ async def _calendar_entries(
         )
         for b, seat_name in block_rows
     ]
+    if viewer_master_id is not None:
+        own = {b.id for b, _, _ in booking_rows if b.master_id == viewer_master_id}
+        entries = [
+            e
+            if e.kind == "booking" and e.id in own
+            else CalendarEntry(
+                kind="busy", id=e.id, seat_id=e.seat_id, start=e.start, end=e.end, seat_name=e.seat_name
+            )
+            for e in entries
+        ]
     entries.sort(key=lambda e: (e.start, e.kind))
     return entries
 
@@ -443,10 +513,12 @@ async def seat_calendar(
     from_: datetime = Query(..., alias="from"),
     to: datetime = Query(...),
 ):
-    business, _ = actor
+    business, self_master = actor
     await _get_seat(session, business.id, seat_id, include_inactive=True)
-    from_, to = _range_params(from_, to)
-    entries = await _calendar_entries(session, business.id, from_, to, seat_id)
+    from_, to = _calendar_range(from_, to)
+    entries = await _calendar_entries(
+        session, business.id, from_, to, seat_id, viewer_master_id=self_master.id if self_master else None
+    )
     return CalendarResponse(**{"from": from_, "to": to, "entries": entries})
 
 
@@ -459,9 +531,11 @@ async def studio_calendar(
     seat_id: int | None = Query(None),
 ):
     """Общий календарь студии (все места), опционально с фильтром по месту."""
-    business, _ = actor
-    from_, to = _range_params(from_, to)
-    entries = await _calendar_entries(session, business.id, from_, to, seat_id)
+    business, self_master = actor
+    from_, to = _calendar_range(from_, to)
+    entries = await _calendar_entries(
+        session, business.id, from_, to, seat_id, viewer_master_id=self_master.id if self_master else None
+    )
     return CalendarResponse(**{"from": from_, "to": to, "entries": entries})
 
 
@@ -478,11 +552,18 @@ async def availability(
     end: datetime = Query(...),
 ):
     """Какие места свободны на интервале [start, end)."""
-    business, _ = actor
+    business, self_master = actor
     start, end = cw.ensure_tz(start), cw.ensure_tz(end)
     if end <= start:
         raise HTTPException(status_code=400, detail="end должен быть позже start")
     settings = cw.coworking_settings(business)
+    # те же границы и правило мастера, что и при создании брони
+    cw.assert_booking_bounds(start, end, settings, await cw._studio_hours_map(session, business.id))
+    if self_master is not None:
+        try:
+            await cw.assert_master_free(session, business.id, self_master.id, start, end)
+        except HTTPException:  # у мастера уже есть бронь на это время — свободных мест для него нет
+            return AvailabilityResponse(start=start, end=end, free_seats=[])
     seats = (
         await session.execute(
             select(Seat).where(Seat.business_id == business.id, Seat.is_active.is_(True))
@@ -506,8 +587,11 @@ async def list_bookings(
     status: str | None = Query(None),
     from_: datetime | None = Query(None, alias="from"),
     to: datetime | None = Query(None),
+    limit: int = Query(200, ge=1, le=500),
+    offset: int = Query(0, ge=0),
 ):
-    """Мастер видит только свои брони; владелец — все. Фильтры: место, статус, диапазон."""
+    """Мастер видит только свои брони; владелец — все. Фильтры: место, статус, диапазон.
+    Страницы: limit/offset, в ответе total — всего под фильтр."""
     business, self_master = actor
     stmt = select(Booking).where(Booking.business_id == business.id)
     if self_master is not None:
@@ -520,9 +604,12 @@ async def list_bookings(
         stmt = stmt.where(Booking.end > cw.ensure_tz(from_))
     if to is not None:
         stmt = stmt.where(Booking.start < cw.ensure_tz(to))
-    stmt = stmt.order_by(Booking.start)
+    total = (await session.execute(select(func.count()).select_from(stmt.subquery()))).scalar_one()
+    stmt = stmt.order_by(Booking.start, Booking.id).limit(limit).offset(offset)
     rows = (await session.execute(stmt)).scalars().all()
-    return BookingListResponse(bookings=[await _booking_out(session, b) for b in rows])
+    return BookingListResponse(
+        bookings=[await _booking_out(session, b) for b in rows], total=total, limit=limit, offset=offset
+    )
 
 
 @router.post("/bookings", response_model=BookingOut, status_code=201)
@@ -602,6 +689,26 @@ async def reschedule_booking(
     await cw.reschedule_booking(
         session, business, booking, body.start, body.end, user.id, note=body.note
     )
+    await session.commit()
+    await session.refresh(booking)
+    return await _booking_out(session, booking)
+
+
+@router.post("/bookings/{booking_id}/extend", response_model=BookingOut)
+async def extend_booking(
+    booking_id: int,
+    body: BookingExtend,
+    session: SessionDep,
+    actor: MasterBusinessAndSelfDep,
+    user: CurrentUserDep,
+):
+    """Продление на целые часы (конец сдвигается). Оплаченную бронь — с доплатой
+    разницы цены с баланса мастера."""
+    business, self_master = actor
+    booking = await _get_booking(session, business.id, booking_id)
+    if self_master is not None and booking.master_id != self_master.id:
+        raise HTTPException(status_code=403, detail="Мастер продлевает только свои брони")
+    await cw.extend_booking(session, business, booking, body.hours, user.id, note=body.note)
     await session.commit()
     await session.refresh(booking)
     return await _booking_out(session, booking)
@@ -733,7 +840,7 @@ async def booking_history(booking_id: int, session: SessionDep, actor: MasterBus
 @router.get("/blocks", response_model=BlockListResponse)
 async def list_blocks(
     session: SessionDep,
-    actor: MasterBusinessAndSelfDep,
+    actor: AdminBusinessAndSelfDep,  # причины блокировок мастеру не показываем — ему хватает /calendar
     seat_id: int | None = Query(None),
     from_: datetime | None = Query(None, alias="from"),
     to: datetime | None = Query(None),
@@ -773,6 +880,9 @@ async def create_block(
             ).scalars().all()
         ]
     # Блокировка конфликтует с активными бронями — проверяем по каждому месту
+    # (локи в порядке id: параллельная бронь того же места ждёт, а не проскакивает)
+    for sid in sorted(seat_ids):
+        await cw.lock_seat_slot(session, sid)
     for sid in seat_ids:
         conflicts = await cw.find_seat_conflicts(session, business.id, sid, start, end)
         booking_conflicts = [c for c in conflicts if c[0] == "booking"]
@@ -887,8 +997,8 @@ async def update_price_rule(
         await _check_rule_seat(session, business, data["seat_id"])
     for field, value in data.items():
         setattr(rule, field, value)
-    if rule.time_from >= rule.time_to:
-        raise HTTPException(status_code=400, detail="time_from должен быть раньше time_to")
+    if not is_valid_window(rule.time_from, rule.time_to):
+        raise HTTPException(status_code=400, detail="time_from должен быть раньше time_to (или time_to=00:00 — до полуночи)")
     if rule.day_kind == "дата" and rule.specific_date is None:
         raise HTTPException(status_code=400, detail="Для day_kind='дата' укажите specific_date")
     await session.commit()
@@ -956,7 +1066,7 @@ async def update_discount_rule(
         await _check_rule_seat(session, business, data["seat_id"])
     for field, value in data.items():
         setattr(rule, field, value)
-    if rule.kind == "min_hours" and rule.min_hours is None:
+    if rule.min_hours is None:
         raise HTTPException(status_code=400, detail="Для kind='min_hours' укажите min_hours")
     if (rule.percent is None) == (rule.fixed_amount is None):
         raise HTTPException(status_code=400, detail="Задайте ровно одно: percent или fixed_amount")
@@ -1103,16 +1213,45 @@ async def my_balance(session: SessionDep, actor: MasterBusinessAndSelfDep):
     return BalanceOut(master_id=self_master.id, balance=float(balance), currency=money.CURRENCY)
 
 
+@router.post("/me/topups", response_model=MyTopupResponse, status_code=201)
+async def create_my_topup(
+    body: MyTopupRequest, session: SessionDep, actor: MasterBusinessAndSelfDep, user: CurrentUserDep
+):
+    """Счёт на пополнение своего баланса (Kaspi): ссылка на оплату; баланс вырастет вебхуком."""
+    from decimal import Decimal
+
+    business, self_master = actor
+    if self_master is None:
+        raise HTTPException(status_code=403, detail="Баланс есть только у мастера")
+    payment = await money.create_topup_invoice(
+        session, business, self_master, Decimal(str(body.amount)), user.id
+    )
+    await session.commit()
+    return MyTopupResponse(
+        payment_id=payment.id,
+        amount=float(payment.amount),
+        payment_url=payment.payment_url,
+        expires_at=payment.expires_at,
+        currency=money.CURRENCY,
+    )
+
+
 @router.get("/me/ledger", response_model=LedgerListResponse)
 async def my_ledger(
     session: SessionDep,
     actor: MasterBusinessAndSelfDep,
     limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
 ):
     """Выписка по счёту мастера (своя)."""
     business, self_master = actor
     if self_master is None:
         raise HTTPException(status_code=403, detail="Выписка есть только у мастера")
+    total = (
+        await session.execute(
+            select(func.count()).select_from(LedgerEntry).where(LedgerEntry.master_id == self_master.id)
+        )
+    ).scalar_one()
     rows = (
         await session.execute(
             select(LedgerEntry, Master.full_name)
@@ -1120,6 +1259,7 @@ async def my_ledger(
             .where(LedgerEntry.master_id == self_master.id)
             .order_by(LedgerEntry.id.desc())
             .limit(limit)
+            .offset(offset)
         )
     ).all()
     return LedgerListResponse(
@@ -1132,7 +1272,7 @@ async def my_ledger(
             )
             for e, mn in rows
         ],
-        total=len(rows),
+        total=total,
     )
 
 
@@ -1144,6 +1284,7 @@ async def list_ledger(
     from_: datetime | None = Query(None, alias="from"),
     to: datetime | None = Query(None),
     limit: int = Query(200, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
 ):
     """Журнал проводок бизнеса (владелец и администратор, 05). Фильтры: мастер, диапазон."""
     business, _ = actor
@@ -1158,7 +1299,12 @@ async def list_ledger(
         stmt = stmt.where(LedgerEntry.created_at >= cw.ensure_tz(from_))
     if to is not None:
         stmt = stmt.where(LedgerEntry.created_at < cw.ensure_tz(to))
-    rows = (await session.execute(stmt.order_by(LedgerEntry.id.desc()).limit(limit))).all()
+    total = (
+        await session.execute(select(func.count()).select_from(stmt.order_by(None).subquery()))
+    ).scalar_one()
+    rows = (
+        await session.execute(stmt.order_by(LedgerEntry.id.desc()).limit(limit).offset(offset))
+    ).all()
     return LedgerListResponse(
         entries=[
             LedgerEntryOut(
@@ -1169,7 +1315,7 @@ async def list_ledger(
             )
             for e, mn in rows
         ],
-        total=len(rows),
+        total=total,
     )
 
 

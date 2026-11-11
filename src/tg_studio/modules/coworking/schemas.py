@@ -4,6 +4,8 @@ from datetime import date, datetime, time
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+from tg_studio.timeutil import is_valid_window
+
 # ---------------------------------------------------------------------------
 # Места
 # ---------------------------------------------------------------------------
@@ -85,6 +87,7 @@ class CoworkingSettingsOut(BaseModel):
     # возврат; позже — удержание no_show_hold_percent %
     cancel_full_refund_hours: int
     no_show_hold_percent: int
+    no_show_grace_minutes: int
 
 
 class CoworkingSettingsUpdate(BaseModel):
@@ -95,6 +98,7 @@ class CoworkingSettingsUpdate(BaseModel):
     hold_ttl_hours: int | None = Field(None, ge=1, le=168)
     cancel_full_refund_hours: int | None = Field(None, ge=0, le=720)
     no_show_hold_percent: int | None = Field(None, ge=0, le=100)
+    no_show_grace_minutes: int | None = Field(None, ge=0, le=240)
 
 
 # ---------------------------------------------------------------------------
@@ -102,8 +106,13 @@ class CoworkingSettingsUpdate(BaseModel):
 # ---------------------------------------------------------------------------
 
 
+PRICE_DAY_KINDS = ("все", "будни", "выходные", "дата")
+DISCOUNT_KINDS = ("min_hours",)  # скидки резидентам не считаем — тариф резидента владелец задаёт сам
+
+
 class PriceRuleCreate(BaseModel):
-    """seat_id=None — правило на все места. day_kind="дата" требует specific_date."""
+    """seat_id=None — правило на все места. day_kind="дата" требует specific_date.
+    time_to=00:00 — до полуночи."""
 
     seat_id: int | None = None
     name: str = Field(..., min_length=1, max_length=128)
@@ -117,11 +126,11 @@ class PriceRuleCreate(BaseModel):
 
     @model_validator(mode="after")
     def _check_window(self):
-        if self.time_from >= self.time_to:
-            raise ValueError("time_from должен быть раньше time_to")
+        if not is_valid_window(self.time_from, self.time_to):
+            raise ValueError("time_from должен быть раньше time_to (или time_to=00:00 — до полуночи)")
         if self.day_kind == "дата" and self.specific_date is None:
             raise ValueError("Для day_kind='дата' укажите specific_date")
-        if self.day_kind not in ("все", "будни", "выходные", "дата"):
+        if self.day_kind not in PRICE_DAY_KINDS:
             raise ValueError("day_kind: все | будни | выходные | дата")
         return self
 
@@ -136,6 +145,13 @@ class PriceRuleUpdate(BaseModel):
     hourly_rate: float | None = Field(None, gt=0)
     priority: int | None = None
     is_active: bool | None = None
+
+    @field_validator("day_kind")
+    @classmethod
+    def _day_kind(cls, v):
+        if v is not None and v not in PRICE_DAY_KINDS:
+            raise ValueError("day_kind: все | будни | выходные | дата")
+        return v
 
 
 class PriceRuleOut(BaseModel):
@@ -161,12 +177,12 @@ class PriceRuleListResponse(BaseModel):
 
 
 class DiscountRuleCreate(BaseModel):
-    """kind: resident (только резиденты) | min_hours (при длительности от N часов).
+    """kind: min_hours (при длительности от N часов; порог и размер задаёт владелец).
     Ровно одно из percent (0..1) / fixed_amount должно быть задано."""
 
     seat_id: int | None = None
     name: str = Field(..., min_length=1, max_length=128)
-    kind: str  # resident | min_hours
+    kind: str = "min_hours"
     min_hours: int | None = Field(None, ge=1, le=720)
     percent: float | None = Field(None, gt=0, le=1)
     fixed_amount: float | None = Field(None, gt=0)
@@ -175,9 +191,9 @@ class DiscountRuleCreate(BaseModel):
 
     @model_validator(mode="after")
     def _check(self):
-        if self.kind not in ("resident", "min_hours"):
-            raise ValueError("kind: resident | min_hours")
-        if self.kind == "min_hours" and self.min_hours is None:
+        if self.kind not in DISCOUNT_KINDS:
+            raise ValueError("kind: min_hours")
+        if self.min_hours is None:
             raise ValueError("Для kind='min_hours' укажите min_hours")
         if (self.percent is None) == (self.fixed_amount is None):
             raise ValueError("Задайте ровно одно: percent или fixed_amount")
@@ -193,6 +209,13 @@ class DiscountRuleUpdate(BaseModel):
     fixed_amount: float | None = Field(None, gt=0)
     priority: int | None = None
     is_active: bool | None = None
+
+    @field_validator("kind")
+    @classmethod
+    def _kind(cls, v):
+        if v is not None and v not in DISCOUNT_KINDS:
+            raise ValueError("kind: min_hours")
+        return v
 
 
 class DiscountRuleOut(BaseModel):
@@ -315,6 +338,13 @@ class BookingReschedule(BaseModel):
     note: str | None = Field(None, max_length=2000)
 
 
+class BookingExtend(BaseModel):
+    """Продление: на сколько целых часов сдвинуть конец брони."""
+
+    hours: int = Field(..., ge=1, le=12)
+    note: str | None = Field(None, max_length=2000)
+
+
 class BookingCancel(BaseModel):
     reason: str | None = Field(None, max_length=500)
 
@@ -359,6 +389,9 @@ class BookingOut(BaseModel):
 
 class BookingListResponse(BaseModel):
     bookings: list[BookingOut]
+    total: int  # всего броней под фильтр (страница — limit/offset)
+    limit: int
+    offset: int
 
 
 class BookingEventOut(BaseModel):
@@ -396,7 +429,7 @@ class AvailabilityResponse(BaseModel):
 class CalendarEntry(BaseModel):
     """Одна запись календаря: бронь или блокировка (поле kind)."""
 
-    kind: str  # "booking" | "block"
+    kind: str  # "booking" | "block" | "busy" (мастеру — чужое занятое время)
     id: int
     seat_id: int | None
     start: datetime
@@ -462,6 +495,20 @@ class TopupRequest(BaseModel):
 
     amount: float = Field(..., gt=0)
     note: str | None = Field(None, max_length=2000)
+
+
+class MyTopupRequest(BaseModel):
+    """Пополнение своего баланса картой (счёт Kaspi)."""
+
+    amount: float = Field(..., gt=0)
+
+
+class MyTopupResponse(BaseModel):
+    payment_id: int
+    amount: float
+    payment_url: str | None
+    expires_at: datetime | None
+    currency: str
 
 
 class TopupResponse(BaseModel):
@@ -685,7 +732,7 @@ class PayoutListResponse(BaseModel):
 
 
 class OpsExceptionOut(BaseModel):
-    kind: str  # no_show | payment_expired | out_of_coverage_unconfirmed
+    kind: str  # no_show | payment_expired | out_of_coverage_unconfirmed | unclosed_past_booking
     booking_id: int
     seat_name: str | None
     master_name: str | None

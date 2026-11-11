@@ -7,7 +7,7 @@ API отдаёт ISO со смещением, а фронтенд конверт
 «сегодня» для промптов и человекочитаемые времена считаем в ней.
 """
 
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
 STUDIO_TZ = ZoneInfo("Asia/Almaty")
@@ -27,3 +27,16 @@ def to_studio_local(dt: datetime) -> datetime:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=UTC)
     return dt.astimezone(STUDIO_TZ)
+
+
+def interval_bounds(day: date, open_t: time, close_t: time) -> tuple[datetime, datetime]:
+    """Границы интервала времени суток в студийном времени. Конец 00:00 = до полуночи
+    (в time нельзя записать 24:00)."""
+    start = datetime.combine(day, open_t, tzinfo=STUDIO_TZ)
+    end = datetime.combine(day, close_t, tzinfo=STUDIO_TZ)
+    return start, end + timedelta(days=1) if close_t == time(0, 0) else end
+
+
+def is_valid_window(time_from: time, time_to: time) -> bool:
+    """Окно [from, to) в пределах суток: to=00:00 — до полуночи, иначе from < to."""
+    return time_to == time(0, 0) or time_from < time_to

@@ -21,7 +21,7 @@ from datetime import UTC, date, datetime, time, timedelta
 from fastapi import HTTPException
 from sqlalchemy import select
 
-from tg_studio.db.locks import lock_seat_slot
+from tg_studio.db.locks import for_update, lock_business_seats, lock_master_slot, lock_seat_slot
 from tg_studio.db.models import (
     ACTIVE_BOOKING_STATUSES,
     Booking,
@@ -30,12 +30,16 @@ from tg_studio.db.models import (
     BookingStatus,
     Business,
     Master,
+    PaymentStatus,
     Seat,
     SeatBlock,
     StudioHours,
 )
 from tg_studio.modules.coworking import pricing
-from tg_studio.timeutil import STUDIO_TZ
+from tg_studio.timeutil import STUDIO_TZ, interval_bounds  # noqa: F401  (реэкспорт: cw.interval_bounds)
+
+# Отмена возможна только до начала: начатую бронь завершают
+CANCELLABLE_BOOKING_STATUSES = (BookingStatus.pending_payment.value, BookingStatus.confirmed.value)
 
 # money импортируем лениво внутри функций: money сам импортирует хелперы
 # отсюда (add_booking_event, coworking_settings) — top-level импорт дал бы цикл
@@ -52,6 +56,8 @@ DEFAULT_HOLD_TTL_HOURS = 24
 # позже → удержание no_show_hold_percent процентов (остальное возвращается)
 DEFAULT_CANCEL_FULL_REFUND_HOURS = 24
 DEFAULT_NO_SHOW_HOLD_PERCENT = 100
+# Неявку можно отметить не раньше start + grace (01: «начало + grace»)
+DEFAULT_NO_SHOW_GRACE_MINUTES = 15
 # Если в studio_hours нет строк — студия работает каждый день 10:00–22:00
 FALLBACK_OPEN = time(10, 0)
 FALLBACK_CLOSE = time(22, 0)
@@ -77,6 +83,9 @@ def coworking_settings(business: Business) -> dict:
         "no_show_hold_percent": int(
             cfg.get("no_show_hold_percent", DEFAULT_NO_SHOW_HOLD_PERCENT)
         ),
+        "no_show_grace_minutes": int(
+            cfg.get("no_show_grace_minutes", DEFAULT_NO_SHOW_GRACE_MINUTES)
+        ),
     }
 
 
@@ -92,37 +101,56 @@ async def _studio_hours_map(session, business_id: int) -> dict[int, list[tuple[t
     return result
 
 
+def open_intervals(hours_map: dict[int, list[tuple[time, time]]], weekday: int) -> list[tuple[time, time]]:
+    """Интервалы работы в день недели. Расписание не задано вовсе — дефолт на все дни;
+    задано — день без интервалов закрыт."""
+    if not hours_map:
+        return [(FALLBACK_OPEN, FALLBACK_CLOSE)]
+    return hours_map.get(weekday, [])
+
+
 def _assert_within_studio_hours(
     start: datetime, end: datetime, hours_map: dict[int, list[tuple[time, time]]]
 ) -> None:
-    """Бронь целиком внутри часов работы студии (по студийному времени)."""
+    """Бронь целиком внутри одного интервала работы студии (по студийному времени)."""
     local_start = start.astimezone(STUDIO_TZ)
     local_end = end.astimezone(STUDIO_TZ)
-    # Интервал внутри одного дня (часы студии не пересекают полночь)
-    if local_end.date() != local_start.date():
-        raise HTTPException(
-            status_code=400,
-            detail="Бронь должна быть в пределах одного дня работы студии",
-        )
-    intervals = hours_map.get(local_start.weekday())
-    if not intervals:
-        intervals = [(FALLBACK_OPEN, FALLBACK_CLOSE)]
-    st, en = local_start.time(), local_end.time()
-    if not any(open_t <= st and en <= close_t for open_t, close_t in intervals):
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                f"Время {st.strftime('%H:%M')}–{en.strftime('%H:%M')} вне часов работы студии"
-            ),
-        )
+    day = local_start.date()
+    for open_t, close_t in open_intervals(hours_map, local_start.weekday()):
+        open_dt, close_dt = interval_bounds(day, open_t, close_t)
+        if open_dt <= local_start and local_end <= close_dt:
+            return
+    raise HTTPException(
+        status_code=400,
+        detail=(
+            f"Время {local_start:%d.%m %H:%M}–{local_end:%d.%m %H:%M} вне часов работы студии"
+        ),
+    )
 
 
 def assert_booking_bounds(
-    start: datetime, end: datetime, settings: dict, hours_map: dict[int, list[tuple[time, time]]]
+    start: datetime,
+    end: datetime,
+    settings: dict,
+    hours_map: dict[int, list[tuple[time, time]]],
+    *,
+    start_is_new: bool = True,
 ) -> None:
-    """Границы брони: start<end, мин. длительность, шаг, часы работы студии."""
+    """Границы брони: start<end, мин. длительность, шаг, часы работы студии.
+    Если начало выбирают заново (создание/перенос) — оно в будущем и лежит на
+    сетке шага от полуночи студии; при продлении начало не меняется и не проверяется."""
     if end <= start:
         raise HTTPException(status_code=400, detail="Конец брони должен быть позже начала")
+    if start_is_new:
+        if start <= datetime.now(UTC):
+            raise HTTPException(status_code=400, detail="Бронь должна начинаться в будущем")
+        local = start.astimezone(STUDIO_TZ)
+        minutes_from_midnight = local.hour * 60 + local.minute
+        if local.second or local.microsecond or minutes_from_midnight % settings["step_minutes"]:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Начало брони — на сетке {settings['step_minutes']} мин (например, 10:00, 10:30)",
+            )
     duration = end - start
     min_dur = timedelta(minutes=settings["min_duration_minutes"])
     if duration < min_dur:
@@ -170,8 +198,9 @@ async def find_seat_conflicts(
 
     block_stmt = select(SeatBlock).where(
         SeatBlock.business_id == business_id,
-        SeatBlock.start < q_end,
-        SeatBlock.end > q_start,
+        # блокировка — жёсткий интервал: буфер действует только между бронями
+        SeatBlock.start < end,
+        SeatBlock.end > start,
         # блокировка либо этого места, либо всей студии (seat_id IS NULL)
         (SeatBlock.seat_id == seat_id) | (SeatBlock.seat_id.is_(None)),
     )
@@ -210,14 +239,14 @@ async def assert_seat_free(
         return
     parts = []
     for kind, cid, c_start, c_end in conflicts:
-        label = f"бронь #{cid}" if kind == "booking" else f"блокировка #{cid}"
-        parts.append(f"{label} {c_start.astimezone(STUDIO_TZ):%d.%m %H:%M}–{c_end.astimezone(STUDIO_TZ):%H:%M}")
+        parts.append(f"занято {c_start.astimezone(STUDIO_TZ):%d.%m %H:%M}–{c_end.astimezone(STUDIO_TZ):%H:%M}")
     raise HTTPException(
         status_code=409,
         detail={
             "message": "Место занято на этом интервале",
             "conflicts": [
-                {"kind": kind, "id": cid, "start": c_start.isoformat(), "end": c_end.isoformat()}
+                # без id и причин: мастеру видны только занятые часы
+                {"kind": kind, "start": c_start.isoformat(), "end": c_end.isoformat()}
                 for kind, cid, c_start, c_end in conflicts
             ],
             "text": "; ".join(parts),
@@ -312,6 +341,9 @@ async def create_booking(
         buffer_minutes=settings["buffer_minutes"],
     )
     if not allow_master_overlap:
+        # порядок локов везде «место → мастер»; без лока два параллельных запроса
+        # мастера на разные места на одно время оба прошли бы проверку
+        await lock_master_slot(session, master.id)
         await assert_master_free(session, business.id, master.id, start, end)
 
     # Цена: снимок расчёта по актуальным правилам (03). Без цены на интервал — 409.
@@ -330,7 +362,8 @@ async def create_booking(
         start=start,
         end=end,
         status=BookingStatus.pending_payment.value,
-        hold_deadline=now + timedelta(hours=settings["hold_ttl_hours"]),
+        # оплатить после начала брони нельзя: hold не длиннее времени до старта
+        hold_deadline=min(now + timedelta(hours=settings["hold_ttl_hours"]), start),
         price_snapshot=snapshot,
         paid_amount=0,
         requires_confirmation=outside,
@@ -364,6 +397,17 @@ async def create_booking(
     return booking
 
 
+async def lock_booking(session, booking: Booking) -> None:
+    """FOR UPDATE строки брони + свежее состояние: проверка статуса/оплаты после лока
+    видит результат параллельной оплаты, отмены или продления (иначе двойное списание)."""
+    await session.execute(
+        for_update(
+            select(Booking).where(Booking.id == booking.id).execution_options(populate_existing=True),
+            session,
+        )
+    )
+
+
 async def reschedule_booking(
     session,
     business: Business,
@@ -374,6 +418,7 @@ async def reschedule_booking(
     note: str | None = None,
 ) -> Booking:
     """Перенос/продление брони: та же проверка места (исключая саму бронь)."""
+    await lock_booking(session, booking)
     new_start = ensure_tz(new_start)
     new_end = ensure_tz(new_end)
     settings = coworking_settings(business)
@@ -390,6 +435,7 @@ async def reschedule_booking(
         buffer_minutes=settings["buffer_minutes"],
         exclude_booking_id=booking.id,
     )
+    await lock_master_slot(session, booking.master_id)
     await assert_master_free(
         session, business.id, booking.master_id, new_start, new_end,
         exclude_booking_id=booking.id,
@@ -406,6 +452,16 @@ async def reschedule_booking(
         session, business.id, booking.seat_id, new_start, new_end, master=master
     )
     booking.price_snapshot = new_snapshot
+    await _refresh_coverage_flag(session, business, booking)
+    if booking.status == BookingStatus.pending_payment.value:
+        # счёт на 100% должен совпадать с новой ценой: старый закрываем, выставляем новый
+        from tg_studio.modules.coworking import money
+
+        await money.close_booking_invoices(session, booking, PaymentStatus.cancelled)
+        if booking.hold_deadline is not None:
+            deadline = booking.hold_deadline if booking.hold_deadline.tzinfo else booking.hold_deadline.replace(tzinfo=UTC)  # SQLite отдаёт naive UTC
+            booking.hold_deadline = min(deadline, new_start)
+        await money.create_booking_invoice(session, business, booking, actor_user_id)
     add_booking_event(
         session,
         business.id,
@@ -415,6 +471,98 @@ async def reschedule_booking(
         {
             "old": old,
             "new": {"start": new_start.isoformat(), "end": new_end.isoformat()},
+            "note": note,
+            "old_price_snapshot": old_snapshot,
+            "new_price_snapshot": new_snapshot,
+        },
+    )
+    add_booking_event(
+        session,
+        business.id,
+        booking.id,
+        BookingEventKind.priced,
+        actor_user_id,
+        {"price_final": new_snapshot["final"], "currency": new_snapshot["currency"]},
+    )
+    return booking
+
+
+async def _refresh_coverage_flag(session, business: Business, booking: Booking) -> None:
+    """Интервал изменился → «вне покрытия смен» считаем заново, подтверждение владельца сбрасываем."""
+    outside = await booking_outside_coverage(session, business, booking.start, booking.end)
+    booking.requires_confirmation = outside
+    booking.confirmed_by_user_id = None
+
+
+def _as_utc(dt: datetime) -> datetime:
+    return dt if dt.tzinfo else dt.replace(tzinfo=UTC)  # SQLite отдаёт naive UTC
+
+
+async def extend_booking(
+    session,
+    business: Business,
+    booking: Booking,
+    hours: int,
+    actor_user_id: int,
+    note: str | None = None,
+) -> Booking:
+    """Продление на целое число часов: конец сдвигается, начало остаётся.
+
+    Проверки как у переноса (место/мастер/часы студии) на всём новом интервале.
+    Ожидает оплаты — счёт перевыставляется на новую цену; подтверждена/начата —
+    разница цены списывается с баланса мастера (money.settle_price_change).
+    """
+    await lock_booking(session, booking)
+    if booking.status not in ACTIVE_BOOKING_STATUSES:
+        raise HTTPException(status_code=409, detail=f"Бронь в терминальном статусе: {booking.status}")
+    from tg_studio.modules.coworking import money
+
+    start = _as_utc(booking.start)
+    old_end = _as_utc(booking.end)
+    new_end = old_end + timedelta(hours=hours)
+    settings = coworking_settings(business)
+    hours_map = await _studio_hours_map(session, business.id)
+
+    await lock_seat_slot(session, booking.seat_id)
+    assert_booking_bounds(start, new_end, settings, hours_map, start_is_new=False)
+    await assert_seat_free(
+        session,
+        business.id,
+        booking.seat_id,
+        start,
+        new_end,
+        buffer_minutes=settings["buffer_minutes"],
+        exclude_booking_id=booking.id,
+    )
+    await lock_master_slot(session, booking.master_id)
+    await assert_master_free(
+        session, business.id, booking.master_id, start, new_end, exclude_booking_id=booking.id
+    )
+    master = await session.get(Master, booking.master_id)
+    old_snapshot = booking.price_snapshot
+    new_snapshot = await pricing.quote_booking_price(
+        session, business.id, booking.seat_id, start, new_end, master=master
+    )
+    delta = None
+    if booking.status != BookingStatus.pending_payment.value:
+        delta = await money.settle_price_change(session, business, booking, new_snapshot, actor_user_id)
+    booking.end = new_end
+    booking.price_snapshot = new_snapshot
+    await _refresh_coverage_flag(session, business, booking)
+    if booking.status == BookingStatus.pending_payment.value:
+        await money.close_booking_invoices(session, booking, PaymentStatus.cancelled)
+        await money.create_booking_invoice(session, business, booking, actor_user_id)
+    add_booking_event(
+        session,
+        business.id,
+        booking.id,
+        BookingEventKind.extended,
+        actor_user_id,
+        {
+            "hours": hours,
+            "old_end": old_end.isoformat(),
+            "new_end": new_end.isoformat(),
+            "settled": float(delta) if delta is not None else None,
             "note": note,
             "old_price_snapshot": old_snapshot,
             "new_price_snapshot": new_snapshot,
@@ -446,13 +594,17 @@ async def cancel_booking(
     отмены (≥ cancel_full_refund_hours до начала → 100%, позже → удержание
     no_show_hold_percent %; площадка — всегда 100%). Проводка refund в ledger.
     """
-    if booking.status not in ACTIVE_BOOKING_STATUSES:
-        raise HTTPException(status_code=409, detail=f"Бронь уже в терминальном статусе: {booking.status}")
+    await lock_booking(session, booking)
+    # 01: отмена — из ожидает_оплаты/подтверждена; начатую бронь завершают, а не отменяют
+    if booking.status not in CANCELLABLE_BOOKING_STATUSES:
+        raise HTTPException(status_code=409, detail=f"Бронь нельзя отменить в статусе: {booking.status}")
     from tg_studio.modules.coworking import money
 
     booking.status = (
         BookingStatus.cancelled_by_studio.value if by_studio else BookingStatus.cancelled_by_master.value
     )
+    # неоплаченный счёт брони не должен остаться живым (оплатят по ссылке после отмены)
+    await money.close_booking_invoices(session, booking, PaymentStatus.cancelled)
     if booking.paid_amount and booking.paid_amount > 0:
         await money.apply_cancellation_refund(
             session, business, booking, actor_user_id, by_studio=by_studio, reason=reason
@@ -470,6 +622,7 @@ async def cancel_booking(
 
 async def start_booking(session, business: Business, booking: Booking, actor_user_id: int) -> Booking:
     """Отметка «начата» (владелец/админ в 05; статус + фактическое время)."""
+    await lock_booking(session, booking)
     if booking.status != BookingStatus.confirmed.value:
         raise HTTPException(
             status_code=409,
@@ -483,6 +636,7 @@ async def start_booking(session, business: Business, booking: Booking, actor_use
 
 async def complete_booking(session, business: Business, booking: Booking, actor_user_id: int) -> Booking:
     """Отметка «завершена» (владелец/админ в 05)."""
+    await lock_booking(session, booking)
     if booking.status != BookingStatus.started.value:
         raise HTTPException(
             status_code=409,
@@ -499,8 +653,19 @@ async def mark_no_show(session, business: Business, booking: Booking, actor_user
 
     04: удержание no_show_hold_percent % от оплаченной суммы (refund остатка).
     """
-    if booking.status not in ACTIVE_BOOKING_STATUSES:
-        raise HTTPException(status_code=409, detail=f"Бронь уже в терминальном статусе: {booking.status}")
+    await lock_booking(session, booking)
+    if booking.status != BookingStatus.confirmed.value:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Неявку можно отметить только у подтверждённой брони (сейчас: {booking.status})",
+        )
+    grace = timedelta(minutes=coworking_settings(business)["no_show_grace_minutes"])
+    start = booking.start if booking.start.tzinfo else booking.start.replace(tzinfo=UTC)  # SQLite отдаёт naive UTC
+    if datetime.now(UTC) < start + grace:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Неявку можно отметить не раньше {grace.seconds // 60} мин после начала брони",
+        )
     from tg_studio.modules.coworking import money
 
     booking.status = BookingStatus.no_show.value
@@ -524,17 +689,21 @@ async def expire_booking_holds(session) -> int:
     now = datetime.now(UTC)
     stale = (
         await session.execute(
-            select(Booking).where(
-                Booking.status == BookingStatus.pending_payment.value,
-                Booking.hold_deadline.isnot(None),
-                Booking.hold_deadline < now,
+            # FOR UPDATE: параллельный вебхук оплаты не перезапишется статусом истекла_оплата
+            for_update(
+                select(Booking).where(
+                    Booking.status == BookingStatus.pending_payment.value,
+                    Booking.hold_deadline.isnot(None),
+                    Booking.hold_deadline < now,
+                ),
+                session,
             )
         )
     ).scalars().all()
     for booking in stale:
         booking.status = BookingStatus.payment_expired.value
         # 04: pending-счёт за бронь → expired (место свободно, деньги не списаны)
-        await money.expire_booking_payment(session, booking)
+        await money.close_booking_invoices(session, booking, PaymentStatus.expired)
         add_booking_event(
             session,
             booking.business_id,
@@ -560,7 +729,7 @@ def free_seats_for_interval(
 async def studio_hours_for_date(session, business_id: int, day: date) -> list[tuple[time, time]]:
     """Интервалы работы студии на конкретную дату (дефолт 10:00–22:00)."""
     hours_map = await _studio_hours_map(session, business_id)
-    return hours_map.get(day.weekday(), [(FALLBACK_OPEN, FALLBACK_CLOSE)])
+    return open_intervals(hours_map, day.weekday())
 
 
 # ---------------------------------------------------------------------------
@@ -703,7 +872,8 @@ async def confirm_out_of_coverage_booking(
 
 async def ops_exceptions(session, business: Business) -> list[dict]:
     """Операционные исключения для админа/владельца (05): неявки, истекшие hold,
-    брони вне покрытия без подтверждения — за последние 7 дней и сегодня вперёд."""
+    брони вне покрытия без подтверждения, брони, которые прошли, но не закрыты
+    (подтверждена без отметки / начата без завершения) — за последние 7 дней и вперёд."""
     now = datetime.now(UTC)
     window_from = now - timedelta(days=7)
     rows = (
@@ -724,6 +894,13 @@ async def ops_exceptions(session, business: Business) -> list[dict]:
                     Booking.requires_confirmation.is_(True)
                     & Booking.confirmed_by_user_id.is_(None)
                     & Booking.status.in_(ACTIVE_BOOKING_STATUSES)
+                )
+                | (
+                    # прошла, но владелец/админ не отметил итог — деньги висят
+                    (Booking.end < now)
+                    & Booking.status.in_(
+                        (BookingStatus.confirmed.value, BookingStatus.started.value)
+                    )
                 ),
             )
             .order_by(Booking.start)
@@ -735,6 +912,8 @@ async def ops_exceptions(session, business: Business) -> list[dict]:
             kind = "no_show"
         elif b.status == BookingStatus.payment_expired.value:
             kind = "payment_expired"
+        elif b.status in (BookingStatus.confirmed.value, BookingStatus.started.value) and b.end < now:
+            kind = "unclosed_past_booking"
         else:
             kind = "out_of_coverage_unconfirmed"
         result.append(

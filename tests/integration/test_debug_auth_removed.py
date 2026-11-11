@@ -23,7 +23,7 @@ async def test_no_credentials_401_even_with_debug_enabled(api_client, db_session
     await make_business(db_session)
     await db_session.commit()
 
-    r = await api_client.get("/api/admin/chats")
+    r = await api_client.get("/api/admin/masters")
     assert r.status_code == 401
 
 
@@ -36,7 +36,7 @@ async def test_debug_header_ignored_for_owner_id(api_client, db_session, monkeyp
     await make_business(db_session)
     await db_session.commit()
 
-    r = await api_client.get("/api/admin/chats", headers={"X-Debug-User-Id": str(OWNER_TG_ID)})
+    r = await api_client.get("/api/admin/masters", headers={"X-Debug-User-Id": str(OWNER_TG_ID)})
     assert r.status_code == 401
 
 

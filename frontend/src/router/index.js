@@ -4,12 +4,10 @@ import PlaceholderSection from '../components/PlaceholderSection.vue'
 import { firstSectionPath } from '../nav'
 import { authStore } from '../store/auth'
 import AdminsView from '../views/AdminsView.vue'
-import AiAssistantView from '../views/AiAssistantView.vue'
 import BalanceView from '../views/BalanceView.vue'
 import BusinessView from '../views/BusinessView.vue'
 import CalendarView from '../views/CalendarView.vue'
 import CheckoutView from '../views/CheckoutView.vue'
-import ChatsView from '../views/ChatsView.vue'
 import DashboardView from '../views/DashboardView.vue'
 import DeskView from '../views/DeskView.vue'
 import LoginView from '../views/LoginView.vue'
@@ -18,8 +16,6 @@ import MastersView from '../views/MastersView.vue'
 import SeatsView from '../views/SeatsView.vue'
 import ShiftsView from '../views/ShiftsView.vue'
 import StockView from '../views/StockView.vue'
-import SuppliesView from '../views/SuppliesView.vue'
-import TattoosView from '../views/TattoosView.vue'
 import UpsellsView from '../views/UpsellsView.vue'
 
 // Разделы с готовым бэкендом получают свои view, остальное — заглушка.
@@ -37,13 +33,9 @@ const sectionComponents = {
   dashboard: DashboardView,
   reports: ReportsView,
   masters: MastersView,
-  works: TattoosView,
-  chats: ChatsView,
-  supplies: SuppliesView,
   stock: StockView,
   checkout: CheckoutView,
   business: BusinessView,
-  ai: AiAssistantView,
 }
 
 const appChildren = Object.entries(sectionComponents).map(([path, component]) => ({

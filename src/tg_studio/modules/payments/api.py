@@ -1,8 +1,5 @@
-"""API платежей (миниапп: владелец и мастера).
-
-Обе роли выставляют счёты и подтверждают ручные оплаты: счёт клиенту
-выставляет мастер (он договаривается с клиентом), владелец видит всё.
-Владелец дополнительно может отменить любой счёт.
+"""API платежей (миниапп): счета за брони мест (04) — чтение, ручное подтверждение,
+отмена, опрос статуса, вебхук. Счета создаёт коворкинг (POST /bookings/{id}/pay).
 
 Машина состояний: pending → paid | cancelled | expired. Провайдер manual —
 кнопка «Оплатил»; apipay (Kaspi) — вебхук с HMAC-подписью, ручное
@@ -18,68 +15,36 @@ from datetime import UTC, datetime
 from decimal import Decimal
 
 from fastapi import APIRouter, HTTPException, Query, Request
-from sqlalchemy import select
+from sqlalchemy import func, select
 
-from tg_studio.api.admin_deps import MasterBusinessAndSelfDep
+from tg_studio.api.admin_deps import AdminBusinessAndSelfDep, MasterBusinessAndSelfDep
 from tg_studio.api.auth import CurrentUserDep
 from tg_studio.api.deps import SessionDep
 from tg_studio.config import settings
 from tg_studio.db.locks import for_update
 from tg_studio.db.models import (
-    Client,
+    Booking,
     Master,
     Payment,
-    PaymentKind,
-    User,
-    UserRole,
     PaymentProvider,
     PaymentStatus,
-    TattooSession,
-    TattooWork,
+    User,
+    UserRole,
 )
-from tg_studio.modules.payments import service
 from tg_studio.modules.payments.providers import (
-    InvoiceContext,
     PaymentProviderError,
-    apipay_configured,
     apply_provider_status,
     get_provider,
 )
 from tg_studio.modules.payments.schemas import (
     PaymentCancelRequest,
-    PaymentCreate,
     PaymentListResponse,
     PaymentOut,
-    WorkBalanceOut,
 )
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/payments", tags=["payments"])
-
-
-def _dec(value) -> Decimal:
-    return Decimal(str(value))
-
-
-def _fmt_money(value: Decimal | float) -> str:
-    return f"{float(value):,.0f}".replace(",", " ")
-
-
-async def _get_work(
-    session, business, work_id: int, self_master
-) -> TattooWork:
-    result = await session.execute(
-        select(TattooWork).where(
-            TattooWork.id == work_id, TattooWork.business_id == business.id
-        )
-    )
-    work = result.scalar_one_or_none()
-    if work is None:
-        raise HTTPException(status_code=404, detail="Работа не найдена")
-    if self_master is not None and work.master_id != self_master.id:
-        raise HTTPException(status_code=404, detail="Работа не найдена")
-    return work
 
 
 async def _get_payment(session, business, payment_id: int) -> Payment:
@@ -94,60 +59,60 @@ async def _get_payment(session, business, payment_id: int) -> Payment:
     return payment
 
 
+async def _lock_payment(session, payment_id: int) -> Payment:
+    """Свежая строка счёта под FOR UPDATE (вебхук, sync и ручная отметка не гонятся)."""
+    return (
+        await session.execute(
+            for_update(
+                select(Payment).where(Payment.id == payment_id).execution_options(populate_existing=True),
+                session,
+            )
+        )
+    ).scalar_one()
+
+
 async def _get_payment_for_actor(
     session, business, payment_id: int, actor_user: User, self_master: Master | None
 ) -> Payment:
-    """Платёж актора: мастер действует только по счетам СВОИХ работ
+    """Платёж актора: мастер действует только по счетам за СВОИ брони (04)
     (иначе мог бы отметить чужую оплату или отменить чужой счёт).
     Владелец и администратор студии (05) — все счета бизнеса."""
     payment = await _get_payment(session, business, payment_id)
     if actor_user.role == UserRole.master and self_master is not None:
-        if payment.work_id is not None:
-            work = await session.get(TattooWork, payment.work_id)
-            if work is None or work.master_id != self_master.id:
-                raise HTTPException(status_code=404, detail="Платёж не найден")
-        elif payment.booking_id is not None:
-            # Счёт за бронь места (04): мастер — только по СВОИМ броням
-            from tg_studio.db.models import Booking
-
-            booking = await session.get(Booking, payment.booking_id)
-            if booking is None or booking.master_id != self_master.id:
-                raise HTTPException(status_code=404, detail="Платёж не найден")
+        booking = await session.get(Booking, payment.booking_id) if payment.booking_id else None
+        if booking is None or booking.master_id != self_master.id:
+            raise HTTPException(status_code=404, detail="Платёж не найден")
     return payment
 
 
 async def _reread_payment(session, business, payment_id: int) -> PaymentOut:
-    """Свежая строка с именами (SQLite не возвращает server_default)."""
+    """Свежая строка с именем мастера (SQLite не возвращает server_default)."""
     stmt = (
-        select(Payment, Master.full_name, Client.full_name)
-        .join(TattooWork, Payment.work_id == TattooWork.id, isouter=True)
-        .join(Client, TattooWork.client_id == Client.id, isouter=True)
+        select(Payment, Master.full_name)
         .outerjoin(Master, Payment.master_id == Master.id)
         .where(Payment.id == payment_id)
     )
-    payment, master_name, client_name = (await session.execute(stmt)).one()
+    payment, master_name = (await session.execute(stmt)).one()
+    return _payment_out(payment, master_name)
+
+
+def _payment_out(p: Payment, master_name: str | None) -> PaymentOut:
     return PaymentOut(
-        id=payment.id,
-        work_id=payment.work_id,
-        session_id=payment.session_id,
-        amount=float(payment.amount),
-        kind=payment.kind,
-        status=payment.status,
-        provider=payment.provider,
-        external_invoice_id=payment.external_invoice_id,
-        payment_url=payment.payment_url,
-        expires_at=payment.expires_at,
-        master_id=payment.master_id,
+        id=p.id,
+        booking_id=p.booking_id,
+        amount=float(p.amount),
+        kind=p.kind,
+        status=p.status,
+        provider=p.provider,
+        external_invoice_id=p.external_invoice_id,
+        payment_url=p.payment_url,
+        expires_at=p.expires_at,
+        master_id=p.master_id,
         master_name=master_name,
-        client_name=client_name,
-        note=payment.note,
-        created_at=payment.created_at,
-        paid_at=payment.paid_at,
+        note=p.note,
+        created_at=p.created_at,
+        paid_at=p.paid_at,
     )
-
-
-def _normalize_phone(raw: str | None) -> str | None:
-    return service.normalize_phone(raw)
 
 
 # ---------------------------------------------------------------------------
@@ -159,69 +124,30 @@ def _normalize_phone(raw: str | None) -> str | None:
 async def list_payments(
     session: SessionDep,
     actor: MasterBusinessAndSelfDep,
-    work_id: int | None = Query(None),
+    booking_id: int | None = Query(None),
     status: str | None = Query(None),
     limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
 ):
-    """Платежи бизнеса. Мастер — только по своим работам, владелец/админ — все (05)."""
+    """Платежи бизнеса. Мастер — только свои, владелец/админ — все (05)."""
     business, self_master = actor
     stmt = (
-        select(Payment, Master.full_name, Client.full_name)
-        .outerjoin(TattooWork, Payment.work_id == TattooWork.id)
-        .outerjoin(Client, TattooWork.client_id == Client.id)
+        select(Payment, Master.full_name)
         .outerjoin(Master, Payment.master_id == Master.id)
         .where(Payment.business_id == business.id)
-        .order_by(Payment.id.desc())
-        .limit(limit)
     )
     if self_master is not None:
-        stmt = stmt.where(TattooWork.master_id == self_master.id)
-    if work_id is not None:
-        stmt = stmt.where(Payment.work_id == work_id)
+        stmt = stmt.where(Payment.master_id == self_master.id)
+    if booking_id is not None:
+        stmt = stmt.where(Payment.booking_id == booking_id)
     if status is not None:
         stmt = stmt.where(Payment.status == status)
-    rows = (await session.execute(stmt)).all()
-    payments = [
-        PaymentOut(
-            id=p.id,
-            work_id=p.work_id,
-            session_id=p.session_id,
-            amount=float(p.amount),
-            kind=p.kind,
-            status=p.status,
-            provider=p.provider,
-            external_invoice_id=p.external_invoice_id,
-            payment_url=p.payment_url,
-            expires_at=p.expires_at,
-            master_id=p.master_id,
-            master_name=master_name,
-            client_name=client_name,
-            note=p.note,
-            created_at=p.created_at,
-            paid_at=p.paid_at,
-        )
-        for p, master_name, client_name in rows
-    ]
-    return PaymentListResponse(payments=payments, total=len(payments))
-
-
-@router.get("/works/{work_id}/balance", response_model=WorkBalanceOut)
-async def work_balance(work_id: int, session: SessionDep, actor: MasterBusinessAndSelfDep):
-    """Баланс работы для диалога завершения сеанса: цена, оплачено, остаток."""
-    business, self_master = actor
-    work = await _get_work(session, business, work_id, self_master)
-    client = await session.get(Client, work.client_id)
-    balance, paid = await service.work_balance(session, work)
-    return WorkBalanceOut(
-        work_id=work.id,
-        client_id=work.client_id,
-        client_name=client.full_name if client else "",
-        client_phone=_normalize_phone(client.phone) if client else None,
-        contract_price=float(work.contract_price) if work.contract_price is not None else None,
-        paid_total=float(paid),
-        balance=float(balance) if balance is not None else None,
-        apipay_ready=apipay_configured(),
-    )
+    total = (
+        await session.execute(select(func.count()).select_from(stmt.order_by(None).subquery()))
+    ).scalar_one()
+    rows = (await session.execute(stmt.order_by(Payment.id.desc()).limit(limit).offset(offset))).all()
+    payments = [_payment_out(p, master_name) for p, master_name in rows]
+    return PaymentListResponse(payments=payments, total=total)
 
 
 # ---------------------------------------------------------------------------
@@ -316,9 +242,9 @@ async def apipay_webhook(request: Request, session: SessionDep):
     if paid_at is None and provider_status == "paid":
         paid_at = datetime.now(UTC)
     changed = apply_provider_status(payment, provider_status, paid_at)
-    if changed and payment.status == PaymentStatus.paid.value and payment.booking_id is not None:
-        # Коворкинг (04): счёт за бронь места оплачен → проводка topup +
-        # бронь подтверждена (дедуп: повторный вебхук — no-op в apply_payment_paid)
+    if changed and payment.status == PaymentStatus.paid.value:
+        # Коворкинг (04): счёт оплачен → проводка topup (+ подтверждение брони, если счёт за бронь;
+        # дедуп: повторный вебхук — no-op в apply_payment_paid)
         from tg_studio.modules.coworking import money
 
         await money.apply_payment_paid(session, payment, paid_at=paid_at)
@@ -332,131 +258,33 @@ async def apipay_webhook(request: Request, session: SessionDep):
 # ---------------------------------------------------------------------------
 
 
-@router.post("", response_model=PaymentOut, status_code=201)
-async def create_payment(
-    body: PaymentCreate,
-    session: SessionDep,
-    actor: MasterBusinessAndSelfDep,
-    user: CurrentUserDep,
-):
-    """Выставить счёт по работе.
-
-    contract_price: None — не трогать; при первом счёте работы фиксирует
-    договорную цену (дальше менять только явным пересмотром).
-    kind: None → final, если сумма закрывает баланс, иначе partial.
-    """
-    business, self_master = actor
-    work = await _get_work(session, business, body.work_id, self_master)
-
-    session_id = body.session_id
-    if session_id is not None:
-        sess = (
-            await session.execute(
-                select(TattooSession).where(
-                    TattooSession.id == session_id, TattooSession.work_id == work.id
-                )
-            )
-        ).scalar_one_or_none()
-        if sess is None:
-            raise HTTPException(status_code=404, detail="Сеанс не найден в этой работе")
-
-    # Фиксация/пересмотр договорной цены — до расчёта баланса и kind
-    if body.contract_price is not None and (
-        work.contract_price is None or _dec(body.contract_price) != _dec(work.contract_price)
-    ):
-        work.contract_price = _dec(body.contract_price)
-
-    provider_name = body.provider or ("apipay" if apipay_configured() else "manual")
-    if provider_name == PaymentProvider.apipay.value and not apipay_configured():
-        raise HTTPException(status_code=409, detail="ApPay не подключён")
-    if body.paid_now and provider_name != PaymentProvider.manual.value:
-        raise HTTPException(
-            status_code=422,
-            detail="«Оплатил» доступен только для ручных платежей (наличные/перевод)",
-        )
-
-    balance, _paid = await service.work_balance(session, work)
-    amount = _dec(body.amount)
-    if body.kind is not None:
-        kind = body.kind.value
-    else:
-        kind = (
-            PaymentKind.final.value
-            if balance is not None and amount >= balance
-            else PaymentKind.partial.value
-        )
-
-    client = await session.get(Client, work.client_id)
-    payment = Payment(
-        business_id=business.id,
-        work_id=work.id,
-        session_id=session_id,
-        amount=amount,
-        kind=kind,
-        status=PaymentStatus.pending.value,
-        provider=provider_name,
-        created_by_user_id=user.id,
-        master_id=self_master.id if self_master is not None else None,
-        note=body.note,
-    )
-    session.add(payment)
-    await session.flush()
-
-    if provider_name == PaymentProvider.apipay.value:
-        try:
-            created = await get_provider(provider_name).create_invoice(
-                payment,
-                InvoiceContext(
-                    client_phone=_normalize_phone(client.phone) if client else None,
-                    client_name=client.full_name if client else "",
-                    description=f"Тату-работа #{work.id}",
-                ),
-            )
-        except PaymentProviderError as exc:
-            await session.rollback()
-            raise HTTPException(status_code=502, detail=str(exc)) from exc
-        payment.external_invoice_id = created.external_id
-        payment.payment_url = created.payment_url
-        payment.expires_at = created.expires_at
-
-    if body.paid_now:
-        payment.status = PaymentStatus.paid.value
-        payment.paid_at = datetime.now(UTC)
-        payment.confirmed_by_user_id = user.id
-
-    await session.commit()
-    return await _reread_payment(session, business, payment.id)
-
 
 @router.post("/{payment_id}/mark-paid", response_model=PaymentOut)
 async def mark_paid(
     payment_id: int,
     session: SessionDep,
-    actor: MasterBusinessAndSelfDep,
+    actor: AdminBusinessAndSelfDep,
     user: CurrentUserDep,
 ):
-    """Подтвердить ручную оплату: клиент отдал деньги / перевёл на карту
-    (владелец, мастер — по своим работам, администратор студии — 05).
+    """Подтвердить ручную оплату: деньги принял владелец или администратор студии (04, 05).
 
+    Мастер подтвердить свою оплату не может — иначе бронь подтверждалась бы без денег.
     Для apipay-платежей недоступно — их оплачивает вебхук платёжной системы.
     """
-    business, self_master = actor
-    payment = await _get_payment_for_actor(session, business, payment_id, user, self_master)
+    business, _ = actor
+    await _get_payment(session, business, payment_id)
+    # FOR UPDATE: повторное нажатие/параллельная отметка не должны задвоить topup
+    payment = await _lock_payment(session, payment_id)
     if payment.status != PaymentStatus.pending.value:
         raise HTTPException(status_code=409, detail="Счёт уже не ожидает оплаты")
     if payment.provider != PaymentProvider.manual.value:
         raise HTTPException(
             status_code=409, detail="Оплату этого счёта подтверждает платёжная система"
         )
-    # Коворкинг (04): ручная отметка счёта за бронь → проводка + подтверждение брони
-    if payment.booking_id is not None:
-        from tg_studio.modules.coworking import money
+    from tg_studio.modules.coworking import money
 
-        await money.apply_payment_paid(session, payment, actor_user_id=user.id)
-    else:
-        payment.status = PaymentStatus.paid.value
-        payment.paid_at = datetime.now(UTC)
-        payment.confirmed_by_user_id = user.id
+    # топап баланса мастера (+ подтверждение брони, если счёт за бронь)
+    await money.apply_payment_paid(session, payment, actor_user_id=user.id)
     await session.commit()
     return await _reread_payment(session, business, payment.id)
 
@@ -506,6 +334,7 @@ async def sync_payment(
         raise HTTPException(status_code=409, detail="Опрос статуса — только для счетов Kaspi")
     if not payment.external_invoice_id:
         raise HTTPException(status_code=409, detail="У платежа нет внешнего счёта")
+    payment = await _lock_payment(session, payment.id)
     try:
         invoice = await get_provider(payment.provider).fetch_invoice(payment)
     except PaymentProviderError as exc:
@@ -518,7 +347,7 @@ async def sync_payment(
     if invoice.get("status") == "error" and invoice.get("error_message"):
         payment.note = f"ApiPay: {invoice['error_message']}"
     # Коворкинг (04): опрос подтянул «paid» по счёту за бронь → проводка + бронь
-    if payment.status == PaymentStatus.paid.value and payment.booking_id is not None:
+    if payment.status == PaymentStatus.paid.value:
         from tg_studio.modules.coworking import money
 
         await money.apply_payment_paid(session, payment)

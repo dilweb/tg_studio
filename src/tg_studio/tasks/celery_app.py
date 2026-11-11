@@ -9,8 +9,6 @@ celery_app = Celery(
     backend=settings.celery_result_backend,
     include=[
         "tg_studio.tasks.email_verification",
-        "tg_studio.tasks.session_offers",
-        "tg_studio.tasks.prepay_expiry",
         "tg_studio.tasks.booking_holds",
     ],
 )
@@ -22,16 +20,6 @@ celery_app.conf.update(
     timezone="Asia/Almaty",
     enable_utc=True,
     beat_schedule={
-        # Офферы без ответа сгорают и уходят следующему в очереди
-        "expire-session-offers": {
-            "task": "expire_session_offers",
-            "schedule": crontab(minute="*/5"),
-        },
-        # Неоплаченные предоплаты отменяют бронь (дедлайн = жизнь счёта ApiPay)
-        "expire-prepay-invoices": {
-            "task": "expire_prepay_invoices",
-            "schedule": crontab(minute="*/15"),
-        },
         # Истёкший hold брони места (ожидает_оплаты) → истекла_оплата, место свободно
         "expire-booking-holds": {
             "task": "expire_booking_holds",

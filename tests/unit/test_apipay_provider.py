@@ -159,3 +159,12 @@ def test_apply_status_transitions():
 
     # неизвестный статус — игнор
     assert apply_provider_status(make_payment(), "refunded") is False
+
+async def test_network_error_becomes_provider_error():
+    """Сеть/прокси/таймаут → PaymentProviderError (бронь уходит на manual-счёт, а не в 500)."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("нет сети", request=request)
+
+    with pytest.raises(PaymentProviderError):
+        await provider_with(handler).create_invoice(make_payment(), CTX)

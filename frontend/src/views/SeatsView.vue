@@ -64,7 +64,7 @@ const editingDiscountId = ref(null)
 const discountForm = reactive({
   seat_id: '',
   name: '',
-  kind: 'resident',
+  kind: 'min_hours',
   min_hours: '4',
   percent: '10',
   fixed_amount: '',
@@ -337,7 +337,7 @@ function openDiscountCreate() {
   Object.assign(discountForm, {
     seat_id: '',
     name: '',
-    kind: 'resident',
+    kind: 'min_hours',
     min_hours: '4',
     percent: '10',
     fixed_amount: '',
@@ -376,7 +376,7 @@ async function submitDiscount() {
       seat_id: discountForm.seat_id ? Number(discountForm.seat_id) : null,
       name: discountForm.name.trim(),
       kind: discountForm.kind,
-      min_hours: discountForm.kind === 'min_hours' ? Number(discountForm.min_hours) : null,
+      min_hours: Number(discountForm.min_hours),
       percent: discountForm.use_percent ? Number(discountForm.percent) / 100 : null,
       fixed_amount: discountForm.use_percent ? null : Number(discountForm.fixed_amount),
       priority: Number(discountForm.priority),
@@ -603,7 +603,7 @@ onMounted(() => {
                 <tr v-for="r in discountRules" :key="r.id">
                   <td>{{ r.name }}</td>
                   <td>{{ seatName(r.seat_id) }}</td>
-                  <td>{{ r.kind === 'resident' ? 'Резидент студии' : `От ${r.min_hours} ч брони` }}</td>
+                  <td>От {{ r.min_hours }} ч брони</td>
                   <td>{{ r.percent != null ? `${Number(r.percent) * 100}%` : fmtMoney(r.fixed_amount) }}</td>
                   <td>{{ r.priority }}</td>
                   <td><span class="badge" :class="r.is_active ? '' : 'badge-muted'">{{ r.is_active ? 'Активна' : 'Выкл' }}</span></td>
@@ -788,13 +788,6 @@ onMounted(() => {
           </select>
         </div>
         <div class="field">
-          <label>Условие</label>
-          <select v-model="discountForm.kind">
-            <option value="resident">Мастер — резидент студии</option>
-            <option value="min_hours">Бронь от N часов</option>
-          </select>
-        </div>
-        <div v-if="discountForm.kind === 'min_hours'" class="field">
           <label>От скольких часов</label>
           <input v-model="discountForm.min_hours" type="number" min="1" max="720" />
         </div>

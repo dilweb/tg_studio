@@ -1,74 +1,47 @@
-# TG Studio — Система записи через Telegram
+# TG Studio — CRM коворкинга
 
-CRM backend for tattoo studios — scheduling, customers, analytics.
+Студия сдаёт время 4 рабочих мест независимым мастерам: брони с 100% предоплатой,
+цены по правилам (утро/вечер, будни/выходные, праздники, скидки), баланс мастера,
+админы с апсейлами, склад и продажи, дашборд и Excel-отчёты для владельца.
+План и модель — в [docs/coworking](docs/coworking/00-overview.md).
 
 ## Стек
 
 | Слой | Технология |
 |------|-----------|
-| Telegram Bot | aiogram 3 |
-| API Backend | FastAPI + Uvicorn |
+| API | FastAPI + Uvicorn |
 | База данных | PostgreSQL + SQLAlchemy 2.0 (async) + Alembic |
-| Очередь задач | Redis + Celery |
+| Очередь задач | Redis + Celery (истечение hold'ов броней, письма) |
+| Фронтенд | Vue (Telegram Mini App / веб), `frontend/` |
+| Платежи | ApiPay (Kaspi) или ручное подтверждение |
+| Зависимости | uv |
 | Контейнеры | Docker Compose + Nginx |
+
+Telegram-бота как процесса нет: Bot API используется только для исходящих
+уведомлений (`modules/notify.py`) и проверки `initData` миниаппа (`BOT_TOKEN`).
 
 ## Быстрый старт
 
-### 1. Скопировать конфиг
-
 ```bash
-cp .env.example .env
-```
-
-Заполнить в `.env`:
-- `BOT_TOKEN` — токен из [@BotFather](https://t.me/BotFather)
-- `MINIAPP_URL` — URL где будет хоститься фронтенд (должен быть HTTPS)
-
-### 2. Запустить
-
-```bash
+# заполнить .env: BOT_TOKEN, MINIAPP_URL (HTTPS), JWT_SECRET_KEY, ALLOWED_USERS
 docker compose up -d
 ```
 
-Миграции применяются автоматически при старте (сервис `migrate`). Запустить миграции вручную:
+Миграции применяются при старте сервиса `api` (`RUN_MIGRATIONS=true`).
+
+## Разработка и тесты
+
 ```bash
-docker compose run migrate
+uv sync --group dev
+uv run pytest            # SQLite in-memory, Postgres не нужен
+uv run alembic upgrade head
 ```
 
-### 3. Добавить данные
+Тесты `test_coworking_postgres`-типа и миграции требуют реальный Postgres.
 
-Подключиться к postgres и добавить мастеров, услуги и временные слоты:
+## API
 
-```sql
-INSERT INTO masters (full_name, telegram_id) VALUES ('Алия Нурова', 123456789);
-INSERT INTO services (name, price) VALUES ('Тату', 5000);
-INSERT INTO master_services (master_id, service_id) VALUES (1, 1);
-```
-
-## Архитектура
-
-```
-Клиент (Telegram)
-    │
-    ├─ /start → aiogram Bot → кнопка "Записаться" (открывает Mini App)
-    │
-    └─ Mini App (React/Vue) ──→ FastAPI Backend
-                                    ├─ GET /api/slots/masters
-                                    ├─ GET /api/slots/available
-                                    └─ GET /api/health
-```
-
-## API Endpoints
-
-| Метод | Путь | Описание |
-|-------|------|----------|
-| GET | `/api/slots/masters` | Список активных мастеров |
-| GET | `/api/slots/masters/{id}/services` | Услуги мастера |
-| GET | `/api/slots/available?master_id=1&day=2026-03-10` | Свободные слоты |
-| GET | `/api/health` | Healthcheck |
-
-## Команды бота
-
-| Команда | Описание |
-|---------|----------|
-| `/start` | Открыть Mini App для записи |
+Swagger — `/api/docs` (только при `REQUIRE_HTTPS=false`). Основные разделы:
+`/api/seats`, `/api/bookings`, `/api/pricing/quote`, `/api/price-rules`,
+`/api/me/balance`, `/api/payments`, `/api/admins`, `/api/shifts`,
+`/api/dashboard`, `/api/reports/*` (+ `revenue.xlsx`), `/api/health`.

@@ -228,6 +228,20 @@ async function cancelBooking(b) {
   }
 }
 
+// Продление на 1 час (шаг продления); для оплаченной брони разница спишется с баланса
+async function extendBooking(b) {
+  if (!window.confirm(`Продлить бронь #${b.id} на 1 час?`)) return
+  error.value = ''
+  try {
+    await api.post(`/api/bookings/${b.id}/extend`, { hours: 1 })
+    notice.value = 'Бронь продлена'
+    await load()
+  } catch (err) {
+    const d = err.detail
+    error.value = typeof d === 'object' ? (d.message ?? d.text ?? JSON.stringify(d)) : (d ?? err.message)
+  }
+}
+
 // --- оплата брони (04) ---
 const paying = ref(false)
 
@@ -352,13 +366,14 @@ onMounted(load)
             v-for="e in entries"
             :key="`${e.kind}-${e.id}`"
             class="cal-entry"
-            :class="e.kind === 'block' ? 'cal-block' : 'cal-booking'"
+            :class="e.kind === 'booking' ? 'cal-booking' : 'cal-block'"
           >
             <span class="cal-time">{{ fmt(e.start).slice(-5) }}–{{ fmt(e.end).slice(-5) }}</span>
             <span v-if="e.kind === 'booking'">
               {{ e.seat_name }} · {{ e.master_name }} ·
               <b>{{ STATUS_LABELS[e.status] ?? e.status }}</b>
             </span>
+            <span v-else-if="e.kind === 'busy'">{{ e.seat_name ?? 'Вся студия' }} · занято</span>
             <span v-else>🔒 {{ e.seat_name ?? 'Вся студия' }} · {{ e.reason }}</span>
             <button
               v-if="e.kind === 'block' && isOwner"
@@ -416,6 +431,12 @@ onMounted(load)
                   </template>
                   <button
                     v-if="['ожидает_оплаты', 'подтверждена', 'начата'].includes(b.status)"
+                    class="btn btn-sm"
+                    type="button"
+                    @click="extendBooking(b)"
+                  >Продлить +1 ч</button>
+                  <button
+                    v-if="['ожидает_оплаты', 'подтверждена'].includes(b.status)"
                     class="btn btn-sm btn-ghost"
                     type="button"
                     @click="cancelBooking(b)"
@@ -450,7 +471,7 @@ onMounted(load)
                       @click="act(b, 'visit/end')"
                     >Ушёл</button>
                     <button
-                      v-if="['ожидает_оплаты', 'подтверждена', 'начата'].includes(b.status)"
+                      v-if="b.status === 'подтверждена'"
                       class="btn btn-sm btn-ghost"
                       type="button"
                       :disabled="acting"

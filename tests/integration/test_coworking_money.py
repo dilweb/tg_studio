@@ -46,6 +46,7 @@ from ..conftest import (
     make_business,
     make_init_data_headers,
     make_master,
+    move_booking_to_past,
     make_user,
 )
 
@@ -325,15 +326,17 @@ async def test_webhook_paid_confirms_booking_and_dedup(api_client, db_session, b
     booking = await db_session.get(Booking, b["id"])
     assert booking.status == BookingStatus.confirmed.value
     assert float(booking.paid_amount) == 2000
-    assert await _balance(db_session, master.id) == Decimal("2000")
+    # оплата картой не оставляет деньги на балансе: topup +2000, charge −2000
+    assert await _balance(db_session, master.id) == Decimal("0")
     assert "оплачена" in await _events(db_session, b["id"])
 
-    # Повторный вебхук — дедуп: баланс не дублируется
+    # Повторный вебхук — дедуп: проводки не дублируются
     resp2 = await api_client.post("/api/payments/webhook/apipay", content=body, headers=signed_headers(body))
     assert resp2.status_code == 200
-    assert await _balance(db_session, master.id) == Decimal("2000")
+    assert await _balance(db_session, master.id) == Decimal("0")
     entries = (await db_session.execute(select(LedgerEntry))).scalars().all()
     assert len([e for e in entries if e.kind == "topup"]) == 1
+    assert len([e for e in entries if e.kind == "charge"]) == 1
 
 
 @pytest.mark.asyncio
@@ -479,6 +482,7 @@ async def test_cancel_by_studio_always_full_refund(api_client, db_session, busin
 async def test_no_show_holds_percent(api_client, db_session, business, seats, master):
     """Неявка → удержание no_show_hold_percent от оплаты (дефолт 100%)."""
     b = await _confirmed_booking(api_client, db_session, seats, master)
+    await move_booking_to_past(db_session, b["id"])
     balance_before = await _balance(db_session, master.id)
     resp = await api_client.post(f"/api/bookings/{b['id']}/no-show", headers=OWNER_HEADERS)
     assert resp.status_code == 200, resp.text
@@ -567,3 +571,159 @@ async def test_owner_balance_endpoint(api_client, db_session, master):
     assert resp.status_code == 200
     assert resp.json()["balance"] == 4200
     assert resp.json()["currency"] == "KZT"
+
+
+# ---------------------------------------------------------------------------
+# Счета брони следуют за её состоянием (01: долга и висящих счетов нет)
+# ---------------------------------------------------------------------------
+
+
+async def _booking_payments(db_session, booking_id: int) -> list[Payment]:
+    return list(
+        (
+            await db_session.execute(
+                select(Payment).where(Payment.booking_id == booking_id).order_by(Payment.id)
+            )
+        ).scalars()
+    )
+
+
+@pytest.mark.asyncio
+async def test_reschedule_pending_reissues_invoice(api_client, db_session, seats, master):
+    master_id = master.id  # после expire_all атрибут не перечитать вне greenlet
+    b = await _create_booking(api_client, seats[0]["id"], _tomorrow(12), _tomorrow(14))
+    resp = await api_client.patch(
+        f"/api/bookings/{b['id']}",
+        json={"start": _tomorrow(12), "end": _tomorrow(16)},
+        headers=MASTER_HEADERS,
+    )
+    assert resp.status_code == 200, resp.text
+    new_price = Decimal(str(resp.json()["price_snapshot"]["final"]))
+    assert new_price > Decimal(str(b["price_snapshot"]["final"]))
+
+    db_session.expire_all()
+    old, new = await _booking_payments(db_session, b["id"])
+    assert old.status == "cancelled"
+    assert new.status == "pending" and Decimal(str(new.amount)) == new_price
+
+    # Запоздалая оплата старого (меньшего) счёта бронь не подтверждает: деньги на балансе
+    assert await money.apply_payment_paid(db_session, old) is True
+    await db_session.commit()
+    booking = await db_session.get(Booking, b["id"])
+    assert booking.status == BookingStatus.pending_payment.value
+    assert await _balance(db_session, master_id) == Decimal(str(old.amount))
+
+
+@pytest.mark.asyncio
+async def test_cancel_pending_closes_invoice(api_client, db_session, seats, master):
+    b = await _create_booking(api_client, seats[0]["id"], _tomorrow(12), _tomorrow(14))
+    resp = await api_client.post(
+        f"/api/bookings/{b['id']}/cancel", json={"reason": "передумала"}, headers=MASTER_HEADERS
+    )
+    assert resp.status_code == 200, resp.text
+    db_session.expire_all()
+    assert [p.status for p in await _booking_payments(db_session, b["id"])] == ["cancelled"]
+
+
+@pytest.mark.asyncio
+async def test_pay_from_balance_closes_invoice(api_client, db_session, seats, master):
+    b = await _confirmed_booking(api_client, db_session, seats, master)
+    db_session.expire_all()
+    assert [p.status for p in await _booking_payments(db_session, b["id"])] == ["cancelled"]
+
+
+@pytest.mark.asyncio
+async def test_cannot_cancel_started_booking(api_client, db_session, seats, master):
+    b = await _confirmed_booking(api_client, db_session, seats, master)
+    resp = await api_client.post(f"/api/bookings/{b['id']}/start", headers=OWNER_HEADERS)
+    assert resp.status_code == 200, resp.text
+    resp = await api_client.post(
+        f"/api/bookings/{b['id']}/cancel", json={"reason": "x"}, headers=OWNER_HEADERS
+    )
+    assert resp.status_code == 409
+
+
+# ---------------------------------------------------------------------------
+# Пополнение баланса картой, уникальность topup, поздняя оплата, пагинация
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_my_topup_requires_apipay(api_client, master):
+    resp = await api_client.post("/api/me/topups", json={"amount": 1000}, headers=MASTER_HEADERS)
+    assert resp.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_my_topup_invoice_and_webhook_credits_balance(
+    api_client, db_session, master, apipay_on, monkeypatch
+):
+    from tg_studio.modules.payments.providers import ApipayProvider, CreatedInvoice
+
+    async def fake_create(self, payment, ctx):
+        return CreatedInvoice(external_id="inv-top-1", payment_url="https://kaspi.test/pay/top-1")
+
+    monkeypatch.setattr(ApipayProvider, "create_invoice", fake_create)
+
+    resp = await api_client.post("/api/me/topups", json={"amount": 1500.5}, headers=MASTER_HEADERS)
+    assert resp.status_code == 400  # Kaspi — только целые тенге
+
+    resp = await api_client.post("/api/me/topups", json={"amount": 1500}, headers=MASTER_HEADERS)
+    assert resp.status_code == 201, resp.text
+    assert resp.json()["payment_url"] == "https://kaspi.test/pay/top-1"
+    assert await _balance(db_session, master.id) == Decimal("0")
+
+    body = webhook_body("inv-top-1", "paid", amount=1500)
+    for _ in range(2):  # повторный вебхук — дедуп
+        r = await api_client.post("/api/payments/webhook/apipay", content=body, headers=signed_headers(body))
+        assert r.status_code == 200, r.text
+    assert await _balance(db_session, master.id) == Decimal("1500")
+
+
+@pytest.mark.asyncio
+async def test_ledger_unique_topup_per_payment(db_session, business, master):
+    from sqlalchemy.exc import IntegrityError
+
+    from tg_studio.modules.coworking import money
+
+    payment = await money.manual_topup(db_session, business, master, Decimal("100"), master.user_id, None)
+    await db_session.commit()
+    db_session.add(
+        LedgerEntry(
+            business_id=business.id, master_id=master.id, kind="topup", amount=100, payment_id=payment.id
+        )
+    )
+    with pytest.raises(IntegrityError):
+        await db_session.commit()
+    await db_session.rollback()
+
+
+@pytest.mark.asyncio
+async def test_late_payment_after_expiry_lands_on_balance_with_note(
+    api_client, db_session, business, seats, master, apipay_on
+):
+    b = await _create_booking(api_client, seats[0]["id"], _tomorrow(12), _tomorrow(14))
+    await _make_apipay_booking_payment(db_session, business, master, b["id"], "2000", "inv-late")
+    booking = await db_session.get(Booking, b["id"])
+    booking.status = BookingStatus.payment_expired.value
+    await db_session.commit()
+
+    body = webhook_body("inv-late", "paid", amount=2000)
+    resp = await api_client.post("/api/payments/webhook/apipay", content=body, headers=signed_headers(body))
+    assert resp.status_code == 200
+    assert await _balance(db_session, master.id) == Decimal("2000")
+    topup = (
+        await db_session.execute(select(LedgerEntry).where(LedgerEntry.kind == "topup"))
+    ).scalar_one()
+    assert "уже" in topup.note and "баланс" in topup.note
+
+
+@pytest.mark.asyncio
+async def test_ledger_total_is_full_count(api_client, master):
+    for _ in range(3):
+        await api_client.post(f"/api/masters/{master.id}/topup", json={"amount": 100}, headers=OWNER_HEADERS)
+    resp = await api_client.get("/api/me/ledger?limit=2&offset=1", headers=MASTER_HEADERS)
+    assert len(resp.json()["entries"]) == 2
+    assert resp.json()["total"] == 3
+    resp = await api_client.get("/api/ledger?limit=1", headers=OWNER_HEADERS)
+    assert resp.json()["total"] == 3 and len(resp.json()["entries"]) == 1

@@ -257,6 +257,7 @@ async def test_partial_period_split_has_consistent_excel(api_client, reporting_f
     assert response.status_code == 200, response.text
     assert response.json()["gross"] == 6000  # 2 часа брони + продажа в 12:00
     assert sum(row["gross"] for row in response.json()["by_day"]) == 6000
+    assert sum(row["hours"] for row in response.json()["by_day"]) == 2  # часы, а не секунды/3600 дважды
     response = await period(api_client, "/api/reports/revenue.xlsx", **bounds)
     assert response.status_code == 200, response.text
     workbook = load_workbook(BytesIO(response.content), data_only=True)

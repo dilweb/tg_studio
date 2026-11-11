@@ -97,6 +97,9 @@ class ApipayProvider:
         own = self._http is None
         try:
             resp = await client.request(method, path, json=json_body)
+        except httpx.HTTPError as exc:
+            # Сеть/прокси/таймаут — та же «ApiPay недоступен»: вызывающие ловят только PaymentProviderError
+            raise PaymentProviderError(f"ApiPay недоступен: {type(exc).__name__}") from exc
         finally:
             if own:
                 await client.aclose()
@@ -178,6 +181,21 @@ _PROVIDER_TO_LOCAL = {
     "error": "pending",
     "partially_refunded": "paid",
 }
+
+
+def normalize_phone(raw: str | None) -> str | None:
+    """Телефон клиента к формату ApiPay 8XXXXXXXXXX. None — не приводится.
+
+    +7XXXXXXXXXX → 8XXXXXXXXXX, цифры из «8 (777) 123-45-67» склеиваются.
+    """
+    if not raw:
+        return None
+    digits = "".join(ch for ch in raw if ch.isdigit())
+    if len(digits) == 11 and digits.startswith("7"):
+        digits = "8" + digits[1:]
+    if len(digits) == 10 and digits.startswith("7"):
+        digits = "8" + digits
+    return digits if len(digits) == 11 and digits.startswith("8") else None
 
 
 def provider_status_to_local(status: str) -> str | None:

@@ -32,6 +32,7 @@ from ..conftest import (
     make_business,
     make_init_data_headers,
     make_master,
+    move_booking_to_past,
     make_user,
 )
 
@@ -447,8 +448,13 @@ async def test_availability(api_client, business, seats, master):
         json=booking_payload(seats[0]["id"], _tomorrow(12), _tomorrow(14)),
         headers=MASTER_HEADERS,
     )
+    # Мастер с бронью на это время свободных мест не видит (создать вторую нельзя)
     resp = await api_client.get(
         f"/api/bookings/availability?start={_tomorrow(12)}&end={_tomorrow(14)}", headers=MASTER_HEADERS
+    )
+    assert resp.status_code == 200 and resp.json()["free_seats"] == []
+    resp = await api_client.get(
+        f"/api/bookings/availability?start={_tomorrow(12)}&end={_tomorrow(14)}", headers=OWNER_HEADERS
     )
     assert resp.status_code == 200
     free_ids = [s["seat_id"] for s in resp.json()["free_seats"]]
@@ -549,6 +555,15 @@ async def test_owner_marks_start_complete_no_show(api_client, business, seats, m
         headers=OWNER_HEADERS,
     )
     bid2 = resp.json()["id"]
+    # неоплаченную бронь и бронь до начала отметить неявкой нельзя
+    resp = await api_client.post(f"/api/bookings/{bid2}/no-show", headers=OWNER_HEADERS)
+    assert resp.status_code == 409
+    booking2 = (await db_session.execute(select(Booking).where(Booking.id == bid2))).scalar_one()
+    booking2.status = BookingStatus.confirmed.value
+    await db_session.commit()
+    resp = await api_client.post(f"/api/bookings/{bid2}/no-show", headers=OWNER_HEADERS)
+    assert resp.status_code == 409  # до start + grace
+    await move_booking_to_past(db_session, bid2)
     resp = await api_client.post(f"/api/bookings/{bid2}/no-show", headers=OWNER_HEADERS)
     assert resp.status_code == 200
     assert resp.json()["status"] == "неявка"
@@ -658,3 +673,293 @@ async def test_settings_owner_only(api_client, business, master):
     # max_seats=2 меньше активных мест? мест пока 0 → ок; но 1 тоже ок
     resp = await api_client.patch("/api/coworking/settings", json={"max_seats": 2}, headers=OWNER_HEADERS)
     assert resp.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_calendar_hides_cancelled_bookings(api_client, business, seats, master):
+    resp = await api_client.post(
+        "/api/bookings",
+        json=booking_payload(seats[0]["id"], _tomorrow(12), _tomorrow(14), master_id=master.id),
+        headers=OWNER_HEADERS,
+    )
+    bid = resp.json()["id"]
+    params = {"from": _tomorrow(0), "to": _tomorrow(23)}
+    resp = await api_client.get(f"/api/seats/{seats[0]['id']}/calendar", params=params, headers=OWNER_HEADERS)
+    assert [e["id"] for e in resp.json()["entries"]] == [bid]
+
+    await api_client.post(f"/api/bookings/{bid}/cancel", json={"reason": "x"}, headers=OWNER_HEADERS)
+    resp = await api_client.get(f"/api/seats/{seats[0]['id']}/calendar", params=params, headers=OWNER_HEADERS)
+    assert resp.json()["entries"] == []
+
+
+# ---------------------------------------------------------------------------
+# Ревью 02: настройки, прошлое, hold, часы, места, исключения
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_settings_patch_persists_repeatedly(api_client, db_session, business):
+    from tg_studio.db.models import Business
+
+    business_id = business.id
+    for buf in (10, 20):
+        resp = await api_client.patch(
+            "/api/coworking/settings", json={"buffer_minutes": buf}, headers=OWNER_HEADERS
+        )
+        assert resp.status_code == 200
+    db_session.expire_all()
+    row = (await db_session.execute(select(Business).where(Business.id == business_id))).scalar_one()
+    assert row.coworking_settings["buffer_minutes"] == 20
+
+
+@pytest.mark.asyncio
+async def test_booking_in_past_rejected(api_client, business, seats, master):
+    day = (datetime.now(STUDIO_TZ) - timedelta(days=1)).date().isoformat()
+    resp = await api_client.post(
+        "/api/bookings",
+        json=booking_payload(seats[0]["id"], f"{day}T12:00:00", f"{day}T14:00:00"),
+        headers=MASTER_HEADERS,
+    )
+    assert resp.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_hold_deadline_not_after_start(api_client, db_session, business, seats, master):
+    # hold 72ч длиннее, чем время до завтрашней брони: дедлайн = начало брони
+    resp = await api_client.patch(
+        "/api/coworking/settings", json={"hold_ttl_hours": 72}, headers=OWNER_HEADERS
+    )
+    assert resp.status_code == 200
+    resp = await api_client.post(
+        "/api/bookings",
+        json=booking_payload(seats[0]["id"], _tomorrow(12), _tomorrow(14)),
+        headers=MASTER_HEADERS,
+    )
+    assert resp.status_code == 201, resp.text
+    booking = (await db_session.execute(select(Booking))).scalars().one()
+    deadline = booking.hold_deadline if booking.hold_deadline.tzinfo else booking.hold_deadline.replace(tzinfo=UTC)
+    assert deadline == booking.start.replace(tzinfo=UTC) if booking.start.tzinfo is None else deadline == booking.start
+
+
+@pytest.mark.asyncio
+async def test_closed_day_and_midnight_close(api_client, business, seats, master):
+    tomorrow = datetime.now(STUDIO_TZ) + timedelta(days=1)
+    wd = tomorrow.weekday()
+    other = (wd + 1) % 7
+    # работаем только в «другой» день до полуночи — завтра выходной
+    resp = await api_client.put(
+        "/api/studio-hours",
+        json={"entries": [{"weekday": other, "open_time": "10:00:00", "close_time": "00:00:00"}]},
+        headers=OWNER_HEADERS,
+    )
+    assert resp.status_code == 200, resp.text
+    resp = await api_client.post(
+        "/api/bookings",
+        json=booking_payload(seats[0]["id"], _tomorrow(12), _tomorrow(14)),
+        headers=MASTER_HEADERS,
+    )
+    assert resp.status_code == 400
+    # в рабочий «до полуночи» день бронь до 24:00 проходит (цена по правилу до 22:00 → 409/201 не важно, не 400 по часам)
+    day = (tomorrow + timedelta(days=1)).date().isoformat()
+    nxt = (tomorrow + timedelta(days=2)).date().isoformat()
+    resp = await api_client.post(
+        "/api/bookings",
+        json=booking_payload(seats[0]["id"], f"{day}T21:00:00", f"{nxt}T00:00:00"),
+        headers=MASTER_HEADERS,
+    )
+    assert "вне часов" not in resp.text
+
+
+@pytest.mark.asyncio
+async def test_studio_hours_overlap_rejected(api_client, business):
+    resp = await api_client.put(
+        "/api/studio-hours",
+        json={"entries": [
+            {"weekday": 0, "open_time": "10:00:00", "close_time": "14:00:00"},
+            {"weekday": 0, "open_time": "13:00:00", "close_time": "18:00:00"},
+        ]},
+        headers=OWNER_HEADERS,
+    )
+    assert resp.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_cannot_deactivate_seat_with_active_booking_via_patch(api_client, business, seats, master):
+    await api_client.post(
+        "/api/bookings",
+        json=booking_payload(seats[0]["id"], _tomorrow(12), _tomorrow(14)),
+        headers=MASTER_HEADERS,
+    )
+    resp = await api_client.patch(
+        f"/api/seats/{seats[0]['id']}", json={"is_active": False}, headers=OWNER_HEADERS
+    )
+    assert resp.status_code == 409
+    # свободное место выключается, а включить сверх лимита нельзя
+    resp = await api_client.patch(
+        f"/api/seats/{seats[1]['id']}", json={"is_active": False}, headers=OWNER_HEADERS
+    )
+    assert resp.status_code == 200
+    new = await api_client.post("/api/seats", json={"name": "Пятое"}, headers=OWNER_HEADERS)
+    assert new.status_code == 201
+    resp = await api_client.patch(
+        f"/api/seats/{seats[1]['id']}", json={"is_active": True}, headers=OWNER_HEADERS
+    )
+    assert resp.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_ops_exceptions_unclosed_past_booking(api_client, db_session, business, seats, master):
+    resp = await api_client.post(
+        "/api/bookings",
+        json=booking_payload(seats[0]["id"], _tomorrow(12), _tomorrow(14)),
+        headers=MASTER_HEADERS,
+    )
+    booking_id = resp.json()["id"]
+    booking = await db_session.get(Booking, booking_id)
+    booking.status = BookingStatus.confirmed.value
+    await db_session.commit()
+    await move_booking_to_past(db_session, booking_id)
+    resp = await api_client.get("/api/ops/exceptions", headers=OWNER_HEADERS)
+    kinds = [(e["booking_id"], e["kind"]) for e in resp.json()["exceptions"]]
+    assert (booking_id, "unclosed_past_booking") in kinds
+
+
+# ---------------------------------------------------------------------------
+# Продление (шаг — час) и приватность календаря
+# ---------------------------------------------------------------------------
+
+
+async def _topup(api_client, master_id, amount):
+    resp = await api_client.post(
+        f"/api/masters/{master_id}/topup", json={"amount": amount, "note": "тест"}, headers=OWNER_HEADERS
+    )
+    assert resp.status_code == 201, resp.text
+
+
+async def _book(api_client, seat_id, h1=12, h2=14, headers=MASTER_HEADERS):
+    resp = await api_client.post(
+        "/api/bookings", json=booking_payload(seat_id, _tomorrow(h1), _tomorrow(h2)), headers=headers
+    )
+    assert resp.status_code == 201, resp.text
+    return resp.json()
+
+
+@pytest.mark.asyncio
+async def test_extend_pending_reissues_invoice(api_client, db_session, business, seats, master):
+    b = await _book(api_client, seats[0]["id"])
+    resp = await api_client.post(f"/api/bookings/{b['id']}/extend", json={"hours": 1}, headers=MASTER_HEADERS)
+    assert resp.status_code == 200, resp.text
+    out = resp.json()
+    assert "15:00" in out["end"]
+    assert out["price_snapshot"]["final"] == 3000
+    from tg_studio.db.models import Payment
+
+    payments = (await db_session.execute(select(Payment).where(Payment.booking_id == b["id"]))).scalars().all()
+    pending = [p for p in payments if p.status == "pending"]
+    assert [float(p.amount) for p in pending] == [3000]  # старый счёт на 2000 закрыт
+
+
+@pytest.mark.asyncio
+async def test_extend_confirmed_charges_difference(api_client, db_session, business, seats, master):
+    await _topup(api_client, master.id, 5000)
+    b = await _book(api_client, seats[0]["id"])
+    resp = await api_client.post(f"/api/bookings/{b['id']}/pay", json={"method": "balance"}, headers=MASTER_HEADERS)
+    assert resp.status_code == 200
+    resp = await api_client.post(f"/api/bookings/{b['id']}/extend", json={"hours": 1}, headers=MASTER_HEADERS)
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["paid_amount"] == 3000
+    resp = await api_client.get("/api/me/balance", headers=MASTER_HEADERS)
+    assert resp.json()["balance"] == 2000
+
+
+@pytest.mark.asyncio
+async def test_extend_confirmed_insufficient_balance_keeps_booking(api_client, business, seats, master):
+    await _topup(api_client, master.id, 2000)
+    b = await _book(api_client, seats[0]["id"])
+    await api_client.post(f"/api/bookings/{b['id']}/pay", json={"method": "balance"}, headers=MASTER_HEADERS)
+    resp = await api_client.post(f"/api/bookings/{b['id']}/extend", json={"hours": 1}, headers=MASTER_HEADERS)
+    assert resp.status_code == 409
+    resp = await api_client.get(f"/api/bookings/{b['id']}", headers=MASTER_HEADERS)
+    assert resp.json()["paid_amount"] == 2000 and resp.json()["price_snapshot"]["final"] == 2000
+
+
+@pytest.mark.asyncio
+async def test_extend_conflicts_and_rights(api_client, business, seats, master, other_master):
+    b = await _book(api_client, seats[0]["id"])
+    await _book(api_client, seats[0]["id"], 14, 15, headers=OTHER_MASTER_HEADERS)
+    # дальше занято другим мастером
+    resp = await api_client.post(f"/api/bookings/{b['id']}/extend", json={"hours": 1}, headers=MASTER_HEADERS)
+    assert resp.status_code == 409
+    # чужую бронь продлить нельзя
+    resp = await api_client.post(f"/api/bookings/{b['id']}/extend", json={"hours": 1}, headers=OTHER_MASTER_HEADERS)
+    assert resp.status_code == 403
+    # шаг — целые часы
+    resp = await api_client.post(f"/api/bookings/{b['id']}/extend", json={"hours": 0}, headers=MASTER_HEADERS)
+    assert resp.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_master_calendar_hides_other_masters(api_client, business, seats, master, other_master):
+    mine = await _book(api_client, seats[0]["id"], 12, 13)
+    other = await _book(api_client, seats[1]["id"], 12, 13, headers=OTHER_MASTER_HEADERS)
+    resp = await api_client.post(
+        "/api/blocks",
+        json={"seat_id": seats[2]["id"], "start": _tomorrow(12), "end": _tomorrow(13), "reason": "ремонт"},
+        headers=OWNER_HEADERS,
+    )
+    assert resp.status_code == 201
+    from_s, to_s = _tomorrow(0), _tomorrow(23, 59)
+    resp = await api_client.get(f"/api/calendar?from={from_s}&to={to_s}", headers=MASTER_HEADERS)
+    entries = {(e["kind"], e["id"]): e for e in resp.json()["entries"]}
+    assert entries[("booking", mine["id"])]["master_name"] == "Мастер Тест"
+    busy_other = entries[("busy", other["id"])]
+    assert busy_other["master_name"] is None and busy_other["status"] is None
+    assert all(e["kind"] != "block" for e in entries.values())
+    assert [e for e in entries.values() if e["kind"] == "busy" and e["reason"] is not None] == []
+    # владелец видит всё
+    resp = await api_client.get(f"/api/calendar?from={from_s}&to={to_s}", headers=OWNER_HEADERS)
+    owner_entries = {(e["kind"], e["id"]): e for e in resp.json()["entries"]}
+    assert owner_entries[("booking", other["id"])]["master_name"] == "Второй"
+    # причины блокировок мастеру недоступны и через /blocks
+    resp = await api_client.get("/api/blocks", headers=MASTER_HEADERS)
+    assert resp.status_code in (401, 403)
+
+
+@pytest.mark.asyncio
+async def test_conflict_detail_has_no_ids(api_client, business, seats, master, other_master):
+    await _book(api_client, seats[0]["id"], headers=OTHER_MASTER_HEADERS)
+    resp = await api_client.post(
+        "/api/bookings", json=booking_payload(seats[0]["id"], _tomorrow(12), _tomorrow(14)), headers=MASTER_HEADERS
+    )
+    assert resp.status_code == 409
+    assert all("id" not in c for c in resp.json()["detail"]["conflicts"])
+
+
+@pytest.mark.asyncio
+async def test_start_must_be_on_step_grid(api_client, business, seats, master):
+    # шаг 30 мин: 12:10–13:10 — длительность кратна, но начало мимо сетки
+    resp = await api_client.post(
+        "/api/bookings",
+        json=booking_payload(seats[0]["id"], _tomorrow(12, 10), _tomorrow(13, 10)),
+        headers=MASTER_HEADERS,
+    )
+    assert resp.status_code == 400
+    resp = await api_client.post(
+        "/api/bookings",
+        json=booking_payload(seats[0]["id"], _tomorrow(12, 30), _tomorrow(13, 30)),
+        headers=MASTER_HEADERS,
+    )
+    assert resp.status_code == 201
+
+
+@pytest.mark.asyncio
+async def test_bookings_pagination_and_calendar_cap(api_client, business, seats, master):
+    for h in (10, 12, 14):
+        await _book(api_client, seats[0]["id"], h, h + 1)
+    resp = await api_client.get("/api/bookings?limit=2", headers=MASTER_HEADERS)
+    data = resp.json()
+    assert (data["total"], data["limit"], data["offset"], len(data["bookings"])) == (3, 2, 0, 2)
+    resp = await api_client.get("/api/bookings?limit=2&offset=2", headers=MASTER_HEADERS)
+    assert len(resp.json()["bookings"]) == 1
+    resp = await api_client.get("/api/calendar?from=2026-01-01T00:00:00&to=2026-06-01T00:00:00", headers=MASTER_HEADERS)
+    assert resp.status_code == 400

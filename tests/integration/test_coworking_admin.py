@@ -38,6 +38,7 @@ from ..conftest import (
     make_business,
     make_init_data_headers,
     make_master,
+    move_booking_to_past,
     make_user,
 )
 
@@ -315,6 +316,7 @@ async def test_visit_marks_validation(api_client, db_session, business, seats, m
     assert resp.status_code == 409
 
     # Неявка админом
+    await move_booking_to_past(db_session, b2["id"])
     resp = await api_client.post(f"/api/bookings/{b2['id']}/no-show", headers=ADMIN_HEADERS)
     assert resp.status_code == 200
     assert resp.json()["status"] == BookingStatus.no_show.value
@@ -618,7 +620,10 @@ async def test_admin_marks_booking_invoice_paid(api_client, db_session, business
     await db_session.commit()
     other_headers = make_init_data_headers(77777)
     resp = await api_client.post(f"/api/payments/{payment_id}/mark-paid", headers=other_headers)
-    assert resp.status_code == 404
+    assert resp.status_code == 403
+    # и мастер брони не может подтвердить свою оплату сам
+    resp = await api_client.post(f"/api/payments/{payment_id}/mark-paid", headers=MASTER_HEADERS)
+    assert resp.status_code == 403
 
     # Админ подтверждает ручную оплату → бронь подтверждена, проводка topup
     resp = await api_client.post(f"/api/payments/{payment_id}/mark-paid", headers=ADMIN_HEADERS)
@@ -647,6 +652,7 @@ async def test_admin_marks_booking_invoice_paid(api_client, db_session, business
 @pytest.mark.asyncio
 async def test_ops_exceptions_lists_no_show(api_client, db_session, business, seats, master, admin):
     b = await _make_confirmed_booking(api_client, seats, master)
+    await move_booking_to_past(db_session, b["id"])
     resp = await api_client.post(f"/api/bookings/{b['id']}/no-show", headers=ADMIN_HEADERS)
     assert resp.status_code == 200
     ex = (await api_client.get("/api/ops/exceptions", headers=ADMIN_HEADERS)).json()["exceptions"]

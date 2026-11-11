@@ -36,7 +36,6 @@ from tg_studio.config import settings
 from tg_studio.db.base import Base
 from tg_studio.db.models import (
     Business,
-    Client,
     Master,
     User,
     UserRole,
@@ -138,20 +137,6 @@ async def make_master(
     return obj
 
 
-async def make_client(
-    session: AsyncSession,
-    telegram_id: int = 42,
-    full_name: str = "Test Client",
-) -> Client:
-    user = await make_user(
-        session, telegram_id=telegram_id, first_name=full_name, role=UserRole.client
-    )
-    obj = Client(user_id=user.id, telegram_id=telegram_id, full_name=full_name)
-    session.add(obj)
-    await session.flush()
-    return obj
-
-
 def make_init_data_headers(telegram_id: int, first_name: str = "Test") -> dict:
     """Заголовок Authorization с подписанным Telegram initData — как в миниаппе.
 
@@ -165,3 +150,16 @@ def make_init_data_headers(telegram_id: int, first_name: str = "Test") -> dict:
     secret_key = hmac.new(b"WebAppData", settings.bot_token.encode(), hashlib.sha256).digest()
     params["hash"] = hmac.new(secret_key, data_check_string.encode(), hashlib.sha256).hexdigest()
     return {"Authorization": f"TelegramInitData {urlencode(params)}"}
+
+
+async def move_booking_to_past(db_session, booking_id: int, hours_ago: int = 3) -> None:
+    """Сдвинуть бронь в прошлое (неявку можно отметить только после start + grace)."""
+    from datetime import UTC, datetime, timedelta
+
+    from tg_studio.db.models import Booking
+
+    booking = await db_session.get(Booking, booking_id)
+    now = datetime.now(UTC)
+    booking.start = now - timedelta(hours=hours_ago)
+    booking.end = now - timedelta(hours=hours_ago - 1)
+    await db_session.commit()

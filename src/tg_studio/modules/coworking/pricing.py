@@ -12,9 +12,10 @@
 3. part_amount = hourly_rate × минуты/60, округляем до 2 знаков (ROUND_HALF_UP);
    base = Σ частей. Если хоть один сегмент не покрыт правилом → 409
    «не задана цена на этот интервал».
-4. Скидки (discount_rules, по priority): resident — если мастер-резидент,
-   min_hours — если длительность брони ≥ порога. percent — доля от base,
-   fixed — фиксированная сумма. discount = Σ, не больше base; final = base − discount.
+4. Скидка (discount_rules, kind=min_hours): одна — с наибольшим достигнутым порогом
+   длительности (порог и размер настраивает владелец). percent — доля от base,
+   fixed — фиксированная сумма. discount не больше base; final = base − discount.
+   Скидки резидентам не считаются (тариф резидента владелец задаёт сам).
 
 Снимок (словарь) пишется в bookings.price_snapshot — единственный источник
 стоимости брони дальше; смена правил не трогает существующие брони.
@@ -30,7 +31,7 @@ from fastapi import HTTPException
 from sqlalchemy import select
 
 from tg_studio.db.models import DiscountRule, Master, PriceRule, PriceRuleDayKind
-from tg_studio.timeutil import STUDIO_TZ
+from tg_studio.timeutil import STUDIO_TZ, interval_bounds
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +39,9 @@ logger = logging.getLogger(__name__)
 CURRENCY = "KZT"
 
 _CENT = Decimal("0.01")
+
+# Длиннее суток-недели расчёт не нужен (бронь ограничена часами студии) — защита от квоты на годы
+MAX_QUOTE_RANGE = timedelta(days=7)
 
 
 def _round2(value: Decimal | float) -> float:
@@ -61,9 +65,7 @@ def _rule_window_on_day(rule: PriceRule, day: date) -> tuple[datetime, datetime]
     """Окно правила [time_from, time_to) на конкретную дату в aware-времени (UTC)."""
     if not _rule_matches_day(rule, day):
         return None
-    tz_start = datetime.combine(day, rule.time_from, tzinfo=STUDIO_TZ)
-    tz_end = datetime.combine(day, rule.time_to, tzinfo=STUDIO_TZ)
-    return tz_start, tz_end
+    return interval_bounds(day, rule.time_from, rule.time_to)
 
 
 def _pick_rule(segment_start: datetime, segment_end: datetime, rules: list[PriceRule]) -> PriceRule | None:
@@ -135,39 +137,25 @@ def _split_into_segments(
 def _apply_discounts(
     base: float,
     duration_minutes: int,
-    master: Master | None,
     rules: list[DiscountRule],
 ) -> tuple[float, list[dict]]:
-    """Скидки по правилам (по priority, затем id). discount не больше base."""
-    applied: list[dict] = []
-    total = Decimal("0")
-    ordered = sorted(rules, key=lambda r: (r.priority, r.id), reverse=True)
-    for rule in ordered:
-        if rule.kind == "resident":
-            if master is None or not master.is_resident:
-                continue
-        elif rule.kind == "min_hours":
-            if rule.min_hours is None or duration_minutes < rule.min_hours * 60:
-                continue
-        else:
-            continue
-        if rule.percent is not None:
-            amount = Decimal(str(base)) * Decimal(str(rule.percent))
-        elif rule.fixed_amount is not None:
-            amount = Decimal(str(rule.fixed_amount))
-        else:
-            continue
-        total += amount
-        applied.append(
-            {
-                "rule_id": rule.id,
-                "name": rule.name,
-                "kind": rule.kind,
-                "amount": _round2(amount),
-            }
-        )
-    discount = min(_round2(total), base)
-    return discount, applied
+    """Скидка по длительности: действует одна — с наибольшим порогом min_hours среди
+    достигнутых (ступени не складываются); при равном пороге — выше priority, затем id."""
+    reached = [
+        r for r in rules
+        if r.kind == "min_hours" and r.min_hours is not None and duration_minutes >= r.min_hours * 60
+    ]
+    if not reached:
+        return 0.0, []
+    rule = max(reached, key=lambda r: (r.min_hours, r.priority, r.id))
+    if rule.percent is not None:
+        amount = Decimal(str(base)) * Decimal(str(rule.percent))
+    elif rule.fixed_amount is not None:
+        amount = Decimal(str(rule.fixed_amount))
+    else:
+        return 0.0, []
+    discount = min(_round2(amount), base)
+    return discount, [{"rule_id": rule.id, "name": rule.name, "kind": rule.kind, "amount": discount}]
 
 
 async def quote_booking_price(
@@ -189,6 +177,8 @@ async def quote_booking_price(
     if end.tzinfo is None:
         end = end.replace(tzinfo=STUDIO_TZ)
 
+    if end - start > MAX_QUOTE_RANGE:
+        raise HTTPException(status_code=400, detail=f"Интервал расчёта не длиннее {MAX_QUOTE_RANGE.days} суток")
     rules = await _active_price_rules(session, business_id, seat_id)
     segments = _split_into_segments(start, end, rules)
 
@@ -233,7 +223,7 @@ async def quote_booking_price(
     base = _round2(sum(Decimal(str(p["amount"])) for p in parts))
     duration_minutes = int((end - start).total_seconds() // 60)
     discount_rules = await _active_discount_rules(session, business_id, seat_id)
-    discount, discounts = _apply_discounts(base, duration_minutes, master, discount_rules)
+    discount, discounts = _apply_discounts(base, duration_minutes, discount_rules)
     final = _round2(Decimal(str(base)) - Decimal(str(discount)))
 
     return {

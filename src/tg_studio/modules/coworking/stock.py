@@ -114,7 +114,7 @@ def _crossed_low(supply: Supply, new_quantity: Decimal) -> bool:
 
 async def notify_low_stock(session, supply: Supply) -> None:
     """Telegram-уведомление владельцу о низком остатке (best-effort)."""
-    from tg_studio.modules.chat.service import resolve_owner_telegram_id, send_text_to_telegram
+    from tg_studio.modules.notify import resolve_owner_telegram_id, send_text_to_telegram
 
     try:
         owner_tg_id = await resolve_owner_telegram_id(session)
