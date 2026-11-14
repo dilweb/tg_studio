@@ -10,6 +10,7 @@ celery_app = Celery(
     include=[
         "tg_studio.tasks.email_verification",
         "tg_studio.tasks.booking_holds",
+        "tg_studio.tasks.booking_reminders",
     ],
 )
 
@@ -23,6 +24,11 @@ celery_app.conf.update(
         # Истёкший hold брони места (ожидает_оплаты) → истекла_оплата, место свободно
         "expire-booking-holds": {
             "task": "expire_booking_holds",
+            "schedule": crontab(minute="*/5"),
+        },
+        # Напоминания мастерам: «оплатите до …» и «скоро бронь» с кнопкой «Подтвердить»
+        "send-booking-reminders": {
+            "task": "send_booking_reminders",
             "schedule": crontab(minute="*/5"),
         },
     },

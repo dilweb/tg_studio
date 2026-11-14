@@ -13,6 +13,7 @@ from tg_studio.modules.coworking.reports import (
     PAID_BOOKING_STATUSES,
     ReportData,
     _booking_interval,
+    _booking_price,
     _overlap_seconds,
     dec,
     money,
@@ -47,8 +48,10 @@ def _finish(workbook: Workbook) -> bytes:
             sheet.column_dimensions[get_column_letter(column)].width = min(max(width + 2, 10), 40)
         for row in sheet.iter_rows(min_row=2):
             for cell in row:
-                if isinstance(cell.value, (int, float)) and cell.column > 2:
+                if isinstance(cell.value, float):  # int — это id броней/продаж/платежей
                     cell.number_format = "#,##0.00"
+                elif isinstance(cell.value, str) and cell.value[:1] in ("=", "+", "-", "@"):
+                    cell.data_type = "s"  # текст от пользователей не должен стать формулой
     output = BytesIO()
     workbook.save(output)
     return output.getvalue()
@@ -82,7 +85,7 @@ def build_revenue_xlsx(data: ReportData, revenue: dict, money_data: dict, from_:
         seconds = _overlap_seconds(start, end, from_, to)
         if not duration or not seconds:
             continue
-        amount = dec(booking.paid_amount) * dec(seconds) / dec(duration)
+        amount = _booking_price(booking) * dec(seconds) / dec(duration)
         linked = payments_by_booking.get(booking.id, [])
         external = next((p for p in linked if p.external_invoice_id), None)
         sheet.append([
@@ -151,4 +154,14 @@ def build_revenue_xlsx(data: ReportData, revenue: dict, money_data: dict, from_:
         "ИТОГО", None, None, None, None, None, money(amount_total), None,
         money(cost_total), money(amount_total - cost_total),
     ])
+    receipts_sheet = _sheet(workbook, "Поступления", [
+        "Дата", "Тип", "Мастер", "Сумма, ₸", "Способ", "ID платежа", "Внешний ID", "Бронь", "Продажа",
+    ])
+    for row in sorted(money_data["payments"], key=lambda r: utc(r["date"])):
+        receipts_sheet.append([
+            _local(row["date"]), {"topup": "пополнение", "booking": "бронь", "sale": "продажа"}[row["type"]],
+            row["master_name"], row["amount"], row["method"], row["payment_id"],
+            row["external_id"], row["booking_id"], row["sale_id"],
+        ])
+    receipts_sheet.append(["ИТОГО", None, None, money_data["receipts"]])
     return _finish(workbook)

@@ -17,7 +17,7 @@ class ProductCreate(BaseModel):
     quantity: float = Field(0, ge=0)
     min_quantity: float | None = Field(None, ge=0)
     purchase_price: float | None = Field(None, ge=0)
-    sale_price: float | None = Field(None, ge=0)
+    sale_price: float | None = Field(None, gt=0)
     note: str | None = Field(None, max_length=2000)
 
 
@@ -27,7 +27,7 @@ class ProductUpdate(BaseModel):
     unit: str | None = Field(None, min_length=1, max_length=16)
     min_quantity: float | None = Field(None, ge=0)
     purchase_price: float | None = Field(None, ge=0)
-    sale_price: float | None = Field(None, ge=0)
+    sale_price: float | None = Field(None, gt=0)
     note: str | None = Field(None, max_length=2000)
     is_active: bool | None = None
 
@@ -152,6 +152,8 @@ class SaleCreate(BaseModel):
     def _check(self):
         if self.payment_method not in ("balance", "cash", "card"):
             raise ValueError("payment_method: balance | cash | card")
+        if self.master_id is not None and (self.buyer_name or self.buyer_phone):
+            raise ValueError("Укажите либо мастера, либо разового покупателя")
         # Мастер может не передавать master_id — API подставит его сам.
         # Для админа/владельца без master_id нужен разовый контакт.
         if (

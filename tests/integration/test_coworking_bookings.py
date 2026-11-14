@@ -524,52 +524,21 @@ async def test_reschedule_and_cancel(api_client, business, seats, master):
 
 
 @pytest.mark.asyncio
-async def test_owner_marks_start_complete_no_show(api_client, business, seats, master, db_session):
+async def test_cancel_only_before_start(api_client, business, seats, master, db_session):
+    """Начавшуюся бронь не отменить ни мастеру, ни владельцу."""
     resp = await api_client.post(
         "/api/bookings",
         json=booking_payload(seats[0]["id"], _tomorrow(12), _tomorrow(14)),
         headers=MASTER_HEADERS,
     )
     bid = resp.json()["id"]
-    # Начать можно только подтверждённую — пока ожидает_оплаты → 409
-    resp = await api_client.post(f"/api/bookings/{bid}/start", headers=OWNER_HEADERS)
-    assert resp.status_code == 409
-    # Подтвердим напрямую в БД (оплата придёт в 04)
-    booking = (await db_session.execute(select(Booking).where(Booking.id == bid))).scalar_one()
+    booking = await db_session.get(Booking, bid)
     booking.status = BookingStatus.confirmed.value
     await db_session.commit()
-
-    resp = await api_client.post(f"/api/bookings/{bid}/start", headers=OWNER_HEADERS)
-    assert resp.status_code == 200
-    assert resp.json()["status"] == "начата"
-    assert resp.json()["started_at"] is not None
-    resp = await api_client.post(f"/api/bookings/{bid}/complete", headers=OWNER_HEADERS)
-    assert resp.status_code == 200
-    assert resp.json()["status"] == "завершена"
-    assert resp.json()["completed_at"] is not None
-
-    # Неявка по другой брони
-    resp = await api_client.post(
-        "/api/bookings",
-        json=booking_payload(seats[1]["id"], _tomorrow(15), _tomorrow(16), master_id=master.id),
-        headers=OWNER_HEADERS,
-    )
-    bid2 = resp.json()["id"]
-    # неоплаченную бронь и бронь до начала отметить неявкой нельзя
-    resp = await api_client.post(f"/api/bookings/{bid2}/no-show", headers=OWNER_HEADERS)
-    assert resp.status_code == 409
-    booking2 = (await db_session.execute(select(Booking).where(Booking.id == bid2))).scalar_one()
-    booking2.status = BookingStatus.confirmed.value
-    await db_session.commit()
-    resp = await api_client.post(f"/api/bookings/{bid2}/no-show", headers=OWNER_HEADERS)
-    assert resp.status_code == 409  # до start + grace
-    await move_booking_to_past(db_session, bid2)
-    resp = await api_client.post(f"/api/bookings/{bid2}/no-show", headers=OWNER_HEADERS)
-    assert resp.status_code == 200
-    assert resp.json()["status"] == "неявка"
-    # Мастер не может отмечать
-    resp = await api_client.post(f"/api/bookings/{bid2}/start", headers=MASTER_HEADERS)
-    assert resp.status_code == 403
+    await move_booking_to_past(db_session, bid)
+    for headers in (MASTER_HEADERS, OWNER_HEADERS):
+        resp = await api_client.post(f"/api/bookings/{bid}/cancel", json={"reason": "x"}, headers=headers)
+        assert resp.status_code == 409
 
 
 # ---------------------------------------------------------------------------
@@ -808,7 +777,7 @@ async def test_cannot_deactivate_seat_with_active_booking_via_patch(api_client, 
 
 
 @pytest.mark.asyncio
-async def test_ops_exceptions_unclosed_past_booking(api_client, db_session, business, seats, master):
+async def test_past_confirmed_booking_is_not_an_exception(api_client, db_session, business, seats, master):
     resp = await api_client.post(
         "/api/bookings",
         json=booking_payload(seats[0]["id"], _tomorrow(12), _tomorrow(14)),
@@ -820,8 +789,8 @@ async def test_ops_exceptions_unclosed_past_booking(api_client, db_session, busi
     await db_session.commit()
     await move_booking_to_past(db_session, booking_id)
     resp = await api_client.get("/api/ops/exceptions", headers=OWNER_HEADERS)
-    kinds = [(e["booking_id"], e["kind"]) for e in resp.json()["exceptions"]]
-    assert (booking_id, "unclosed_past_booking") in kinds
+    # прошедшая подтверждённая бронь состоялась — закрывать её вручную не нужно
+    assert booking_id not in [e["booking_id"] for e in resp.json()["exceptions"]]
 
 
 # ---------------------------------------------------------------------------

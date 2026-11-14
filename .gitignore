@@ -18,3 +18,6 @@ credentials.json
 
 # Сервисный аккаунт Google (оригинальное имя файла ключа)
 bnztattoo-3a0c8faa7ae4.json
+
+# Нагрузочный тест: отчёты и логи прогонов
+loadtest-reports/

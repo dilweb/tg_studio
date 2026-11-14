@@ -1,16 +1,14 @@
 """API склада и продаж коворкинга (06).
 
-Роли:
-- мастер: каталог read-only + покупка со своего баланса (POST /sales, balance, на себя);
-- админ: закупка/обеспечение/ревизия, продажи (касса), возвраты, журнал;
-- владелец: всё то же + управление карточками товаров.
+Роли: склад и касса — только владелец и администратор студии; мастер склад не видит
+(покупки мастера оформляет админ, они видны мастеру в его ledger).
 """
 
 from fastapi import APIRouter, HTTPException, Query, Response
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import selectinload
 
-from tg_studio.api.admin_deps import AdminBusinessAndSelfDep, MasterBusinessAndSelfDep, OwnerBusinessDep
+from tg_studio.api.admin_deps import AdminBusinessAndSelfDep
 from tg_studio.api.auth import CurrentUserDep
 from tg_studio.api.deps import SessionDep
 from tg_studio.db.models import (
@@ -19,7 +17,7 @@ from tg_studio.db.models import (
     Payment,
     PaymentStatus,
     Sale,
-    SaleStatus,
+    SaleItem,
     StudioAdmin,
     Supply,
     SupplyMovement,
@@ -56,7 +54,7 @@ async def _get_sale(session, business_id: int, sale_id: int) -> Sale:
     sale = (
         await session.execute(
             select(Sale)
-            .options(selectinload(Sale.items))
+            .options(selectinload(Sale.items).selectinload(SaleItem.supply))
             .where(Sale.id == sale_id, Sale.business_id == business_id)
         )
     ).scalar_one_or_none()
@@ -70,7 +68,7 @@ async def _sale_out(session, sale: Sale, *, with_payment_url: bool = False) -> S
     admin = await session.get(StudioAdmin, sale.admin_id) if sale.admin_id else None
     items = []
     for i in sale.items:
-        supply = await session.get(Supply, i.supply_id)
+        supply = i.supply
         items.append(
             SaleItemOut(
                 id=i.id,
@@ -120,12 +118,12 @@ async def _sale_out(session, sale: Sale, *, with_payment_url: bool = False) -> S
 @router.get("/products", response_model=ProductListResponse)
 async def list_products(
     session: SessionDep,
-    actor: MasterBusinessAndSelfDep,
+    actor: AdminBusinessAndSelfDep,
     category: str | None = Query(None),
     low_only: bool = Query(False),
     include_inactive: bool = Query(False),
 ):
-    """Каталог склада: мастер — активные позиции с ценами; владелец/админ — всё."""
+    """Каталог склада (владелец/админ)."""
     business, _ = actor
     stmt = select(Supply).where(Supply.business_id == business.id)
     if not include_inactive:
@@ -294,9 +292,16 @@ async def stock_movements(
     from_: str | None = Query(None, alias="from"),
     to: str | None = Query(None),
     limit: int = Query(200, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
 ):
     """Журнал движений склада (владелец/админ)."""
     from datetime import datetime
+
+    def _parse(value: str) -> datetime:
+        try:
+            return ensure_tz(datetime.fromisoformat(value))
+        except ValueError:
+            raise HTTPException(status_code=422, detail="Дата должна быть в формате ISO 8601") from None
 
     business, _ = actor
     stmt = (
@@ -310,10 +315,15 @@ async def stock_movements(
     if kind is not None:
         stmt = stmt.where(SupplyMovement.kind == kind)
     if from_:
-        stmt = stmt.where(SupplyMovement.created_at >= ensure_tz(datetime.fromisoformat(from_)))
+        stmt = stmt.where(SupplyMovement.created_at >= _parse(from_))
     if to:
-        stmt = stmt.where(SupplyMovement.created_at < ensure_tz(datetime.fromisoformat(to)))
-    rows = (await session.execute(stmt.order_by(SupplyMovement.id.desc()).limit(limit))).all()
+        stmt = stmt.where(SupplyMovement.created_at < _parse(to))
+    total = (
+        await session.execute(select(func.count()).select_from(stmt.order_by(None).subquery()))
+    ).scalar_one()
+    rows = (
+        await session.execute(stmt.order_by(SupplyMovement.id.desc()).limit(limit).offset(offset))
+    ).all()
     movements = [
         StockMovementOut(
             id=m.id,
@@ -331,7 +341,7 @@ async def stock_movements(
         )
         for m, supply_name, master_name in rows
     ]
-    return StockMovementListResponse(movements=movements, total=len(movements))
+    return StockMovementListResponse(movements=movements, total=total)
 
 
 # ---------------------------------------------------------------------------
@@ -342,58 +352,47 @@ async def stock_movements(
 @router.get("/sales", response_model=SaleListResponse)
 async def list_sales(
     session: SessionDep,
-    actor: MasterBusinessAndSelfDep,
+    actor: AdminBusinessAndSelfDep,
     master_id: int | None = Query(None),
     admin_id: int | None = Query(None),
     status: str | None = Query(None),
     limit: int = Query(200, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
 ):
-    """Продажи: мастер — только свои покупки; владелец/админ — все."""
-    business, self_master = actor
+    """Продажи (владелец/админ)."""
+    business, _ = actor
     stmt = select(Sale).where(Sale.business_id == business.id)
-    if self_master is not None:
-        stmt = stmt.where(Sale.master_id == self_master.id)
-    elif master_id is not None:
+    if master_id is not None:
         stmt = stmt.where(Sale.master_id == master_id)
     if admin_id is not None:
         stmt = stmt.where(Sale.admin_id == admin_id)
     if status is not None:
         stmt = stmt.where(Sale.status == status)
+    total = (
+        await session.execute(select(func.count()).select_from(stmt.order_by(None).subquery()))
+    ).scalar_one()
     rows = (
         await session.execute(
-            stmt.options(selectinload(Sale.items)).order_by(Sale.id.desc()).limit(limit)
+            stmt.options(selectinload(Sale.items).selectinload(SaleItem.supply))
+            .order_by(Sale.id.desc())
+            .limit(limit)
+            .offset(offset)
         )
     ).scalars().unique().all()
-    return SaleListResponse(sales=[await _sale_out(session, s) for s in rows], total=len(rows))
+    return SaleListResponse(sales=[await _sale_out(session, s) for s in rows], total=total)
 
 
 @router.post("/sales", response_model=SaleOut, status_code=201)
 async def create_sale(
     body: SaleCreate,
     session: SessionDep,
-    actor: MasterBusinessAndSelfDep,
+    actor: AdminBusinessAndSelfDep,
     user: CurrentUserDep,
 ):
-    """Продажа (касса). Мастер — только себе и только с баланса; админ/владелец —
-    любому покупателю, любым способом. Атомарно: остатки + sale + оплата + апсейл.
+    """Продажа (касса, владелец/админ): любому покупателю, любым способом.
+    Атомарно: остатки + sale + оплата + апсейл (автор — админ).
     """
-    business, self_master = actor
-    self_admin = None
-    if user.role.value == "admin":
-        self_admin = (
-            await session.execute(
-                select(StudioAdmin).where(
-                    StudioAdmin.user_id == user.id, StudioAdmin.is_active.is_(True)
-                )
-            )
-        ).scalar_one_or_none()
-    if self_master is not None:
-        # Мастер покупает себе и только с баланса
-        if body.master_id is not None and body.master_id != self_master.id:
-            raise HTTPException(status_code=403, detail="Мастер покупает только себе")
-        if body.payment_method != "balance":
-            raise HTTPException(status_code=403, detail="Мастер оплачивает покупки только с баланса")
-        body.master_id = self_master.id
+    business, self_admin = actor
     try:
         sale = await stock.create_sale(session, business, body, user.id, self_admin)
         low_stock = [
@@ -422,12 +421,10 @@ async def create_sale(
 async def get_sale(
     sale_id: int,
     session: SessionDep,
-    actor: MasterBusinessAndSelfDep,
+    actor: AdminBusinessAndSelfDep,
 ):
-    business, self_master = actor
+    business, _ = actor
     sale = await _get_sale(session, business.id, sale_id)
-    if self_master is not None and sale.master_id != self_master.id:
-        raise HTTPException(status_code=403, detail="Мастер видит только свои покупки")
     return await _sale_out(session, sale, with_payment_url=True)
 
 

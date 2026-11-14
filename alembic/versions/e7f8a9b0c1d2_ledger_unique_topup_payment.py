@@ -6,7 +6,7 @@ payment_id невозможна. Если в таблице уже есть ду
   SELECT payment_id, count(*) FROM ledger_entries
   WHERE kind = 'topup' GROUP BY payment_id HAVING count(*) > 1;
 
-Revision ID: b8c9d0e1f2a3
+Revision ID: e7f8a9b0c1d2
 Revises: a7b8c9d0e1f2
 Create Date: 2026-11-11
 """
@@ -14,7 +14,7 @@ Create Date: 2026-11-11
 import sqlalchemy as sa
 from alembic import op
 
-revision = "b8c9d0e1f2a3"
+revision = "e7f8a9b0c1d2"
 down_revision = "a7b8c9d0e1f2"
 branch_labels = None
 depends_on = None

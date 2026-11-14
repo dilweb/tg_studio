@@ -31,9 +31,24 @@ const settingsForm = reactive({
   step_minutes: '30',
   buffer_minutes: '0',
   hold_ttl_hours: '24',
-  cancel_full_refund_hours: '24',
-  no_show_hold_percent: '100',
+  // ступени возврата при отмене мастером: за ≥ hours_before ч до начала → percent %
+  refund_tiers: [],
+  booking_reminder_minutes: '60',
+  payment_reminder_minutes: '120',
 })
+
+function addRefundTier() {
+  settingsForm.refund_tiers.push({ hours_before: '', percent: '' })
+}
+
+function removeRefundTier(index) {
+  settingsForm.refund_tiers.splice(index, 1)
+}
+
+function refundTiersText(tiers) {
+  if (!tiers?.length) return 'отмена мастером — без возврата'
+  return tiers.map((t) => `≥${t.hours_before} ч — ${t.percent}%`).join(', ') + ', позже — 0%'
+}
 
 // --- часы работы ---
 const showHours = ref(false)
@@ -110,8 +125,11 @@ async function load() {
       step_minutes: String(settingsData.step_minutes),
       buffer_minutes: String(settingsData.buffer_minutes),
       hold_ttl_hours: String(settingsData.hold_ttl_hours),
-      cancel_full_refund_hours: String(settingsData.cancel_full_refund_hours),
-      no_show_hold_percent: String(settingsData.no_show_hold_percent),
+      refund_tiers: settingsData.refund_tiers.map((t) => ({
+        hours_before: String(t.hours_before), percent: String(t.percent),
+      })),
+      booking_reminder_minutes: String(settingsData.booking_reminder_minutes),
+      payment_reminder_minutes: String(settingsData.payment_reminder_minutes),
     })
     hoursFormClear()
     for (const e of hoursData.entries) {
@@ -202,8 +220,11 @@ async function submitSettings() {
       step_minutes: Number(settingsForm.step_minutes),
       buffer_minutes: Number(settingsForm.buffer_minutes),
       hold_ttl_hours: Number(settingsForm.hold_ttl_hours),
-      cancel_full_refund_hours: Number(settingsForm.cancel_full_refund_hours),
-      no_show_hold_percent: Number(settingsForm.no_show_hold_percent),
+      refund_tiers: settingsForm.refund_tiers.map((t) => ({
+        hours_before: Number(t.hours_before), percent: Number(t.percent),
+      })),
+      booking_reminder_minutes: Number(settingsForm.booking_reminder_minutes),
+      payment_reminder_minutes: Number(settingsForm.payment_reminder_minutes),
     })
     notice.value = 'Настройки сохранены'
     showSettings.value = false
@@ -649,12 +670,25 @@ onMounted(() => {
               <input v-model="settingsForm.hold_ttl_hours" type="number" min="1" max="168" />
             </div>
             <div class="field">
-              <label>Отмена за ≥ N часов до начала = 100% возврат, ч</label>
-              <input v-model="settingsForm.cancel_full_refund_hours" type="number" min="0" max="720" />
+              <label>Напоминание «скоро бронь» (с кнопкой «Подтвердить»), мин до начала</label>
+              <input v-model="settingsForm.booking_reminder_minutes" type="number" min="5" max="1440" />
             </div>
             <div class="field">
-              <label>При отмене позже — удержание, %</label>
-              <input v-model="settingsForm.no_show_hold_percent" type="number" min="0" max="100" />
+              <label>Напоминание «оплатите», мин до дедлайна оплаты</label>
+              <input v-model="settingsForm.payment_reminder_minutes" type="number" min="5" max="1440" />
+            </div>
+            <div class="field">
+              <label>Возврат при отмене мастером (площадкой — всегда 100%)</label>
+              <div v-for="(tier, index) in settingsForm.refund_tiers" :key="index" class="row-actions">
+                <span>за ≥</span>
+                <input v-model="tier.hours_before" type="number" min="0" max="720" style="width: 6em" />
+                <span>ч до начала —</span>
+                <input v-model="tier.percent" type="number" min="0" max="100" style="width: 5em" />
+                <span>%</span>
+                <button class="btn btn-sm btn-ghost" type="button" @click="removeRefundTier(index)">✕</button>
+              </div>
+              <small class="muted">Позже последней ступени — 0%.</small>
+              <button class="btn btn-sm" type="button" @click="addRefundTier">+ Ступень</button>
             </div>
           </div>
           <div v-if="showSettings" class="row-actions">
@@ -664,8 +698,9 @@ onMounted(() => {
           <div v-else class="muted">
             Мест: {{ settings.max_seats }} · мин. длительность {{ settings.min_duration_minutes }} мин ·
             шаг {{ settings.step_minutes }} мин · буфер {{ settings.buffer_minutes }} мин ·
-            hold {{ settings.hold_ttl_hours }} ч · отмена за ≥{{ settings.cancel_full_refund_hours }} ч = 100% возврат,
-            позже — удержание {{ settings.no_show_hold_percent }}%
+            hold {{ settings.hold_ttl_hours }} ч · возврат: {{ refundTiersText(settings.refund_tiers) }} ·
+            напоминания: за {{ settings.booking_reminder_minutes }} мин до брони,
+            за {{ settings.payment_reminder_minutes }} мин до дедлайна оплаты
           </div>
         </div>
 

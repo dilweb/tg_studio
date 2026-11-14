@@ -1,6 +1,7 @@
 """API дашборда, отчётов и Excel владельца (07)."""
 
 from datetime import datetime
+from typing import Literal
 
 from fastapi import APIRouter, Query, Response
 
@@ -29,9 +30,13 @@ async def _facts(session, business: Business, from_: datetime, to: datetime):
 
 
 @router.get("/dashboard", response_model=Dashboard)
-async def owner_dashboard(session: SessionDep, business: OwnerBusinessDep):
-    """Все виджеты главной владельца; фронтенд обновляет их polling'ом."""
-    return await reports.dashboard(session, business)
+async def owner_dashboard(
+    session: SessionDep, business: OwnerBusinessDep,
+    period: Literal["day", "week", "month"] = Query("day"),
+):
+    """Все виджеты главной владельца; фронтенд обновляет их polling'ом.
+    period задаёт окно денег/загрузки/апсейлов; «сейчас» (места, на месте, склад) от него не зависит."""
+    return await reports.dashboard(session, business, period)
 
 
 @router.get("/reports/revenue", response_model=RevenueReport)

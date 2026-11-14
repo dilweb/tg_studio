@@ -189,20 +189,6 @@ async function submitBooking() {
 // --- отметки для админа/владельца (05) ---
 const acting = ref(false)
 
-async function act(b, action) {
-  acting.value = true
-  error.value = ''
-  try {
-    await api.post(`/api/bookings/${b.id}/${action}`)
-    notice.value = 'Отмечено'
-    await load()
-  } catch (err) {
-    error.value = err.detail ?? err.message
-  } finally {
-    acting.value = false
-  }
-}
-
 async function confirmBooking(b) {
   acting.value = true
   error.value = ''
@@ -409,9 +395,7 @@ onMounted(load)
                 </td>
                 <td class="muted">{{ b.hold_deadline ? fmt(b.hold_deadline) : '—' }}</td>
                 <td class="muted">
-                  <template v-if="b.visit_started_at || b.visit_ended_at">
-                    визит: {{ b.visit_started_at ? fmt(b.visit_started_at).slice(-5) : '—' }}–{{ b.visit_ended_at ? fmt(b.visit_ended_at).slice(-5) : '…' }}
-                  </template>
+                  <span v-if="b.presence_confirmed_at" class="badge">присутствие ✓</span>
                   <span v-if="b.requires_confirmation && !b.confirmed_by_user_id" class="badge">вне покрытия</span>
                 </td>
                 <td class="actions-col">
@@ -436,47 +420,12 @@ onMounted(load)
                     @click="extendBooking(b)"
                   >Продлить +1 ч</button>
                   <button
-                    v-if="['ожидает_оплаты', 'подтверждена'].includes(b.status)"
+                    v-if="['ожидает_оплаты', 'подтверждена'].includes(b.status) && new Date(b.start) > new Date()"
                     class="btn btn-sm btn-ghost"
                     type="button"
                     @click="cancelBooking(b)"
                   >Отменить</button>
                   <template v-if="isOwnerOrAdmin">
-                    <button
-                      v-if="b.status === 'подтверждена'"
-                      class="btn btn-sm"
-                      type="button"
-                      :disabled="acting"
-                      @click="act(b, 'start')"
-                    >Начать</button>
-                    <button
-                      v-if="b.status === 'начата'"
-                      class="btn btn-sm"
-                      type="button"
-                      :disabled="acting"
-                      @click="act(b, 'complete')"
-                    >Завершить</button>
-                    <button
-                      v-if="['подтверждена', 'начата'].includes(b.status) && !b.visit_started_at"
-                      class="btn btn-sm btn-ghost"
-                      type="button"
-                      :disabled="acting"
-                      @click="act(b, 'visit/start')"
-                    >Пришёл</button>
-                    <button
-                      v-if="b.visit_started_at && !b.visit_ended_at"
-                      class="btn btn-sm btn-ghost"
-                      type="button"
-                      :disabled="acting"
-                      @click="act(b, 'visit/end')"
-                    >Ушёл</button>
-                    <button
-                      v-if="b.status === 'подтверждена'"
-                      class="btn btn-sm btn-ghost"
-                      type="button"
-                      :disabled="acting"
-                      @click="act(b, 'no-show')"
-                    >Неявка</button>
                     <button
                       v-if="b.requires_confirmation && !b.confirmed_by_user_id && isOwner"
                       class="btn btn-sm btn-primary"

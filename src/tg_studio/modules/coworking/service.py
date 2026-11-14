@@ -9,17 +9,18 @@
 - границы: start<end, мин. длительность и шаг из настроек студии, бронь
   целиком внутри часов работы, буфер между бронями;
 - мастер не держит две активные пересекающиеся брони (владелец — может);
-- hold истёк → истекла_оплата (expire_booking_holds, beat каждые 5 мин).
+- hold истёк → истекла_оплата (expire_booking_holds, beat каждые 5 мин);
+- итоговая цена брони > 0 (quote_positive_price), иначе 409.
 
-Время: фронт шлёт naive ISO — считаем временем студии (Asia/Almaty), как в
-tattoo/api.py._ensure_tz. В БД — aware UTC (колонки timestamptz / UTCDateTime).
+Время: фронт шлёт naive ISO — считаем временем студии (Asia/Almaty).
+В БД — aware UTC (колонки timestamptz / UTCDateTime).
 """
 
 import logging
 from datetime import UTC, date, datetime, time, timedelta
 
 from fastapi import HTTPException
-from sqlalchemy import select
+from sqlalchemy import or_, select
 
 from tg_studio.db.locks import for_update, lock_business_seats, lock_master_slot, lock_seat_slot
 from tg_studio.db.models import (
@@ -52,12 +53,17 @@ DEFAULT_MIN_DURATION_MINUTES = 60
 DEFAULT_STEP_MINUTES = 30
 DEFAULT_BUFFER_MINUTES = 0
 DEFAULT_HOLD_TTL_HOURS = 24
-# Правило отмены (03/04): отмена раньше чем за N часов до начала → 100% возврат;
-# позже → удержание no_show_hold_percent процентов (остальное возвращается)
-DEFAULT_CANCEL_FULL_REFUND_HOURS = 24
-DEFAULT_NO_SHOW_HOLD_PERCENT = 100
-# Неявку можно отметить не раньше start + grace (01: «начало + grace»)
-DEFAULT_NO_SHOW_GRACE_MINUTES = 15
+# Правило отмены мастером — ступени возврата: отмена не позже чем за hours_before
+# часов до начала → percent % возврата; ступени проверяются от большей к меньшей,
+# ни одна не подошла → 0%. Отмена площадкой — всегда 100%.
+DEFAULT_REFUND_TIERS = (
+    {"hours_before": 24, "percent": 100},
+    {"hours_before": 12, "percent": 50},
+)
+# Напоминания в Telegram: «скоро бронь» за N минут до начала (с кнопкой
+# «Подтвердить» присутствие) и «оплатите» за N минут до дедлайна оплаты
+DEFAULT_BOOKING_REMINDER_MINUTES = 60
+DEFAULT_PAYMENT_REMINDER_MINUTES = 120
 # Если в studio_hours нет строк — студия работает каждый день 10:00–22:00
 FALLBACK_OPEN = time(10, 0)
 FALLBACK_CLOSE = time(22, 0)
@@ -77,14 +83,19 @@ def coworking_settings(business: Business) -> dict:
         "step_minutes": int(cfg.get("step_minutes", DEFAULT_STEP_MINUTES)),
         "buffer_minutes": int(cfg.get("buffer_minutes", DEFAULT_BUFFER_MINUTES)),
         "hold_ttl_hours": int(cfg.get("hold_ttl_hours", DEFAULT_HOLD_TTL_HOURS)),
-        "cancel_full_refund_hours": int(
-            cfg.get("cancel_full_refund_hours", DEFAULT_CANCEL_FULL_REFUND_HOURS)
+        "refund_tiers": sorted(
+            (
+                {"hours_before": int(t["hours_before"]), "percent": int(t["percent"])}
+                for t in cfg.get("refund_tiers", DEFAULT_REFUND_TIERS)
+            ),
+            key=lambda t: t["hours_before"],
+            reverse=True,
         ),
-        "no_show_hold_percent": int(
-            cfg.get("no_show_hold_percent", DEFAULT_NO_SHOW_HOLD_PERCENT)
+        "booking_reminder_minutes": int(
+            cfg.get("booking_reminder_minutes", DEFAULT_BOOKING_REMINDER_MINUTES)
         ),
-        "no_show_grace_minutes": int(
-            cfg.get("no_show_grace_minutes", DEFAULT_NO_SHOW_GRACE_MINUTES)
+        "payment_reminder_minutes": int(
+            cfg.get("payment_reminder_minutes", DEFAULT_PAYMENT_REMINDER_MINUTES)
         ),
     }
 
@@ -189,6 +200,12 @@ async def find_seat_conflicts(
         Booking.business_id == business_id,
         Booking.seat_id == seat_id,
         Booking.status.in_(ACTIVE_BOOKING_STATUSES),
+        # просроченный hold (до свипа beat) место уже не держит
+        or_(
+            Booking.status != BookingStatus.pending_payment.value,
+            Booking.hold_deadline.is_(None),
+            Booking.hold_deadline >= datetime.now(UTC),
+        ),
         Booking.start < q_end,
         Booking.end > q_start,
     )
@@ -268,6 +285,12 @@ async def assert_master_free(
         Booking.business_id == business_id,
         Booking.master_id == master_id,
         Booking.status.in_(ACTIVE_BOOKING_STATUSES),
+        # просроченный hold (до свипа beat) место уже не держит
+        or_(
+            Booking.status != BookingStatus.pending_payment.value,
+            Booking.hold_deadline.is_(None),
+            Booking.hold_deadline >= datetime.now(UTC),
+        ),
         Booking.start < end,
         Booking.end > start,
     )
@@ -283,6 +306,16 @@ async def assert_master_free(
                 f"#{b.id} {b.start.astimezone(STUDIO_TZ):%d.%m %H:%M}–{b.end.astimezone(STUDIO_TZ):%H:%M}"
             ),
         )
+
+
+async def quote_positive_price(session, business_id: int, seat_id: int, start, end, master) -> dict:
+    """Снимок цены брони; итог 0 — 409: бронь не может стоить 0 (бесплатные часы —
+    отдельный флоу, пока не реализован), иначе её нечем подтвердить (нет счёта,
+    оплата с баланса не нужна) и она гарантированно истечёт."""
+    snapshot = await pricing.quote_booking_price(session, business_id, seat_id, start, end, master=master)
+    if snapshot["final"] <= 0:
+        raise HTTPException(status_code=409, detail="Итоговая стоимость брони 0 — такую бронь создать нельзя")
+    return snapshot
 
 
 def add_booking_event(
@@ -347,9 +380,7 @@ async def create_booking(
         await assert_master_free(session, business.id, master.id, start, end)
 
     # Цена: снимок расчёта по актуальным правилам (03). Без цены на интервал — 409.
-    snapshot = await pricing.quote_booking_price(
-        session, business.id, seat.id, start, end, master=master
-    )
+    snapshot = await quote_positive_price(session, business.id, seat.id, start, end, master)
 
     # 05: бронь вне покрытия смен админов — флаг «требует подтверждения владельцем»
     outside = await booking_outside_coverage(session, business, start, end)
@@ -417,8 +448,20 @@ async def reschedule_booking(
     actor_user_id: int,
     note: str | None = None,
 ) -> Booking:
-    """Перенос/продление брони: та же проверка места (исключая саму бронь)."""
+    """Перенос неоплаченной брони: та же проверка места (исключая саму бронь).
+
+    Статус проверяется ПОСЛЕ блокировки: параллельная оплата могла успеть —
+    перенос оплаченной брони сломал бы «подтверждена ⇒ оплачена 100%»."""
     await lock_booking(session, booking)
+    if booking.status not in ACTIVE_BOOKING_STATUSES:
+        raise HTTPException(status_code=409, detail=f"Бронь в терминальном статусе: {booking.status}")
+    if booking.status != BookingStatus.pending_payment.value:
+        # 04: оплаченную бронь переносить нельзя — цена уже зафиксирована
+        # и оплачена; перенос — через отмену (с возвратом по правилу) + новую бронь
+        raise HTTPException(
+            status_code=409,
+            detail="Оплаченную бронь перенести нельзя — отмените её (с возвратом по правилу) и создайте новую",
+        )
     new_start = ensure_tz(new_start)
     new_end = ensure_tz(new_end)
     settings = coworking_settings(business)
@@ -448,8 +491,8 @@ async def reschedule_booking(
     # Перенос/продление → новый расчёт цены по актуальным правилам (03);
     # старый снимок остаётся в событии «перенесена»
     master = await session.get(Master, booking.master_id)
-    new_snapshot = await pricing.quote_booking_price(
-        session, business.id, booking.seat_id, new_start, new_end, master=master
+    new_snapshot = await quote_positive_price(
+        session, business.id, booking.seat_id, new_start, new_end, master
     )
     booking.price_snapshot = new_snapshot
     await _refresh_coverage_flag(session, business, booking)
@@ -540,8 +583,8 @@ async def extend_booking(
     )
     master = await session.get(Master, booking.master_id)
     old_snapshot = booking.price_snapshot
-    new_snapshot = await pricing.quote_booking_price(
-        session, business.id, booking.seat_id, start, new_end, master=master
+    new_snapshot = await quote_positive_price(
+        session, business.id, booking.seat_id, start, new_end, master
     )
     delta = None
     if booking.status != BookingStatus.pending_payment.value:
@@ -590,14 +633,14 @@ async def cancel_booking(
 ) -> Booking:
     """Отмена активной брони → терминальный статус + событие. Слот свободен.
 
-    04: если бронь была оплачена (подтверждена/начата) — возврат по правилу
-    отмены (≥ cancel_full_refund_hours до начала → 100%, позже → удержание
-    no_show_hold_percent %; площадка — всегда 100%). Проводка refund в ledger.
+    Отменить можно только до начала брони. Оплаченная бронь — возврат по
+    ступеням refund_tiers (площадка — всегда 100%). Проводка refund в ledger.
     """
     await lock_booking(session, booking)
-    # 01: отмена — из ожидает_оплаты/подтверждена; начатую бронь завершают, а не отменяют
     if booking.status not in CANCELLABLE_BOOKING_STATUSES:
         raise HTTPException(status_code=409, detail=f"Бронь нельзя отменить в статусе: {booking.status}")
+    if datetime.now(UTC) >= _as_utc(booking.start):
+        raise HTTPException(status_code=409, detail="Бронь уже началась — отменить её нельзя")
     from tg_studio.modules.coworking import money
 
     booking.status = (
@@ -620,99 +663,62 @@ async def cancel_booking(
     return booking
 
 
-async def start_booking(session, business: Business, booking: Booking, actor_user_id: int) -> Booking:
-    """Отметка «начата» (владелец/админ в 05; статус + фактическое время)."""
-    await lock_booking(session, booking)
-    if booking.status != BookingStatus.confirmed.value:
-        raise HTTPException(
-            status_code=409,
-            detail=f"Начать можно только подтверждённую бронь (сейчас: {booking.status})",
-        )
-    booking.status = BookingStatus.started.value
-    booking.started_at = datetime.now(UTC)
-    add_booking_event(session, business.id, booking.id, BookingEventKind.started, actor_user_id)
-    return booking
-
-
-async def complete_booking(session, business: Business, booking: Booking, actor_user_id: int) -> Booking:
-    """Отметка «завершена» (владелец/админ в 05)."""
-    await lock_booking(session, booking)
-    if booking.status != BookingStatus.started.value:
-        raise HTTPException(
-            status_code=409,
-            detail=f"Завершить можно только начатую бронь (сейчас: {booking.status})",
-        )
-    booking.status = BookingStatus.completed.value
-    booking.completed_at = datetime.now(UTC)
-    add_booking_event(session, business.id, booking.id, BookingEventKind.completed, actor_user_id)
-    return booking
-
-
-async def mark_no_show(session, business: Business, booking: Booking, actor_user_id: int) -> Booking:
-    """Неявка (владелец/админ в 05): активная бронь → неявка.
-
-    04: удержание no_show_hold_percent % от оплаченной суммы (refund остатка).
-    """
-    await lock_booking(session, booking)
-    if booking.status != BookingStatus.confirmed.value:
-        raise HTTPException(
-            status_code=409,
-            detail=f"Неявку можно отметить только у подтверждённой брони (сейчас: {booking.status})",
-        )
-    grace = timedelta(minutes=coworking_settings(business)["no_show_grace_minutes"])
-    start = booking.start if booking.start.tzinfo else booking.start.replace(tzinfo=UTC)  # SQLite отдаёт naive UTC
-    if datetime.now(UTC) < start + grace:
-        raise HTTPException(
-            status_code=409,
-            detail=f"Неявку можно отметить не раньше {grace.seconds // 60} мин после начала брони",
-        )
-    from tg_studio.modules.coworking import money
-
-    booking.status = BookingStatus.no_show.value
-    if booking.paid_amount and booking.paid_amount > 0:
-        # Неявка = удержание по правилу (как поздняя отмена), площадка не виновата
-        await money.apply_cancellation_refund(
-            session, business, booking, actor_user_id, by_studio=False, reason="неявка"
-        )
-    add_booking_event(session, business.id, booking.id, BookingEventKind.no_show, actor_user_id)
-    return booking
-
-
 async def expire_booking_holds(session) -> int:
     """Beat-задача: ожидает_оплаты с истёкшим hold_deadline → истекла_оплата.
 
     Место освобождается (статус терминальный, не участвует в пересечениях).
-    Возвращает число истёкших броней. Вызывающий коммитит.
+    Каждая бронь — своя короткая транзакция (коммитит сама): FOR UPDATE одной
+    брони + перепроверка статуса после блокировки (вебхук мог успеть оплатить);
+    сбой по одной брони логируется и не откатывает остальные. Отмена внешних
+    счетов ApiPay — после commit. Возвращает число истёкших броней.
     """
     from tg_studio.modules.coworking import money
 
-    now = datetime.now(UTC)
-    stale = (
-        await session.execute(
-            # FOR UPDATE: параллельный вебхук оплаты не перезапишется статусом истекла_оплата
-            for_update(
-                select(Booking).where(
-                    Booking.status == BookingStatus.pending_payment.value,
-                    Booking.hold_deadline.isnot(None),
-                    Booking.hold_deadline < now,
-                ),
-                session,
-            )
-        )
+    stale_filter = (
+        Booking.status == BookingStatus.pending_payment.value,
+        Booking.hold_deadline.isnot(None),
+        Booking.hold_deadline < datetime.now(UTC),
+    )
+    ids = (
+        await session.execute(select(Booking.id).where(*stale_filter).order_by(Booking.id))
     ).scalars().all()
-    for booking in stale:
-        booking.status = BookingStatus.payment_expired.value
-        # 04: pending-счёт за бронь → expired (место свободно, деньги не списаны)
-        await money.close_booking_invoices(session, booking, PaymentStatus.expired)
-        add_booking_event(
-            session,
-            booking.business_id,
-            booking.id,
-            BookingEventKind.payment_expired,
-            None,
-            {"hold_deadline": booking.hold_deadline.isoformat()},
-        )
-    return len(stale)
+    await session.commit()
+    expired = 0
+    for booking_id in ids:
+        try:
+            booking = (
+                await session.execute(
+                    for_update(
+                        select(Booking)
+                        .where(Booking.id == booking_id, *stale_filter)
+                        .execution_options(populate_existing=True),
+                        session,
+                    )
+                )
+            ).scalar_one_or_none()
+            if booking is None:
+                await session.commit()
+                continue
+            booking.status = BookingStatus.payment_expired.value
+            # 04: pending-счёт за бронь → expired (место свободно, деньги не списаны)
+            await money.close_booking_invoices(session, booking, PaymentStatus.expired)
+            add_booking_event(
+                session,
+                booking.business_id,
+                booking.id,
+                BookingEventKind.payment_expired,
+                None,
+                {"hold_deadline": booking.hold_deadline.isoformat()},
+            )
+            await session.commit()
+            expired += 1
+        except Exception:
+            logger.exception("expire hold failed for booking %s", booking_id)
+            await session.rollback()
+            money.discard_provider_ops(session)
+            continue
+        await money.run_provider_ops(session)
+    return expired
 
 
 def free_seats_for_interval(
@@ -811,48 +817,52 @@ async def booking_outside_coverage(
     return cursor < end
 
 
-async def mark_visit_start(
-    session, business: Business, booking: Booking, actor_user_id: int
-) -> Booking:
-    """Отметка прихода по брони (админ/владелец, 05): фактическое время визита.
+async def confirm_presence(session, booking_id: int, telegram_user_id: int) -> tuple[bool, str]:
+    """Мастер нажал «Подтвердить» в напоминании Telegram: отметка присутствия
+    (аналитика владельца, на деньги не влияет).
 
-    Бронь должна быть подтверждена/начата. Повторная отметка — 409 (история в
-    событиях, время не перезаписываем задним числом).
+    Подтвердить может только мастер этой брони (telegram id мастера или его
+    пользователя), у подтверждённой брони, с момента напоминания (start −
+    booking_reminder_minutes) до конца брони. Повтор — без изменений.
+    Возвращает (успех, текст ответа мастеру). Вызывающий коммитит.
     """
-    if booking.status not in (BookingStatus.confirmed.value, BookingStatus.started.value):
-        raise HTTPException(
-            status_code=409,
-            detail=f"Отметить приход можно по подтверждённой/начатой брони (сейчас: {booking.status})",
-        )
-    if booking.visit_started_at is not None:
-        raise HTTPException(status_code=409, detail="Приход уже отмечен")
-    booking.visit_started_at = datetime.now(UTC)
-    add_booking_event(
-        session, business.id, booking.id, BookingEventKind.visit_started, actor_user_id,
-        {"visit_started_at": booking.visit_started_at.isoformat()},
-    )
-    return booking
+    from tg_studio.db.models import User
 
-
-async def mark_visit_end(
-    session, business: Business, booking: Booking, actor_user_id: int
-) -> Booking:
-    """Отметка ухода по брони (админ/владелец, 05)."""
-    if booking.status not in (BookingStatus.confirmed.value, BookingStatus.started.value):
-        raise HTTPException(
-            status_code=409,
-            detail=f"Отметить уход можно по подтверждённой/начатой брони (сейчас: {booking.status})",
+    booking = (
+        await session.execute(
+            for_update(
+                select(Booking).where(Booking.id == booking_id).execution_options(populate_existing=True),
+                session,
+            )
         )
-    if booking.visit_started_at is None:
-        raise HTTPException(status_code=409, detail="Сначала отметьте приход")
-    if booking.visit_ended_at is not None:
-        raise HTTPException(status_code=409, detail="Уход уже отмечен")
-    booking.visit_ended_at = datetime.now(UTC)
+    ).scalar_one_or_none()
+    if booking is None:
+        return False, "Бронь не найдена"
+    master = await session.get(Master, booking.master_id)
+    user = await session.get(User, master.user_id) if master and master.user_id else None
+    if telegram_user_id not in {master.telegram_id if master else None, user.telegram_id if user else None}:
+        return False, "Это не ваша бронь"
+    if booking.presence_confirmed_at is not None:
+        return True, "Присутствие уже подтверждено"
+    if booking.status not in (BookingStatus.confirmed.value, BookingStatus.started.value):
+        return False, f"Бронь в статусе «{booking.status}» — подтверждать нечего"
+    business = await session.get(Business, booking.business_id)
+    reminder = timedelta(minutes=coworking_settings(business)["booking_reminder_minutes"])
+    now = datetime.now(UTC)
+    if now < _as_utc(booking.start) - reminder:
+        return False, f"Подтвердить можно не раньше чем за {int(reminder.total_seconds() // 60)} мин до начала"
+    if now >= _as_utc(booking.end):
+        return False, "Бронь уже закончилась"
+    booking.presence_confirmed_at = now
     add_booking_event(
-        session, business.id, booking.id, BookingEventKind.visit_ended, actor_user_id,
-        {"visit_ended_at": booking.visit_ended_at.isoformat()},
+        session,
+        booking.business_id,
+        booking.id,
+        BookingEventKind.presence_confirmed,
+        master.user_id if master else None,
+        {"via": "telegram", "presence_confirmed_at": now.isoformat()},
     )
-    return booking
+    return True, "Присутствие подтверждено ✓"
 
 
 async def confirm_out_of_coverage_booking(
@@ -871,9 +881,8 @@ async def confirm_out_of_coverage_booking(
 
 
 async def ops_exceptions(session, business: Business) -> list[dict]:
-    """Операционные исключения для админа/владельца (05): неявки, истекшие hold,
-    брони вне покрытия без подтверждения, брони, которые прошли, но не закрыты
-    (подтверждена без отметки / начата без завершения) — за последние 7 дней и вперёд."""
+    """Операционные исключения для админа/владельца (05): истекшие hold и брони
+    вне покрытия без подтверждения — за последние 7 дней и вперёд."""
     now = datetime.now(UTC)
     window_from = now - timedelta(days=7)
     rows = (
@@ -884,23 +893,13 @@ async def ops_exceptions(session, business: Business) -> list[dict]:
             .where(
                 Booking.business_id == business.id,
                 Booking.end > window_from,
-                Booking.status.in_(
-                    (
-                        BookingStatus.no_show.value,
-                        BookingStatus.payment_expired.value,
-                    )
-                )
+                (Booking.status == BookingStatus.payment_expired.value)
                 | (
+                    # подтверждать вне покрытия есть смысл, пока бронь не прошла
                     Booking.requires_confirmation.is_(True)
                     & Booking.confirmed_by_user_id.is_(None)
                     & Booking.status.in_(ACTIVE_BOOKING_STATUSES)
-                )
-                | (
-                    # прошла, но владелец/админ не отметил итог — деньги висят
-                    (Booking.end < now)
-                    & Booking.status.in_(
-                        (BookingStatus.confirmed.value, BookingStatus.started.value)
-                    )
+                    & (Booking.end > now)
                 ),
             )
             .order_by(Booking.start)
@@ -908,12 +907,8 @@ async def ops_exceptions(session, business: Business) -> list[dict]:
     ).all()
     result = []
     for b, seat_name, master_name in rows:
-        if b.status == BookingStatus.no_show.value:
-            kind = "no_show"
-        elif b.status == BookingStatus.payment_expired.value:
+        if b.status == BookingStatus.payment_expired.value:
             kind = "payment_expired"
-        elif b.status in (BookingStatus.confirmed.value, BookingStatus.started.value) and b.end < now:
-            kind = "unclosed_past_booking"
         else:
             kind = "out_of_coverage_unconfirmed"
         result.append(

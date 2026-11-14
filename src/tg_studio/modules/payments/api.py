@@ -21,7 +21,6 @@ from tg_studio.api.admin_deps import AdminBusinessAndSelfDep, MasterBusinessAndS
 from tg_studio.api.auth import CurrentUserDep
 from tg_studio.api.deps import SessionDep
 from tg_studio.config import settings
-from tg_studio.db.locks import for_update
 from tg_studio.db.models import (
     Booking,
     Master,
@@ -57,18 +56,6 @@ async def _get_payment(session, business, payment_id: int) -> Payment:
     if payment is None:
         raise HTTPException(status_code=404, detail="Платёж не найден")
     return payment
-
-
-async def _lock_payment(session, payment_id: int) -> Payment:
-    """Свежая строка счёта под FOR UPDATE (вебхук, sync и ручная отметка не гонятся)."""
-    return (
-        await session.execute(
-            for_update(
-                select(Payment).where(Payment.id == payment_id).execution_options(populate_existing=True),
-                session,
-            )
-        )
-    ).scalar_one()
 
 
 async def _get_payment_for_actor(
@@ -199,23 +186,22 @@ async def apipay_webhook(request: Request, session: SessionDep):
     if not external_id or not provider_status:
         raise HTTPException(status_code=400, detail="Нет invoice.id или status")
 
-    # FOR UPDATE: вебхук и celery-sweep (expire_unpaid_prepay) не должны
-    # одновременно решать судьбу одного счёта — кто первый залочил, тот и
-    # видит актуальный статус; второй после блокировки перепроверяет
-    payment = (
+    payment_id = (
         await session.execute(
-            for_update(
-                select(Payment).where(
-                    Payment.external_invoice_id == external_id,
-                    Payment.provider == PaymentProvider.apipay.value,
-                ),
-                session,
+            select(Payment.id).where(
+                Payment.external_invoice_id == external_id,
+                Payment.provider == PaymentProvider.apipay.value,
             )
         )
     ).scalar_one_or_none()
-    if payment is None:
+    if payment_id is None:
         logger.warning("Apipay webhook for unknown invoice %s", external_id)
         return {"ok": True, "unknown": external_id}
+    from tg_studio.modules.coworking import money
+
+    # FOR UPDATE в общем порядке «бронь → счёт»: вебхук, sync, отмена брони и
+    # свип hold'ов не решают судьбу счёта одновременно и не дают deadlock
+    payment = await money.lock_payment(session, payment_id)
 
     # Сверка суммы: если вебхук сообщает amount и он не совпадает с нашей
     # записью — это либо чужой счёт с перехваченным id, либо баг интеграции.
@@ -245,11 +231,10 @@ async def apipay_webhook(request: Request, session: SessionDep):
     if changed and payment.status == PaymentStatus.paid.value:
         # Коворкинг (04): счёт оплачен → проводка topup (+ подтверждение брони, если счёт за бронь;
         # дедуп: повторный вебхук — no-op в apply_payment_paid)
-        from tg_studio.modules.coworking import money
-
         await money.apply_payment_paid(session, payment, paid_at=paid_at)
     if changed:
         await session.commit()
+        await money.run_provider_ops(session)
     return {"ok": True, "changed": changed}
 
 
@@ -273,19 +258,20 @@ async def mark_paid(
     """
     business, _ = actor
     await _get_payment(session, business, payment_id)
+    from tg_studio.modules.coworking import money
+
     # FOR UPDATE: повторное нажатие/параллельная отметка не должны задвоить topup
-    payment = await _lock_payment(session, payment_id)
+    payment = await money.lock_payment(session, payment_id)
     if payment.status != PaymentStatus.pending.value:
         raise HTTPException(status_code=409, detail="Счёт уже не ожидает оплаты")
     if payment.provider != PaymentProvider.manual.value:
         raise HTTPException(
             status_code=409, detail="Оплату этого счёта подтверждает платёжная система"
         )
-    from tg_studio.modules.coworking import money
-
     # топап баланса мастера (+ подтверждение брони, если счёт за бронь)
     await money.apply_payment_paid(session, payment, actor_user_id=user.id)
     await session.commit()
+    await money.run_provider_ops(session)
     return await _reread_payment(session, business, payment.id)
 
 
@@ -297,21 +283,25 @@ async def cancel_payment(
     actor: MasterBusinessAndSelfDep,
     user: CurrentUserDep,
 ):
-    """Отменить счёт (pending). Причина — в note."""
+    """Отменить счёт (pending). Причина — в note.
+
+    Статус проверяется под блокировкой: параллельный вебхук «оплачен» не будет
+    затёрт отменой. Внешний счёт Kaspi отменяется после commit; если ApiPay
+    недоступен — счёт отменён локально, поздняя оплата по нему ляжет на баланс."""
     business, self_master = actor
-    payment = await _get_payment_for_actor(session, business, payment_id, user, self_master)
+    await _get_payment_for_actor(session, business, payment_id, user, self_master)
+    from tg_studio.modules.coworking import money
+
+    payment = await money.lock_payment(session, payment_id)
     if payment.status != PaymentStatus.pending.value:
         raise HTTPException(status_code=409, detail="Счёт уже не ожидает оплаты")
-    if payment.provider == PaymentProvider.apipay.value:
-        try:
-            await get_provider(payment.provider).cancel_invoice(payment)
-        except PaymentProviderError as exc:
-            logger.warning("Failed to cancel apipay invoice %s: %s", payment.id, exc)
-            raise HTTPException(status_code=502, detail=str(exc)) from exc
+    if payment.provider == PaymentProvider.apipay.value and payment.external_invoice_id:
+        money._defer_provider_op(session, ("cancel", payment.id, payment.external_invoice_id))
     payment.status = PaymentStatus.cancelled.value
     if body.note:
         payment.note = body.note
     await session.commit()
+    await money.run_provider_ops(session)
     return await _reread_payment(session, business, payment.id)
 
 
@@ -334,12 +324,15 @@ async def sync_payment(
         raise HTTPException(status_code=409, detail="Опрос статуса — только для счетов Kaspi")
     if not payment.external_invoice_id:
         raise HTTPException(status_code=409, detail="У платежа нет внешнего счёта")
-    payment = await _lock_payment(session, payment.id)
+    # опрос ApiPay — до блокировок: строки брони/счёта не ждут сеть
     try:
         invoice = await get_provider(payment.provider).fetch_invoice(payment)
     except PaymentProviderError as exc:
         logger.warning("Failed to fetch apipay invoice for payment %s: %s", payment.id, exc)
         raise HTTPException(status_code=502, detail=str(exc)) from exc
+    from tg_studio.modules.coworking import money
+
+    payment = await money.lock_payment(session, payment.id)
     apply_provider_status(payment, invoice.get("status") or "", _parse_iso(invoice.get("paid_at")))
     link = invoice.get("kaspi_qr_link")
     if link and payment.payment_url != link:
@@ -348,8 +341,7 @@ async def sync_payment(
         payment.note = f"ApiPay: {invoice['error_message']}"
     # Коворкинг (04): опрос подтянул «paid» по счёту за бронь → проводка + бронь
     if payment.status == PaymentStatus.paid.value:
-        from tg_studio.modules.coworking import money
-
         await money.apply_payment_paid(session, payment)
     await session.commit()
+    await money.run_provider_ops(session)
     return await _reread_payment(session, business, payment.id)

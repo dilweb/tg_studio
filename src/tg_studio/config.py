@@ -91,6 +91,11 @@ class Settings(BaseSettings):
     apipay_webhook_secret: str = ""
     apipay_base_url: str = "https://api.apipay.kz/api/v1"
 
+    # Вебхук Telegram (нажатия inline-кнопок в напоминаниях, напр. «Подтвердить»
+    # присутствие). Telegram шлёт его в X-Telegram-Bot-Api-Secret-Token;
+    # регистрация — scripts/set_telegram_webhook.py. Пусто = вебхук выключен (503).
+    telegram_webhook_secret: str = ""
+
     # Google Calendar
     google_calendar_credentials_path: str = "credentials.json"
     google_calendar_redirect_uri: str = "http://localhost:8000/api/admin/google-calendar/callback"

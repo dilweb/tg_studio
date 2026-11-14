@@ -4,14 +4,17 @@ import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { api } from '../api/client'
 
 const data = ref(null)
+const period = ref('day')
+const periods = [['day', 'День'], ['week', 'Неделя'], ['month', 'Месяц']]
+const periodWord = { day: 'сегодня', week: 'за неделю', month: 'за месяц' }
 const loading = ref(true)
 const error = ref('')
 let timer
 
 const stats = computed(() => data.value ? [
-  { label: 'Выручка сегодня', value: money(data.value.revenue.gross), hint: `После возвратов: ${money(data.value.revenue.net)}` },
+  { label: 'Выручка ' + periodWord[data.value.period], value: money(data.value.revenue.gross), hint: `После возвратов: ${money(data.value.revenue.net)}` },
   { label: 'Поступления', value: money(data.value.money.receipts), hint: 'Фактические деньги, не списания с баланса' },
-  { label: 'Брони сегодня', value: data.value.bookings_created, hint: `${data.value.cancellations} отмен · ${data.value.no_shows} неявок` },
+  { label: 'Брони ' + periodWord[data.value.period], value: data.value.bookings_created, hint: `${data.value.cancellations} отмен` },
   { label: 'Загрузка мест', value: `${Math.round(data.value.usage.percent)}%`, hint: `${data.value.usage.occupied_hours.toFixed(1)} из ${data.value.usage.available_hours.toFixed(1)} ч` },
   { label: 'На балансах мастеров', value: money(data.value.master_balances), hint: 'Неиспользованные средства' },
   { label: 'Апсейлы', value: money(data.value.upsells.amount), hint: 'Продажи администраторов за сегодня' },
@@ -26,13 +29,13 @@ function fmt(value) {
 function clock(value) {
   return value ? new Date(value).toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' }) : '—'
 }
-const exceptionLabels = { no_show: 'Неявка', payment_expired: 'Истёк hold', out_of_coverage_unconfirmed: 'Вне покрытия' }
+const exceptionLabels = { payment_expired: 'Истёк hold', out_of_coverage_unconfirmed: 'Вне покрытия' }
 const segmentLabels = { morning: 'Утро', evening: 'Вечер', weekend: 'Выходные' }
 
 async function load(silent = false) {
   if (!silent) loading.value = true
   try {
-    data.value = await api.get('/api/dashboard')
+    data.value = await api.get(`/api/dashboard?period=${period.value}`)
     error.value = ''
   } catch (err) {
     error.value = err.detail ?? err.message
@@ -51,7 +54,10 @@ onBeforeUnmount(() => clearInterval(timer))
   <div class="page dashboard">
     <div class="section-head">
       <div><h2>Студия сейчас</h2><p v-if="data" class="muted">Обновлено {{ clock(data.generated_at) }} · автоматически каждую минуту</p></div>
-      <button class="btn" type="button" :disabled="loading" @click="load()">Обновить</button>
+      <div class="period-tabs">
+        <button v-for="[key, label] in periods" :key="key" class="btn" :class="{ active: period === key }" type="button" @click="period = key; load()">{{ label }}</button>
+        <button class="btn" type="button" :disabled="loading" @click="load()">Обновить</button>
+      </div>
     </div>
     <div v-if="error" class="error-box">{{ error }}</div>
     <div v-if="loading && !data" class="empty-state">Собираем показатели…</div>
@@ -67,7 +73,7 @@ onBeforeUnmount(() => clearInterval(timer))
           <div class="seat-list">
             <div v-for="seat in data.seats_now" :key="seat.seat_id" class="seat-row">
               <span class="seat-dot" :class="seat.status"></span><strong>{{ seat.seat_name }}</strong>
-              <span>{{ seat.status === 'occupied' ? (seat.master_name || 'Занято') : 'Свободно' }}</span>
+              <span>{{ seat.status === 'occupied' ? (seat.master_name || 'Занято') : seat.status === 'blocked' ? 'Закрыто' : 'Свободно' }}</span>
               <small class="muted">{{ seat.status === 'occupied' ? `до ${clock(seat.until)}` : `Ближайшие 4 ч: ${seat.upcoming}` }}</small>
             </div>
           </div>
@@ -76,10 +82,10 @@ onBeforeUnmount(() => clearInterval(timer))
           </div>
         </section>
         <section class="card">
-          <div class="section-head"><h3>На месте и скоро</h3><span class="badge">{{ data.onsite.length }} на месте</span></div>
+          <div class="section-head"><h3>Сейчас и скоро</h3><span class="badge">{{ data.onsite.length }} идёт</span></div>
           <div v-if="!data.onsite.length && !data.upcoming.length" class="empty-state">Броней нет</div>
           <div v-for="booking in data.onsite" :key="`on-${booking.booking_id}`" class="booking-row">
-            <span class="badge live">На месте</span><div><b>{{ booking.master_name }}</b><small>{{ booking.seat_name }}</small></div><span>до {{ clock(booking.end) }}</span>
+            <span class="badge live">Идёт</span><div><b>{{ booking.master_name }}</b><small>{{ booking.seat_name }}{{ booking.presence_confirmed ? ' · присутствие ✓' : ' · не подтвердил' }}</small></div><span>до {{ clock(booking.end) }}</span>
           </div>
           <div v-for="booking in data.upcoming" :key="booking.booking_id" class="booking-row">
             <time>{{ clock(booking.start) }}</time><div><b>{{ booking.master_name }}</b><small>{{ booking.seat_name }}</small></div><span class="muted">{{ booking.status }}</span>
@@ -102,6 +108,8 @@ onBeforeUnmount(() => clearInterval(timer))
 </template>
 
 <style scoped>
+.period-tabs { display: flex; gap: 6px; }
+.period-tabs .btn.active { background: var(--primary, #2563eb); color: #fff; }
 .section-head p { margin: 4px 0 0; font-size: 12px; }
 .stats-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; margin-bottom: 16px; }
 .stat-card { display: flex; flex-direction: column; gap: 8px; }

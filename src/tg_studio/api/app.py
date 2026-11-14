@@ -13,6 +13,7 @@ from tg_studio.modules.coworking.stock_api import router as coworking_stock_rout
 from tg_studio.modules.google_calendar.api import router as google_calendar_router
 from tg_studio.modules.identity.api import router as auth_router
 from tg_studio.modules.payments.api import router as payments_router
+from tg_studio.modules.telegram_api import router as telegram_router
 
 # В проде (https-публичный URL) интерактивная документация и схема API наружу
 # не отдаются: /api/docs и /api/openapi.json раскрывают всю поверхность атаки.
@@ -59,6 +60,7 @@ app.include_router(payments_router, prefix="/api")
 app.include_router(coworking_router, prefix="/api")
 app.include_router(coworking_stock_router, prefix="/api")
 app.include_router(coworking_reports_router, prefix="/api")
+app.include_router(telegram_router, prefix="/api")
 
 
 @app.get("/api/health")

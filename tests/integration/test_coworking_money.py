@@ -11,9 +11,8 @@
 - вебхук с чужой суммой → статус не применяется;
 - hold истёк → истекла_оплата + счёт expired, место свободно;
 - отмена подтверждённой брони ≥24ч до начала → refund 100% на баланс;
-- отмена позже 24ч → удержание no_show_hold_percent (дефолт 100% → refund 0);
+- отмена мастером — возврат по ступеням refund_tiers (≥24ч 100%, ≥12ч 50%, позже 0);
 - отмена площадкой → всегда 100% возврат;
-- неявка → удержание по правилу;
 - баланс = Σ проводок (вычисляется, не хранится): сходится с журналом;
 - ручное пополнение (topup) и корректировка (adjust, основание обязательно);
 - права: мастер видит только свой баланс/выписку; владелец — журнал всех.
@@ -46,7 +45,6 @@ from ..conftest import (
     make_business,
     make_init_data_headers,
     make_master,
-    move_booking_to_past,
     make_user,
 )
 
@@ -433,27 +431,36 @@ async def test_cancel_confirmed_more_than_24h_full_refund(api_client, db_session
     assert len(refunds) == 1 and Decimal(str(refunds[0].amount)) == Decimal("2000")
 
 
+def test_refund_tiers_default():
+    """Дефолтные ступени: ≥24ч → 100%, ≥12ч → 50%, позже → 0%."""
+    from types import SimpleNamespace
+
+    from tg_studio.modules.coworking.service import coworking_settings
+
+    cfg = coworking_settings(SimpleNamespace(coworking_settings={}))
+    for hours, expected in ((30, "2000"), (24.1, "2000"), (18, "1000"), (12.1, "1000"), (6, "0")):
+        booking = SimpleNamespace(
+            price_snapshot={"final": 2000}, start=datetime.now(UTC) + timedelta(hours=hours)
+        )
+        assert money.cancel_refund_amount(booking, cfg, by_studio=False) == Decimal(expected), hours
+        assert money.cancel_refund_amount(booking, cfg, by_studio=True) == Decimal("2000")
+
+
 @pytest.mark.asyncio
-async def test_cancel_confirmed_less_than_24h_holds_percent(api_client, db_session, business, seats, master):
-    """Отмена позже чем за 24ч → удержание no_show_hold_percent (дефолт 100% → refund 0)."""
-    # бронь через 2 часа (меньше 24ч)
-    now_local = datetime.now(STUDIO_TZ)
-    start = (now_local + timedelta(hours=2)).replace(minute=0, second=0, microsecond=0)
-    if start.hour < 10:  # вне часов студии — сдвинем на завтра утро, но тогда >24ч; используем настройку
-        start = start + timedelta(days=1)
-    # проще: поставим правило cancel_full_refund_hours=0 → всегда удержание
+async def test_cancel_refund_by_configured_tier(api_client, db_session, business, seats, master):
+    """Ступень из настроек владельца: отмена в любой момент до начала → 50%."""
     resp = await api_client.patch(
-    "/api/coworking/settings",
-        json={"cancel_full_refund_hours": 0, "no_show_hold_percent": 50},
+        "/api/coworking/settings",
+        json={"refund_tiers": [{"hours_before": 0, "percent": 50}]},
         headers=OWNER_HEADERS,
     )
     assert resp.status_code == 200, resp.text
+    assert resp.json()["refund_tiers"] == [{"hours_before": 0, "percent": 50}]
 
     b = await _confirmed_booking(api_client, db_session, seats, master)
     balance_before = await _balance(db_session, master.id)
     resp = await api_client.post(f"/api/bookings/{b['id']}/cancel", json={"reason": None}, headers=MASTER_HEADERS)
     assert resp.status_code == 200
-        # удержание 50% от 2000 → refund 1000
     assert await _balance(db_session, master.id) == balance_before + Decimal("1000")
     entries = (await db_session.execute(select(LedgerEntry).where(LedgerEntry.booking_id == b["id"]))).scalars().all()
     refunds = [e for e in entries if e.kind == "refund"]
@@ -461,11 +468,21 @@ async def test_cancel_confirmed_less_than_24h_holds_percent(api_client, db_sessi
 
 
 @pytest.mark.asyncio
+async def test_refund_tiers_validation(api_client, business):
+    for tiers in (
+        [{"hours_before": 24, "percent": 50}, {"hours_before": 12, "percent": 100}],  # позже — больше
+        [{"hours_before": 24, "percent": 100}, {"hours_before": 24, "percent": 50}],  # повтор часов
+    ):
+        resp = await api_client.patch("/api/coworking/settings", json={"refund_tiers": tiers}, headers=OWNER_HEADERS)
+        assert resp.status_code == 422, tiers
+
+
+@pytest.mark.asyncio
 async def test_cancel_by_studio_always_full_refund(api_client, db_session, business, seats, master):
     """Отмена площадкой (владелец) → всегда 100% возврат, даже в последний час."""
     resp = await api_client.patch(
     "/api/coworking/settings",
-        json={"cancel_full_refund_hours": 0, "no_show_hold_percent": 100},
+        json={"refund_tiers": []},  # мастеру — 0% в любой момент
         headers=OWNER_HEADERS,
     )
     assert resp.status_code == 200
@@ -476,21 +493,6 @@ async def test_cancel_by_studio_always_full_refund(api_client, db_session, busin
     booking = await db_session.get(Booking, b["id"])
     assert booking.status == BookingStatus.cancelled_by_studio.value
     assert await _balance(db_session, master.id) == balance_before + Decimal("2000")
-
-
-@pytest.mark.asyncio
-async def test_no_show_holds_percent(api_client, db_session, business, seats, master):
-    """Неявка → удержание no_show_hold_percent от оплаты (дефолт 100%)."""
-    b = await _confirmed_booking(api_client, db_session, seats, master)
-    await move_booking_to_past(db_session, b["id"])
-    balance_before = await _balance(db_session, master.id)
-    resp = await api_client.post(f"/api/bookings/{b['id']}/no-show", headers=OWNER_HEADERS)
-    assert resp.status_code == 200, resp.text
-    booking = await db_session.get(Booking, b["id"])
-    assert booking.status == BookingStatus.no_show.value
-    # дефолт 100% удержание → возврата нет
-    assert await _balance(db_session, master.id) == balance_before
-    assert "неявка" in await _events(db_session, b["id"])
 
 
 @pytest.mark.asyncio
@@ -632,17 +634,6 @@ async def test_pay_from_balance_closes_invoice(api_client, db_session, seats, ma
     assert [p.status for p in await _booking_payments(db_session, b["id"])] == ["cancelled"]
 
 
-@pytest.mark.asyncio
-async def test_cannot_cancel_started_booking(api_client, db_session, seats, master):
-    b = await _confirmed_booking(api_client, db_session, seats, master)
-    resp = await api_client.post(f"/api/bookings/{b['id']}/start", headers=OWNER_HEADERS)
-    assert resp.status_code == 200, resp.text
-    resp = await api_client.post(
-        f"/api/bookings/{b['id']}/cancel", json={"reason": "x"}, headers=OWNER_HEADERS
-    )
-    assert resp.status_code == 409
-
-
 # ---------------------------------------------------------------------------
 # Пополнение баланса картой, уникальность topup, поздняя оплата, пагинация
 # ---------------------------------------------------------------------------
@@ -727,3 +718,157 @@ async def test_ledger_total_is_full_count(api_client, master):
     assert resp.json()["total"] == 3
     resp = await api_client.get("/api/ledger?limit=1", headers=OWNER_HEADERS)
     assert resp.json()["total"] == 3 and len(resp.json()["entries"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_expired_hold_before_sweep_frees_seat_and_blocks_late_payment(
+    api_client, db_session, seats, master, other_master
+):
+    await api_client.post(f"/api/masters/{master.id}/topup", json={"amount": 100000}, headers=OWNER_HEADERS)
+    b = await _create_booking(api_client, seats[0]["id"], _tomorrow(12), _tomorrow(14))
+    booking = await db_session.get(Booking, b["id"])
+    booking.hold_deadline = datetime.now(UTC) - timedelta(minutes=1)  # свип ещё не отработал
+    await db_session.commit()
+    # другой мастер уже может занять место
+    taken = await api_client.post(
+        "/api/bookings",
+        json={"seat_id": seats[0]["id"], "start": _tomorrow(12), "end": _tomorrow(14)},
+        headers=OTHER_MASTER_HEADERS,
+    )
+    assert taken.status_code == 201, taken.text
+    # а первый — оплатить просроченную бронь больше не может
+    late = await api_client.post(f"/api/bookings/{b['id']}/pay", json={"method": "balance"}, headers=MASTER_HEADERS)
+    assert late.status_code == 409
+
+
+# ---------------------------------------------------------------------------
+# Надёжность: ApiPay после commit, перенос под блокировкой, цена 0, свип hold'ов
+# ---------------------------------------------------------------------------
+
+
+def _fake_apipay(monkeypatch, *, fail_create: bool = False) -> list[str]:
+    """Подмена ApiPay без сети; возвращает журнал вызовов."""
+    from tg_studio.modules.payments.providers import ApipayProvider, CreatedInvoice, PaymentProviderError
+
+    calls: list[str] = []
+
+    async def fake_create(self, payment, ctx):
+        calls.append(f"create:{payment.id}")
+        if fail_create:
+            raise PaymentProviderError("ApiPay недоступен")
+        return CreatedInvoice(external_id=f"inv-b{payment.id}", payment_url=f"https://kaspi.test/{payment.id}")
+
+    async def fake_cancel(self, payment):
+        calls.append(f"cancel:{payment.external_invoice_id}")
+
+    monkeypatch.setattr(ApipayProvider, "create_invoice", fake_create)
+    monkeypatch.setattr(ApipayProvider, "cancel_invoice", fake_cancel)
+    return calls
+
+
+@pytest.mark.asyncio
+async def test_kaspi_invoice_attached_after_commit_and_cancelled_with_booking(
+    api_client, db_session, seats, master, apipay_on, monkeypatch
+):
+    calls = _fake_apipay(monkeypatch)
+    b = await _create_booking(api_client, seats[0]["id"], _tomorrow(12), _tomorrow(14))
+    pid = b["payment"]["id"]
+    assert b["payment"]["provider"] == "apipay"
+    assert b["payment"]["payment_url"] == f"https://kaspi.test/{pid}"
+
+    resp = await api_client.post(f"/api/bookings/{b['id']}/cancel", json={"reason": "x"}, headers=MASTER_HEADERS)
+    assert resp.status_code == 200, resp.text
+    assert calls == [f"create:{pid}", f"cancel:inv-b{pid}"]
+    payment = await db_session.get(Payment, pid)
+    assert payment.status == PaymentStatus.cancelled.value
+
+
+@pytest.mark.asyncio
+async def test_kaspi_failure_leaves_manual_invoice(api_client, db_session, seats, master, apipay_on, monkeypatch):
+    _fake_apipay(monkeypatch, fail_create=True)
+    b = await _create_booking(api_client, seats[0]["id"], _tomorrow(12), _tomorrow(14))
+    assert b["status"] == "ожидает_оплаты"
+    assert b["payment"]["provider"] == "manual"
+    assert b["payment"]["payment_url"] is None
+
+
+@pytest.mark.asyncio
+async def test_kaspi_invoice_for_closed_payment_is_cancelled(db_session, business, seats, master, monkeypatch):
+    """Счёт закрыли (перенос/оплата) раньше, чем ApiPay ответил — внешний счёт отменяется."""
+    calls = _fake_apipay(monkeypatch)
+    from tg_studio.modules.payments.providers import InvoiceContext
+
+    payment = Payment(
+        business_id=business.id, amount=Decimal("1000"), kind="prepay", status="cancelled",
+        provider="manual", master_id=master.id, created_by_user_id=master.user_id,
+    )
+    db_session.add(payment)
+    await db_session.commit()
+    money._defer_provider_op(db_session, ("create", payment.id, InvoiceContext("87771234567", "М", "x")))
+    await money.run_provider_ops(db_session)
+    assert calls == [f"create:{payment.id}", f"cancel:inv-b{payment.id}"]
+    await db_session.refresh(payment)
+    assert payment.provider == "manual" and payment.external_invoice_id is None
+
+
+@pytest.mark.asyncio
+async def test_reschedule_checks_status_after_lock(api_client, db_session, business, seats, master):
+    """Сервис переноса сам отказывает оплаченной брони (гонка «оплата ↔ перенос»)."""
+    from tg_studio.modules.coworking import service as cw
+
+    resp = await api_client.post(
+        f"/api/masters/{master.id}/topup", json={"amount": 5000, "note": "т"}, headers=OWNER_HEADERS
+    )
+    assert resp.status_code == 201
+    b = await _create_booking(api_client, seats[0]["id"], _tomorrow(12), _tomorrow(14))
+    booking = await db_session.get(Booking, b["id"])
+    # API-проверка статуса прошла бы раньше этой оплаты — вызываем сервис напрямую
+    await money.pay_booking_from_balance(db_session, business, booking, master.user_id)
+    await db_session.commit()
+    from fastapi import HTTPException
+
+    with pytest.raises(HTTPException) as exc:
+        await cw.reschedule_booking(
+            db_session, business, booking,
+            datetime.fromisoformat(_tomorrow(15)), datetime.fromisoformat(_tomorrow(17)), master.user_id,
+        )
+    assert exc.value.status_code == 409
+    await db_session.rollback()
+    booking = await db_session.get(Booking, b["id"])
+    assert Decimal(str(booking.paid_amount)) == Decimal(str(booking.price_snapshot["final"]))
+
+
+@pytest.mark.asyncio
+async def test_zero_price_booking_rejected(api_client, db_session, business, seats, master):
+    from datetime import time as dtime
+
+    from tg_studio.db.models import PriceRule
+
+    db_session.add(PriceRule(
+        business_id=business.id, name="бесплатно", day_kind="все",
+        time_from=dtime(10, 0), time_to=dtime(22, 0), hourly_rate=0, priority=10,
+    ))
+    await db_session.commit()
+    resp = await api_client.post(
+        "/api/bookings",
+        json={"seat_id": seats[0]["id"], "start": _tomorrow(12), "end": _tomorrow(14)},
+        headers=MASTER_HEADERS,
+    )
+    assert resp.status_code == 409, resp.text
+
+
+@pytest.mark.asyncio
+async def test_expire_holds_commits_per_booking(api_client, db_session, seats, master):
+    ids = []
+    for seat in seats[:2]:
+        b = await _create_booking(api_client, seat["id"], _tomorrow(12), _tomorrow(13), headers=OWNER_HEADERS, master_id=master.id)
+        ids.append(b["id"])
+    for bid in ids:
+        (await db_session.get(Booking, bid)).hold_deadline = datetime.now(UTC) - timedelta(minutes=1)
+    await db_session.commit()
+
+    assert await expire_booking_holds(db_session) == 2
+    await db_session.rollback()  # сервис уже закоммитил сам — откат вызывающего ничего не теряет
+    for bid in ids:
+        booking = await db_session.get(Booking, bid)
+        assert booking.status == BookingStatus.payment_expired.value

@@ -20,14 +20,22 @@
   счёт, не покрывающий актуальную цену, бронь не подтверждает (остаётся на балансе);
 - перенос/отмена/оплата с баланса/истечение hold закрывают pending-счета брони;
 - hold_deadline прошёл → истекла_оплата + счёт expired (beat booking_holds);
-- отмена подтверждённой брони: раньше чем за cancel_full_refund_hours до
-  начала → refund 100%; позже → удержание no_show_hold_percent % (т.е.
-  refund = final × (100−hold)/100); отмена площадкой → всегда 100%;
-- неявка → удержание no_show_hold_percent %.
+- отмена подтверждённой брони (только до начала) мастером: возврат по
+  ступеням refund_tiers (дефолт ≥24ч → 100%, ≥12ч → 50%, позже → 0%);
+  отмена площадкой → всегда 100%.
 
 Все check+insert — в одной транзакции; charge сериализуется advisory lock'ом
 по мастеру (lock_master_slot в db/locks.py) — параллельные charge не уходят
 в минус.
+
+Порядок блокировок строк везде один: бронь → её счета (lock_payment). Иначе
+вебхук (счёт → бронь) и отмена/оплата/перенос (бронь → счета) взаимно
+блокируются (deadlock в Postgres).
+
+ApiPay (сеть, таймаут до 15 с) не вызывается внутри транзакции: создание и
+отмена внешнего счёта откладываются (session.info) и выполняются
+run_provider_ops ПОСЛЕ commit — блокировки места/мастера/брони и соединение
+с БД не ждут провайдера.
 """
 
 import logging
@@ -119,17 +127,114 @@ async def _add_entry(
     return entry
 
 
+_PROVIDER_OPS_KEY = "coworking_provider_ops"
+
+
+def _defer_provider_op(session, op: tuple) -> None:
+    """Запомнить вызов ApiPay до commit: выполнит run_provider_ops после него."""
+    session.info.setdefault(_PROVIDER_OPS_KEY, []).append(op)
+
+
+def discard_provider_ops(session) -> None:
+    """Транзакция откатилась — отложенные вызовы провайдера неактуальны."""
+    session.info.pop(_PROVIDER_OPS_KEY, None)
+
+
+async def run_provider_ops(session) -> None:
+    """Выполнить отложенные вызовы ApiPay. Вызывать ТОЛЬКО после commit.
+
+    Сбой провайдера не ломает уже закоммиченную операцию: счёт без внешнего
+    счёта остаётся manual (оплата у администратора/с баланса), неотменённый
+    внешний счёт — поздняя оплата по нему ляжет на баланс (apply_payment_paid).
+    """
+    ops = session.info.pop(_PROVIDER_OPS_KEY, [])
+    for op in ops:
+        try:
+            if op[0] == "create":
+                await _attach_apipay_invoice(session, op[1], op[2])
+            else:
+                await _cancel_external_invoice(op[1], op[2])
+        except Exception:
+            logger.exception("Apipay deferred op %s failed", op[:2])
+            await session.rollback()
+
+
+async def _cancel_external_invoice(payment_id: int, external_id: str) -> None:
+    probe = Payment(id=payment_id, external_invoice_id=external_id)
+    try:
+        await get_provider(PaymentProvider.apipay.value).cancel_invoice(probe)
+    except PaymentProviderError as exc:
+        logger.warning("Apipay cancel failed for payment %s: %s", payment_id, exc)
+
+
+async def _attach_apipay_invoice(session, payment_id: int, ctx: InvoiceContext) -> None:
+    """После commit: внешний счёт Kaspi для manual-счёта брони.
+
+    Счёт мог за это время закрыться (перенос/отмена/оплата с баланса) —
+    тогда только что созданный внешний счёт отменяем.
+    """
+    amount = (
+        await session.execute(select(Payment.amount).where(Payment.id == payment_id))
+    ).scalar_one_or_none()
+    # закрываем читающую транзакцию: соединение с БД не ждёт провайдера
+    await session.commit()
+    if amount is None:
+        return
+    try:
+        created = await get_provider(PaymentProvider.apipay.value).create_invoice(
+            Payment(id=payment_id, amount=amount), ctx
+        )
+    except PaymentProviderError as exc:
+        logger.warning("Apipay booking invoice failed for payment %s: %s — stays manual", payment_id, exc)
+        return
+    payment = await lock_payment(session, payment_id)
+    if payment.status != PaymentStatus.pending.value or payment.external_invoice_id:
+        await session.commit()
+        await _cancel_external_invoice(payment_id, created.external_id)
+        return
+    payment.provider = PaymentProvider.apipay.value
+    payment.external_invoice_id = created.external_id
+    payment.payment_url = created.payment_url
+    payment.expires_at = created.expires_at or payment.expires_at
+    await session.commit()
+
+
+async def lock_payment(session, payment_id: int) -> Payment:
+    """FOR UPDATE счёта в общем порядке «бронь → счёт» (свежие строки).
+
+    booking_id счёта не меняется — читаем его без блокировки, блокируем бронь,
+    затем сам счёт.
+    """
+    booking_id = (
+        await session.execute(select(Payment.booking_id).where(Payment.id == payment_id))
+    ).scalar_one()
+    if booking_id is not None:
+        await session.execute(
+            for_update(
+                select(Booking).where(Booking.id == booking_id).execution_options(populate_existing=True),
+                session,
+            )
+        )
+    return (
+        await session.execute(
+            for_update(
+                select(Payment).where(Payment.id == payment_id).execution_options(populate_existing=True),
+                session,
+            )
+        )
+    ).scalar_one()
+
+
 async def create_booking_invoice(
     session, business: Business, booking: Booking, user_id: int
 ) -> Payment | None:
     """Счёт на 100% стоимости брони при создании (POST /bookings).
 
-    Провайдер: apipay, если подключён, иначе manual pending (мастер/владелец
-    подтвердит оплату кнопкой). Идемпотентен: повторный вызов возвращает уже
-    созданный pending-счёт на эту бронь. None — цена 0 (бесплатная бронь).
-
-    Счёт коммитится вызывающим до обращения к провайдеру; сбой apipay →
-    счёт остаётся manual, бронь не срывается.
+    Счёт создаётся manual pending; если apipay подключён и у мастера есть
+    телефон — внешний счёт Kaspi выставит run_provider_ops после commit
+    (сбой apipay → счёт остаётся manual, бронь не срывается). Идемпотентен:
+    повторный вызов возвращает уже созданный pending-счёт на эту бронь.
+    None — цена 0 (бронь с нулевой ценой не создаётся, см. service).
     """
     existing = (
         await session.execute(
@@ -154,18 +259,13 @@ async def create_booking_invoice(
         )
     ).scalar_one_or_none()
     phone = _normalize_phone(master.phone) if master else None
-    provider_name = (
-        PaymentProvider.apipay.value
-        if apipay_configured() and phone
-        else PaymentProvider.manual.value
-    )
     payment = Payment(
         business_id=business.id,
         booking_id=booking.id,
         amount=float(amount),
         kind=PaymentKind.prepay.value,
         status=PaymentStatus.pending.value,
-        provider=provider_name,
+        provider=PaymentProvider.manual.value,
         created_by_user_id=user_id,
         master_id=booking.master_id,
         expires_at=booking.hold_deadline,
@@ -174,25 +274,19 @@ async def create_booking_invoice(
     session.add(payment)
     await session.flush()
 
-    if provider_name == PaymentProvider.apipay.value:
-        try:
-            created = await get_provider(provider_name).create_invoice(
-                payment,
+    if apipay_configured() and phone:
+        _defer_provider_op(
+            session,
+            (
+                "create",
+                payment.id,
                 InvoiceContext(
                     client_phone=phone,
                     client_name=master.full_name if master else "",
                     description=f"Бронь места #{booking.id}"[:60],
                 ),
-            )
-        except PaymentProviderError as exc:
-            # ApiPay недоступен — счёт остаётся manual, бронь не срывается
-            logger.warning("Apipay booking invoice failed for booking %s: %s — fallback manual", booking.id, exc)
-            payment.provider = PaymentProvider.manual.value
-            payment.external_invoice_id = None
-        else:
-            payment.external_invoice_id = created.external_id
-            payment.payment_url = created.payment_url
-            payment.expires_at = created.expires_at or booking.hold_deadline
+            ),
+        )
     return payment
 
 
@@ -307,7 +401,9 @@ async def apply_payment_paid(
             price = booking_price(booking)
             if _dec(payment.amount) < price:
                 topup.note = f"{payment.note or 'Оплата счёта'} — не покрывает цену брони #{booking.id}, сумма зачислена на баланс"
-            if _dec(payment.amount) >= price:
+            elif await hold_seat_lost(session, booking):
+                topup.note = f"{payment.note or 'Оплата счёта'} — hold брони #{booking.id} истёк и место занято, сумма зачислена на баланс"
+            if _dec(payment.amount) >= price and not await hold_seat_lost(session, booking):
                 booking.paid_amount = float(_round2(price))
                 booking.status = BookingStatus.confirmed.value
                 booking.hold_deadline = None
@@ -343,6 +439,32 @@ async def apply_payment_paid(
     return True
 
 
+async def hold_seat_lost(session, booking: Booking) -> bool:
+    """Hold истёк (свип ещё не отработал), а место/время мастера уже взяла другая бронь."""
+    deadline = booking.hold_deadline
+    if deadline is None:
+        return False
+    if deadline.tzinfo is None:
+        deadline = deadline.replace(tzinfo=UTC)  # SQLite отдаёт naive UTC
+    if deadline >= datetime.now(UTC):
+        return False
+    from tg_studio.modules.coworking import service
+
+    if await service.find_seat_conflicts(
+        session, booking.business_id, booking.seat_id, booking.start, booking.end,
+        exclude_booking_id=booking.id,
+    ):
+        return True
+    try:
+        await service.assert_master_free(
+            session, booking.business_id, booking.master_id, booking.start, booking.end,
+            exclude_booking_id=booking.id,
+        )
+    except HTTPException:
+        return True
+    return False
+
+
 async def pay_booking_from_balance(
     session, business: Business, booking: Booking, user_id: int
 ) -> Booking:
@@ -359,6 +481,8 @@ async def pay_booking_from_balance(
     price = booking_price(booking)
     if price <= 0:
         raise HTTPException(status_code=409, detail="У брони нулевая цена — оплата не нужна")
+    if await hold_seat_lost(session, booking):
+        raise HTTPException(status_code=409, detail="Время оплаты истекло, место уже занято")
 
     await lock_master_slot(session, booking.master_id)
     balance = await master_balance(session, booking.master_id)
@@ -455,27 +579,24 @@ async def settle_price_change(
 
 
 def cancel_refund_amount(booking: Booking, settings: dict, *, by_studio: bool) -> Decimal:
-    """Сколько вернуть при отмене подтверждённой брони (правило 24ч).
+    """Сколько вернуть при отмене подтверждённой брони.
 
-    by_studio → всегда 100%. Иначе: до начала осталось ≥ cancel_full_refund_hours
-    → 100%; позже → удержание no_show_hold_percent % от цены, возврат остатка.
+    by_studio → всегда 100%. Иначе ступени refund_tiers (от большей к меньшей):
+    первая, для которой до начала осталось не меньше hours_before часов,
+    задаёт процент возврата; ни одна не подошла → 0%.
     """
     price = booking_price(booking)
     if by_studio or price <= 0:
         return price
-    now = datetime.now(UTC)
     start = booking.start
     if start.tzinfo is None:
         # SQLite в тестах возвращает naive — колонка timestamptz, время UTC
         start = start.replace(tzinfo=UTC)
-    hours_left = (start - now).total_seconds() / 3600
-    full_hours = int(settings["cancel_full_refund_hours"])
-    # полный возврат — если до начала осталось не меньше порога; порог 0 = никогда
-    if full_hours > 0 and hours_left >= full_hours:
-        return price
-    hold_percent = _dec(settings["no_show_hold_percent"]) / Decimal(100)
-    hold = _round2(price * hold_percent)
-    return _round2(price - hold)
+    hours_left = Decimal(str((start - datetime.now(UTC)).total_seconds())) / Decimal(3600)
+    for tier in settings["refund_tiers"]:
+        if hours_left >= tier["hours_before"]:
+            return _round2(price * Decimal(tier["percent"]) / Decimal(100))
+    return Decimal("0")
 
 
 async def apply_cancellation_refund(
@@ -487,7 +608,7 @@ async def apply_cancellation_refund(
     by_studio: bool,
     reason: str | None,
 ) -> Decimal:
-    """Возврат по отмене подтверждённой брони (или неявки): refund-проводка.
+    """Возврат по отмене подтверждённой брони: refund-проводка.
 
     Возвращает сумму возврата (0 — удержали всё). Проводка пишется всегда,
     когда была предоплата (paid_amount > 0) — даже при нулевом возврате нет:
@@ -530,8 +651,8 @@ async def apply_cancellation_refund(
 async def close_booking_invoices(session, booking: Booking, status: PaymentStatus) -> list[Payment]:
     """Закрыть все pending-счета брони (cancelled/expired): бронь больше не ждёт оплаты.
 
-    Внешний счёт apipay отменяем у провайдера; если он недоступен — локально счёт
-    всё равно закрыт, а запоздалая оплата по нему станет пополнением баланса
+    Внешний счёт apipay отменяется у провайдера после commit (run_provider_ops);
+    если он недоступен — локально счёт всё равно закрыт, а запоздалая оплата по нему станет пополнением баланса
     (apply_payment_paid подтверждает только pending-бронь).
     """
     payments = (
@@ -547,10 +668,7 @@ async def close_booking_invoices(session, booking: Booking, status: PaymentStatu
     ).scalars().all()
     for payment in payments:
         if payment.provider == PaymentProvider.apipay.value and payment.external_invoice_id:
-            try:
-                await get_provider(payment.provider).cancel_invoice(payment)
-            except PaymentProviderError as exc:
-                logger.warning("Apipay cancel failed for payment %s: %s", payment.id, exc)
+            _defer_provider_op(session, ("cancel", payment.id, payment.external_invoice_id))
         payment.status = status.value
     return payments
 

@@ -129,6 +129,13 @@ def _subtract(
     return parts
 
 
+def _intersect(
+    interval: tuple[datetime, datetime], windows: list[tuple[datetime, datetime]]
+) -> list[tuple[datetime, datetime]]:
+    return [(max(interval[0], w0), min(interval[1], w1)) for w0, w1 in windows
+            if min(interval[1], w1) > max(interval[0], w0)]
+
+
 def _hours(seconds: Decimal) -> float:
     return float((seconds / HOUR_SECONDS).quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP))
 
@@ -182,14 +189,7 @@ async def load_report_data(session, business: Business, from_: datetime, to: dat
 
     data.bookings = list(await rows(
         select(Booking).where(
-            Booking.business_id == bid,
-            or_(
-                (Booking.start < to) & (Booking.end > from_),
-                (Booking.visit_started_at.is_not(None))
-                & (Booking.visit_ended_at.is_not(None))
-                & (Booking.visit_started_at < to)
-                & (Booking.visit_ended_at > from_),
-            ),
+            Booking.business_id == bid, Booking.start < to, Booking.end > from_,
         )
     ))
     data.sales = list(await rows(
@@ -297,10 +297,52 @@ async def load_report_data(session, business: Business, from_: datetime, to: dat
 
 
 def _booking_interval(booking: Booking) -> tuple[datetime, datetime]:
-    start, end = booking.start, booking.end
-    if booking.visit_started_at is not None and booking.visit_ended_at is not None:
-        start, end = booking.visit_started_at, booking.visit_ended_at
-    return utc(start), utc(end)
+    return utc(booking.start), utc(booking.end)
+
+
+def _booking_price(booking: Booking) -> Decimal:
+    return dec(booking.paid_amount or (booking.price_snapshot or {}).get("final"))
+
+
+def refund_facts(data: ReportData) -> list[dict]:
+    """Единый список возвратов периода. Возврат по брони/продаже мастеру пишет и
+    событие, и ledger-проводку на одну сумму — это один факт (парим по
+    брони/продаже и сумме, поэтому второй отдельный возврат не теряется).
+    `to_balance`: деньги ушли на баланс мастера, из кассы не выдавались."""
+    sale_by_id = {sale.id: sale for sale in data.sales}
+    booking_master = {b.id: b.master_id for b in data.bookings}
+    ledger = [e for e in data.ledger if e.kind == LedgerEntryKind.refund.value]
+    matched: set[int] = set()
+    facts = []
+    for event in data.events:
+        details = event.details if isinstance(event.details, dict) else {}
+        sale = sale_by_id.get(details.get("sale_id"))
+        amount = dec(details.get("amount"))
+        entry = next((
+            e for e in ledger if e.id not in matched
+            and (e.sale_id == sale.id if sale else e.sale_id is None and e.booking_id == event.booking_id)
+            and dec(e.amount) == amount
+        ), None)
+        if entry is not None:
+            matched.add(entry.id)
+        facts.append({
+            "date": event.created_at, "type": "sale" if sale else "booking",
+            "booking_id": event.booking_id, "sale_id": sale.id if sale else None,
+            "master_id": sale.master_id if sale else booking_master.get(event.booking_id),
+            "amount": amount, "held": dec(details.get("held")),
+            "payment_id": details.get("payment_id"), "to_balance": entry is not None,
+            "note": details.get("reason") or ("Возврат по продаже" if sale else "Возврат и удержание по брони"),
+        })
+    for entry in ledger:
+        if entry.id in matched:
+            continue
+        facts.append({
+            "date": entry.created_at, "type": "booking" if entry.booking_id is not None else "sale",
+            "booking_id": entry.booking_id, "sale_id": entry.sale_id, "master_id": entry.master_id,
+            "amount": dec(entry.amount), "held": Decimal(0),
+            "payment_id": entry.payment_id, "to_balance": True, "note": entry.note,
+        })
+    return facts
 
 
 def revenue_report(data: ReportData, from_: datetime, to: datetime) -> dict:
@@ -320,7 +362,7 @@ def revenue_report(data: ReportData, from_: datetime, to: datetime) -> dict:
         total_seconds = _overlap_seconds(start, end, start, end)
         if total_seconds <= 0:
             continue
-        price = dec(booking.paid_amount or (booking.price_snapshot or {}).get("final"))
+        price = _booking_price(booking)
         seconds = _overlap_seconds(start, end, from_, to)
         if not seconds:
             continue
@@ -347,29 +389,12 @@ def revenue_report(data: ReportData, from_: datetime, to: datetime) -> dict:
         if from_ <= utc(sale.created_at) < to:
             sale_gross += dec(sale.total_amount)
             by_day[to_studio_local(sale.created_at).date()]["sales_revenue"] += dec(sale.total_amount)
-    bookings_with_refund_event = {event.booking_id for event in data.events}
-    sales_with_refund_event = {
-        (event.details or {}).get("sale_id") for event in data.events
-        if (event.details or {}).get("sale_id") is not None
-    }
-    for entry in data.ledger:
-        if entry.kind != LedgerEntryKind.refund.value:
-            continue
-        if entry.booking_id in bookings_with_refund_event or entry.sale_id in sales_with_refund_event:
-            # Событие содержит и возврат, и удержание; ledger здесь дублирует факт.
-            continue
-        if entry.booking_id is not None:
-            booking_refunds += dec(entry.amount)
+    for fact in refund_facts(data):
+        if fact["type"] == "sale":
+            sale_refunds += fact["amount"]
         else:
-            sale_refunds += dec(entry.amount)
-        by_day[to_studio_local(entry.created_at).date()]["refunds"] += dec(entry.amount)
-    for event in data.events:
-        details = event.details or {}
-        if details.get("sale_id") is not None:
-            sale_refunds += dec(details.get("amount"))
-        else:
-            booking_refunds += dec(details.get("amount"))
-        by_day[to_studio_local(event.created_at).date()]["refunds"] += dec(details.get("amount"))
+            booking_refunds += fact["amount"]
+        by_day[to_studio_local(fact["date"]).date()]["refunds"] += fact["amount"]
 
     # Продажи могли быть до начала периода: их позиции уже загружены,
     # а по возвратам мастера источником служит LedgerEntry.
@@ -417,6 +442,8 @@ async def usage_report(session, data: ReportData, from_: datetime, to: datetime)
         hours_by_day[local_day] = await studio_hours_for_date(session, business_id, local_day)
         cursor = utc(studio_day_range(local_day)[1])
     for seat in data.seats:
+        if not seat.is_active and not any(b.seat_id == seat.id for b in data.bookings):
+            continue  # выключенное место без броней не занижает загрузку салона
         intervals: list[tuple[datetime, datetime]] = []
         cursor = from_
         while cursor < to:
@@ -438,6 +465,9 @@ async def usage_report(session, data: ReportData, from_: datetime, to: datetime)
             (max(utc(b.start), from_), min(utc(b.end), to))
             for b in data.blocks if b.seat_id in (None, seat.id)
         ]
+        # Загрузка места ≤ 100%: занятость и блокировки считаем только внутри рабочих часов студии
+        occupied = [p for iv in _merge(occupied) for p in _intersect(iv, available_intervals)]
+        blocked = [p for iv in _merge(blocked) for p in _intersect(iv, available_intervals)]
         occupied, blocked = _merge(occupied), _merge(blocked)
         free = [part for interval in available_intervals for part in _subtract(interval, occupied + blocked)]
         available_seconds = sum((dec((end - start).total_seconds()) for start, end in available_intervals), Decimal(0))
@@ -482,34 +512,14 @@ def money_report(data: ReportData, from_: datetime, to: datetime, revenue: dict)
             "amount": money(amount), "method": payment.provider,
             "external_id": payment.external_invoice_id, "payment_id": payment.id,
         })
-    refunds = []
-    bookings_with_event = {event.booking_id for event in data.events}
-    sales_with_event = {
-        (event.details or {}).get("sale_id") for event in data.events
-        if isinstance(event.details, dict)
-    }
     master_names = {m.id: m.full_name for m in data.masters}
-    sale_by_id = {sale.id: sale for sale in data.sales}
-    for entry in data.ledger:
-        if entry.kind == LedgerEntryKind.refund.value and entry.booking_id not in bookings_with_event and entry.sale_id not in sales_with_event:
-            refunds.append({
-                "date": entry.created_at, "type": "sale" if entry.sale_id else "booking",
-                "booking_id": entry.booking_id, "sale_id": entry.sale_id,
-                "master_name": master_names.get(entry.master_id), "amount": money(dec(entry.amount)),
-                "external_id": None, "payment_id": entry.payment_id, "held": 0, "note": entry.note,
-            })
-    for event in data.events:
-        details = event.details or {}
-        sale = sale_by_id.get(details.get("sale_id"))
-        refunds.append({
-            "date": event.created_at,
-            "type": "sale" if sale is not None else "booking",
-            "booking_id": event.booking_id, "sale_id": sale.id if sale else None,
-            "master_name": master_names.get(sale.master_id) if sale else None,
-            "amount": money(dec(details.get("amount"))), "held": money(dec(details.get("held"))),
-            "external_id": None, "payment_id": details.get("payment_id"),
-            "note": details.get("reason") or ("Возврат по продаже" if sale else "Возврат и удержание по брони"),
-        })
+    facts = refund_facts(data)
+    refunds = [{
+        "date": f["date"], "type": f["type"], "booking_id": f["booking_id"], "sale_id": f["sale_id"],
+        "master_name": master_names.get(f["master_id"]), "amount": money(f["amount"]),
+        "held": money(f["held"]), "external_id": None, "payment_id": f["payment_id"], "note": f["note"],
+    } for f in facts]
+    cash_refunds = sum((f["amount"] for f in facts if not f["to_balance"]), Decimal(0))
     balances = []
     for master in data.masters:
         balances.append({
@@ -518,7 +528,7 @@ def money_report(data: ReportData, from_: datetime, to: datetime, revenue: dict)
         })
     return {
         "from_": from_, "to": to, "currency": CURRENCY,
-        "receipts": money(receipts), "net_cash": money(receipts - dec(revenue["refunds"])),
+        "receipts": money(receipts), "net_cash": money(receipts - cash_refunds),
         "refunds": money(dec(revenue["refunds"])), "booking_holds": money(sum((dec(r["held"]) for r in refunds), Decimal(0))),
         "topups": money(sum((dec(e.amount) for e in data.ledger if e.kind == LedgerEntryKind.topup.value), Decimal(0))),
         "charges": money(-sum((dec(e.amount) for e in data.ledger if e.kind == LedgerEntryKind.charge.value), Decimal(0))),
@@ -538,7 +548,13 @@ async def fill_balances(session, business_id: int, rows: list[dict]) -> Decimal:
 
 
 def masters_report(data: ReportData, from_: datetime, to: datetime) -> dict:
+    """Мастера за период. Присутствие: брони, начавшиеся в периоде и уже
+    начавшиеся к «сейчас» (presence_expected), из них подтверждённые мастером
+    кнопкой в напоминании (presence_confirmed). Неподтверждённая ≠ неявка —
+    мастер мог не нажать."""
     rows = []
+    master_refunds = refund_facts(data)
+    presence_until = min(utc(to), datetime.now(UTC))
     for master in data.masters:
         bookings = [b for b in data.bookings if b.master_id == master.id and b.status in PAID_BOOKING_STATUSES]
         seconds = Decimal(0)
@@ -550,17 +566,30 @@ def masters_report(data: ReportData, from_: datetime, to: datetime) -> dict:
             if booking.status in SERVICE_BOOKING_STATUSES:
                 seconds += selected  # отменённая бронь не создаёт отработанных часов
             if total:
-                revenue += dec(booking.paid_amount) * selected / total
-        sales = sum((dec(s.total_amount) for s in data.sales if s.master_id == master.id), Decimal(0))
+                revenue += _booking_price(booking) * selected / total
+        sales = sum((
+            dec(s.total_amount) for s in data.sales
+            if s.master_id == master.id and from_ <= utc(s.created_at) < to
+        ), Decimal(0))
+        refunds = sum((f["amount"] for f in master_refunds if f["master_id"] == master.id), Decimal(0))
         created = utc(master.user.created_at) if master.user else None
+        expected = [
+            b for b in bookings
+            if b.status in SERVICE_BOOKING_STATUSES and utc(from_) <= utc(b.start) < presence_until
+        ]
         rows.append({
             "master_id": master.id, "master_name": master.full_name, "is_active": master.is_active,
             "is_new": bool(created and from_ <= created < to), "bookings": len(bookings),
-            "hours": _hours(seconds), "revenue": money(revenue + sales),
+            "hours": _hours(seconds), "revenue": money(revenue + sales - refunds),
+            "refunds": money(refunds),
             "booking_revenue": money(revenue), "sales_revenue": money(sales), "balance": None,
+            "presence_expected": len(expected),
+            "presence_confirmed": sum(b.presence_confirmed_at is not None for b in expected),
         })
     return {"from_": from_, "to": to, "currency": CURRENCY, "masters": rows,
-            "new": sum(row["is_new"] for row in rows), "active": sum(row["bookings"] > 0 or row["sales_revenue"] > 0 for row in rows)}
+            "new": sum(row["is_new"] for row in rows), "active": sum(row["bookings"] > 0 or row["sales_revenue"] > 0 for row in rows),
+            "presence_expected": sum(row["presence_expected"] for row in rows),
+            "presence_confirmed": sum(row["presence_confirmed"] for row in rows)}
 
 
 def upsells_report(data: ReportData, from_: datetime, to: datetime) -> dict:
@@ -575,45 +604,78 @@ def upsells_report(data: ReportData, from_: datetime, to: datetime) -> dict:
             "amount": money(sum((dec(u.amount) for u in upsells), Decimal(0))),
             "product_amount": money(sum((dec(u.amount) for u in upsells if u.sale_id is not None), Decimal(0))),
             "manual_amount": money(sum((dec(u.amount) for u in upsells if u.sale_id is None), Decimal(0))),
+            # кто покупает: мастера (расходники для работы) и клиенты мастеров (уход)
+            "master_amount": money(sum((dec(u.amount) for u in upsells if u.master_id is not None), Decimal(0))),
+            "client_amount": money(sum((dec(u.amount) for u in upsells if u.master_id is None), Decimal(0))),
             "payout_accrued": money(accrued), "payout_paid": money(paid),
         })
     return {"from_": from_, "to": to, "currency": CURRENCY, "admins": rows,
-            "amount": money(sum((dec(row["amount"]) for row in rows), Decimal(0)))}
+            "amount": money(sum((dec(row["amount"]) for row in rows), Decimal(0))),
+            "master_amount": money(sum((dec(row["master_amount"]) for row in rows), Decimal(0))),
+            "client_amount": money(sum((dec(row["client_amount"]) for row in rows), Decimal(0)))}
 
 
-async def dashboard(session, business: Business) -> dict:
+def dashboard_period(now: datetime, period: str) -> tuple[datetime, datetime]:
+    """Календарные день / неделя (с понедельника) / месяц студии, содержащие `now`."""
+    today = now.date()
+    if period == "week":
+        first = today - timedelta(days=today.weekday())
+        return studio_day_range(first)[0], studio_day_range(first + timedelta(days=7))[0]
+    if period == "month":
+        first = today.replace(day=1)
+        following = (first + timedelta(days=32)).replace(day=1)
+        return studio_day_range(first)[0], studio_day_range(following)[0]
+    return studio_day_range(today)
+
+
+async def dashboard(session, business: Business, period: str = "day") -> dict:
     now = studio_now()
-    from_, tomorrow = studio_day_range(now.date())
+    from_, tomorrow = dashboard_period(now, period)
     data = await load_report_data(session, business, from_, tomorrow)
     revenue = revenue_report(data, from_, tomorrow)
     money_data = money_report(data, from_, tomorrow, revenue)
     total_balance = await fill_balances(session, business.id, money_data["balances"])
     money_data["total_balance"] = money(total_balance)
-    usage = await usage_report(session, data, from_, tomorrow)
-    next_day = tomorrow + timedelta(days=1)
+    # Загрузка за неделю/месяц считаем до «сейчас»: будущие часы занизили бы процент
+    usage = await usage_report(session, data, from_, tomorrow if period == "day" else min(tomorrow, utc(now)))
+    next_day = studio_day_range(now.date())[1] + timedelta(days=1)
     upcoming_data = await load_report_data(session, business, now, next_day)
+    # идут сейчас — подтверждённые брони, время которых наступило; скоро — ещё не начавшиеся
+    onsite = sorted([
+        b for b in upcoming_data.bookings
+        if b.status in SERVICE_BOOKING_STATUSES and utc(b.start) <= utc(now) < utc(b.end)
+    ], key=lambda b: utc(b.start))
     upcoming = sorted([
         b for b in upcoming_data.bookings
-        if b.status in ACTIVE_BOOKING_STATUSES and utc(b.end) > utc(now)
+        if b.status in ACTIVE_BOOKING_STATUSES and utc(b.start) > utc(now)
     ], key=lambda b: utc(b.start))[:12]
     names = {m.id: m.full_name for m in upcoming_data.masters}
     seat_names = {s.id: s.name for s in upcoming_data.seats}
 
-    horizon = min(utc(now) + timedelta(hours=4), utc(tomorrow))
+    horizon = utc(now) + timedelta(hours=4)
     seats_now = []
+    all_bookings = {b.id: b for b in data.bookings + upcoming_data.bookings}.values()
+    now_utc = utc(now)
     for seat in data.seats:
+        if not seat.is_active:
+            continue
         busy = [
-            b for b in data.bookings + upcoming_data.bookings
+            b for b in all_bookings
             if b.seat_id == seat.id and b.status in ACTIVE_BOOKING_STATUSES
-            and utc(b.start) < horizon and utc(b.end) > utc(now)
+            and utc(b.start) < horizon and utc(b.end) > now_utc
         ]
-        current = next((b for b in busy if utc(b.start) <= utc(now) < utc(b.end)), None)
+        current = next((b for b in busy if utc(b.start) <= now_utc < utc(b.end)), None)
+        blocked = next((
+            bl for bl in data.blocks
+            if bl.seat_id in (None, seat.id) and utc(bl.start) <= now_utc < utc(bl.end)
+        ), None)
         seats_now.append({
             "seat_id": seat.id, "seat_name": seat.name,
-            "status": "occupied" if current else "free", "booking_id": current.id if current else None,
+            "status": "occupied" if current else "blocked" if blocked else "free",
+            "booking_id": current.id if current else None,
             "master_name": names.get(current.master_id) if current else None,
-            "until": current.end if current else None,
-            "upcoming": len(busy),
+            "until": current.end if current else blocked.end if blocked else None,
+            "upcoming": len([b for b in busy if b is not current]),
         })
     low_stock = list((await session.execute(
         select(Supply).where(
@@ -623,16 +685,16 @@ async def dashboard(session, business: Business) -> dict:
     )).scalars().all())
     from tg_studio.modules.coworking.service import ops_exceptions
     return {
-        "generated_at": now, "from_": from_, "to": tomorrow, "currency": CURRENCY,
+        "generated_at": now, "period": period, "from_": from_, "to": tomorrow, "currency": CURRENCY,
         "revenue": revenue, "money": money_data, "usage": usage,
         "master_balances": money(total_balance),
         "bookings_created": sum(from_ <= utc(b.created_at) < tomorrow for b in data.bookings),
         "cancellations": sum(b.status in (BookingStatus.cancelled_by_master.value, BookingStatus.cancelled_by_studio.value) for b in data.bookings),
-        "no_shows": sum(b.status == BookingStatus.no_show.value for b in data.bookings),
         "onsite": [{
             "booking_id": b.id, "master_name": names.get(b.master_id), "seat_name": seat_names.get(b.seat_id),
-            "start": b.visit_started_at or b.start, "end": b.end,
-        } for b in data.bookings if b.status == BookingStatus.started.value and b.visit_started_at and not b.visit_ended_at],
+            "start": b.start, "end": b.end, "status": b.status,
+            "presence_confirmed": b.presence_confirmed_at is not None,
+        } for b in onsite],
         "upcoming": [{
             "booking_id": b.id, "master_name": names.get(b.master_id), "seat_name": seat_names.get(b.seat_id),
             "start": b.start, "end": b.end, "status": b.status,

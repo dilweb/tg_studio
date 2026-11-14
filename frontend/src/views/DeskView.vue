@@ -4,7 +4,8 @@ import { computed, onMounted, ref } from 'vue'
 import { api } from '../api/client'
 import { authStore } from '../store/auth'
 
-// Раздел «Админ» (05): текущие брони студии с отметками и операционные исключения.
+// Раздел «Админ» (05): текущие брони студии и операционные исключения.
+// Ручных отметок посещения нет: присутствие мастер подтверждает кнопкой в напоминании Telegram.
 const isOwner = computed(() => authStore.me?.role === 'owner')
 
 const bookings = ref([])
@@ -26,7 +27,6 @@ const STATUS_LABELS = {
 }
 
 const EXCEPTION_LABELS = {
-  no_show: 'Неявка',
   payment_expired: 'Истёк hold оплаты',
   out_of_coverage_unconfirmed: 'Вне покрытия, не подтверждена',
 }
@@ -59,21 +59,6 @@ async function load() {
     error.value = err.detail ?? err.message
   } finally {
     loading.value = false
-  }
-}
-
-async function act(b, action) {
-  acting.value = true
-  error.value = ''
-  try {
-    await api.post(`/api/bookings/${b.id}/${action}`)
-    notice.value = 'Отмечено'
-    await load()
-  } catch (err) {
-    const d = err.detail
-    error.value = typeof d === 'object' ? (d.message ?? JSON.stringify(d)) : (d ?? err.message)
-  } finally {
-    acting.value = false
   }
 }
 
@@ -141,7 +126,7 @@ onMounted(load)
         <div v-else class="table-wrap">
           <table class="table">
             <thead>
-              <tr><th>Место</th><th>Начало</th><th>Конец</th><th>Мастер</th><th>Статус</th><th>Цена</th><th>Визит</th><th class="actions-col"></th></tr>
+              <tr><th>Место</th><th>Начало</th><th>Конец</th><th>Мастер</th><th>Статус</th><th>Цена</th><th>Присутствие</th><th class="actions-col"></th></tr>
             </thead>
             <tbody>
               <tr v-for="b in bookings" :key="b.id">
@@ -152,46 +137,9 @@ onMounted(load)
                 <td><span class="badge">{{ STATUS_LABELS[b.status] ?? b.status }}</span></td>
                 <td>{{ b.price_snapshot ? fmtMoney(b.price_snapshot.final) : '—' }}</td>
                 <td class="muted">
-                  {{ b.visit_started_at ? fmt(b.visit_started_at).slice(-5) : '—' }}
-                  –
-                  {{ b.visit_ended_at ? fmt(b.visit_ended_at).slice(-5) : '…' }}
+                  {{ b.presence_confirmed_at ? `✓ ${fmt(b.presence_confirmed_at).slice(-5)}` : '—' }}
                 </td>
                 <td class="actions-col">
-                  <button
-                    v-if="b.status === 'подтверждена'"
-                    class="btn btn-sm"
-                    type="button"
-                    :disabled="acting"
-                    @click="act(b, 'start')"
-                  >Начать</button>
-                  <button
-                    v-if="b.status === 'начата'"
-                    class="btn btn-sm"
-                    type="button"
-                    :disabled="acting"
-                    @click="act(b, 'complete')"
-                  >Завершить</button>
-                  <button
-                    v-if="['подтверждена', 'начата'].includes(b.status) && !b.visit_started_at"
-                    class="btn btn-sm btn-ghost"
-                    type="button"
-                    :disabled="acting"
-                    @click="act(b, 'visit/start')"
-                  >Пришёл</button>
-                  <button
-                    v-if="b.visit_started_at && !b.visit_ended_at"
-                    class="btn btn-sm btn-ghost"
-                    type="button"
-                    :disabled="acting"
-                    @click="act(b, 'visit/end')"
-                  >Ушёл</button>
-                  <button
-                    v-if="['ожидает_оплаты', 'подтверждена', 'начата'].includes(b.status)"
-                    class="btn btn-sm btn-ghost"
-                    type="button"
-                    :disabled="acting"
-                    @click="act(b, 'no-show')"
-                  >Неявка</button>
                   <button
                     v-if="b.requires_confirmation && !b.confirmed_by_user_id && isOwner"
                     class="btn btn-sm btn-primary"

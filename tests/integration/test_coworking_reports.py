@@ -1,6 +1,6 @@
 """Интеграционные тесты дашборда, отчётов и Excel (docs/coworking/07)."""
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from io import BytesIO
 
 import pytest
@@ -162,7 +162,7 @@ async def test_reports_match_facts_and_owner_only(api_client, reporting_facts):
     # Topup с баланса — не второй приход: только фактические paid Payment.
     assert money["receipts"] == 8000
     assert money["refunds"] == 1500
-    assert money["net_cash"] == 6500
+    assert money["net_cash"] == 8000  # оба возврата ушли на баланс мастера, из кассы не выдавались
     # 6000 пополнение - 6000 списание + 1000 и 500 возвратов на баланс.
     assert money["total_balance"] == 1500
     assert len(money["payments"]) == 2
@@ -179,7 +179,8 @@ async def test_reports_match_facts_and_owner_only(api_client, reporting_facts):
     assert masters["new"] == 1
     assert masters["active"] == 1
     assert masters["masters"][0]["hours"] == 3
-    assert masters["masters"][0]["revenue"] == 9000
+    assert masters["masters"][0]["revenue"] == 7500  # 9000 минус возвраты 1500
+    assert masters["masters"][0]["refunds"] == 1500
     assert masters["masters"][0]["balance"] == 1500
 
     response = await period(api_client, "/api/reports/upsells")
@@ -198,7 +199,7 @@ async def test_excel_contains_operations_refunds_and_cost(api_client, reporting_
     assert response.status_code == 200, response.text
     assert response.headers["content-type"] == "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     workbook = load_workbook(BytesIO(response.content), data_only=True)
-    assert workbook.sheetnames == ["Выручка", "Возвраты и удержания", "Продажи товаров"]
+    assert workbook.sheetnames == ["Выручка", "Возвраты и удержания", "Продажи товаров", "Поступления"]
     revenue = workbook["Выручка"]
     rows = list(revenue.iter_rows(min_row=2, values_only=True))
     assert any(row[7] == "bank-report-07" and row[2] == "Мастер Отчёт" and row[3] == 6000 for row in rows)
@@ -245,7 +246,6 @@ async def test_dashboard_reconciles_today_and_poll_source(api_client, reporting_
     assert dashboard["usage"]["blocked_hours"] == 2
     assert dashboard["bookings_created"] == 1
     assert dashboard["cancellations"] == 0
-    assert dashboard["no_shows"] == 0
     assert len(dashboard["seats_now"]) == 4
     assert all(row["status"] == "free" for row in dashboard["seats_now"])
 
@@ -269,10 +269,8 @@ async def test_partial_period_split_has_consistent_excel(api_client, reporting_f
 
 
 @pytest.mark.asyncio
-async def test_actual_visit_and_prior_payment_are_not_lost(api_client, db_session, reporting_facts):
+async def test_prior_payment_is_not_lost(api_client, db_session, reporting_facts):
     booking = reporting_facts["booking"]
-    booking.start, booking.end = at(1, 10), at(1, 13)
-    booking.visit_started_at, booking.visit_ended_at = at(3, 10), at(3, 13)
     # Банковский id сохраняется на строке этой брони в Excel.
     # Деньги пришли до периода выручки: cash не дублируется, но банковский id
     # остаётся доступен бухгалтеру на строке этой брони в Excel.
@@ -294,3 +292,76 @@ async def test_actual_visit_and_prior_payment_are_not_lost(api_client, db_sessio
     assert response.status_code == 200, response.text
     sheet = load_workbook(BytesIO(response.content), data_only=True)["Выручка"]
     assert any(row[7] == "bank-report-07" and row[8] == booking.id for row in sheet.iter_rows(min_row=2, values_only=True))
+
+
+@pytest.mark.asyncio
+async def test_dashboard_seats_blocked_upcoming_once_and_inactive_hidden(
+    api_client, db_session, reporting_facts, business, monkeypatch
+):
+    from tg_studio.modules.coworking import reports as reports_module
+
+    seats, master = reporting_facts["seats"], reporting_facts["master"]
+    db_session.add(Booking(
+        business_id=business.id, seat_id=seats[2]["id"], master_id=master.id,
+        start=at(3, 14), end=at(3, 15), status=BookingStatus.confirmed.value,
+        paid_amount=0, price_snapshot={"final": 0}, created_by_user_id=business.owner_id,
+    ))
+    await db_session.commit()
+    r = await api_client.patch(f"/api/seats/{seats[3]['id']}", json={"is_active": False}, headers=OWNER_HEADERS)
+    assert r.status_code == 200, r.text
+    monkeypatch.setattr(reports_module, "studio_now", lambda: at(3, 11))
+    rows = {row["seat_id"]: row for row in (await api_client.get("/api/dashboard", headers=OWNER_HEADERS)).json()["seats_now"]}
+    assert seats[3]["id"] not in rows
+    assert rows[seats[0]["id"]]["status"] == "free"  # бронь завершена
+    assert rows[seats[1]["id"]]["status"] == "blocked"
+    assert rows[seats[2]["id"]]["status"] == "free"
+    assert rows[seats[2]["id"]]["upcoming"] == 1  # раньше бронь считалась дважды
+
+
+@pytest.mark.asyncio
+async def test_usage_clipped_to_working_hours(api_client, db_session, reporting_facts, business):
+    seats, master = reporting_facts["seats"], reporting_facts["master"]
+    # бронь 21:00–24:00 при рабочем дне до 22:00: занято считается только до 22:00
+    db_session.add(Booking(
+        business_id=business.id, seat_id=seats[2]["id"], master_id=master.id,
+        start=at(3, 21), end=at(3, 21) + timedelta(hours=3), status=BookingStatus.completed.value,
+        paid_amount=0, price_snapshot={"final": 0}, created_by_user_id=business.owner_id,
+    ))
+    await db_session.commit()
+    usage = (await period(api_client, "/api/reports/usage", from_day=3, to_day=4)).json()
+    row = next(r for r in usage["seats"] if r["seat_id"] == seats[2]["id"])
+    assert row["occupied_hours"] == 1 and row["percent"] <= 100
+
+
+def test_excel_ids_are_integers_and_text_is_not_formula():
+    from openpyxl import Workbook, load_workbook
+
+    from tg_studio.modules.coworking.report_excel import _finish
+
+    wb = Workbook()
+    ws = wb.active
+    ws.append(["a", "b", "c", "d"])
+    ws.append([1, 2, 12, "=1+1"])
+    ws.append(["x", "y", 1.5, "@cmd"])
+    loaded = load_workbook(BytesIO(_finish(wb)))
+    cells = loaded.active
+    assert cells["C2"].number_format == "General" and cells["C3"].number_format == "#,##0.00"
+    assert cells["D2"].data_type == "s" and cells["D2"].value == "=1+1"
+
+
+@pytest.mark.asyncio
+async def test_dashboard_week_and_month_windows(api_client, reporting_facts, monkeypatch):
+    from tg_studio.modules.coworking import reports as reports_module
+
+    # 5 ноября 2026 — четверг: неделя 2–9 ноября, месяц весь ноябрь
+    monkeypatch.setattr(reports_module, "studio_now", lambda: at(5, 12))
+    week = (await api_client.get("/api/dashboard?period=week", headers=OWNER_HEADERS)).json()
+    assert week["period"] == "week"
+    assert week["from"].startswith("2026-11-02T00:00") and week["to"].startswith("2026-11-09T00:00")
+    assert week["revenue"]["gross"] == 9000 and week["revenue"]["refunds"] == 1500
+    month = (await api_client.get("/api/dashboard?period=month", headers=OWNER_HEADERS)).json()
+    assert month["from"].startswith("2026-11-01T00:00") and month["to"].startswith("2026-12-01T00:00")
+    assert month["revenue"]["gross"] == 9000
+    day = (await api_client.get("/api/dashboard", headers=OWNER_HEADERS)).json()
+    assert day["period"] == "day" and day["revenue"]["gross"] == 0
+    assert (await api_client.get("/api/dashboard?period=year", headers=OWNER_HEADERS)).status_code == 422

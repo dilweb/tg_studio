@@ -1,0 +1,88 @@
+# Нагрузочный тест: дополнение к docker-compose.yml (основной файл не меняется).
+#
+#   docker compose -f docker-compose.yml -f docker-compose.loadtest.yml up -d --build
+#   docker compose -f docker-compose.yml -f docker-compose.loadtest.yml run --rm loadtest
+#
+# Пока стенд поднят с этим файлом, ApiPay (Kaspi) — мок apipay-mock: настоящий Kaspi
+# не вызывается. Обычный режим — поднять без этого файла.
+# Отчёт: ./loadtest-reports/<время>/ (summary.md, violations.json, service-*.log …).
+# Параметры: ROUNDS, BURST, SEATS, LOAD_STAGES, LOAD_STAGE_SECONDS, SEED — через env, напр.
+#   ROUNDS=20 LOAD_STAGES=10,20,40,80 docker compose ... run --rm loadtest
+
+x-loadtest-env: &loadtest-env
+  APIPAY_BASE_URL: http://apipay-mock:9100
+  APIPAY_API_KEY: loadtest-apipay-key
+  APIPAY_WEBHOOK_SECRET: loadtest-apipay-webhook-secret
+  TELEGRAM_WEBHOOK_SECRET: ${TELEGRAM_WEBHOOK_SECRET:-loadtest-telegram-secret}
+  # без общего ключа каждый процесс генерирует свой случайный (config.py) — и ссылка
+  # подтверждения почты владельца, выписанная скриптом, не прошла бы проверку в api
+  JWT_SECRET_KEY: ${JWT_SECRET_KEY:-loadtest-jwt-secret-key-0123456789abcdef}
+  # логи для разбора — loadtest/pyhook/sitecustomize.py
+  PYTHONPATH: /app/src:/app/loadtest/pyhook
+  TZ: UTC
+
+x-loadtest-volumes: &loadtest-volumes
+  - ./loadtest:/app/loadtest:ro
+  - ./loadtest-reports:/reports
+
+services:
+  api:
+    environment:
+      <<: *loadtest-env
+      LOADTEST_SERVICE_LOG: api
+    volumes: *loadtest-volumes
+    depends_on:
+      apipay-mock:
+        condition: service_started
+
+  celery_worker:
+    environment:
+      <<: *loadtest-env
+      LOADTEST_SERVICE_LOG: celery_worker
+    volumes: *loadtest-volumes
+
+  celery_beat:
+    environment:
+      <<: *loadtest-env
+      LOADTEST_SERVICE_LOG: celery_beat
+    volumes: *loadtest-volumes
+
+  apipay-mock:
+    build: .
+    restart: unless-stopped
+    command: uvicorn loadtest.apipay_mock:app --host 0.0.0.0 --port 9100
+    working_dir: /app
+    env_file: .env
+    environment:
+      <<: *loadtest-env
+      LOADTEST_SERVICE_LOG: apipay-mock
+      WEBHOOK_URL: http://api:8000/api/payments/webhook/apipay
+    volumes: *loadtest-volumes
+
+  loadtest:
+    build: .
+    profiles: ["loadtest"]
+    command: python -m loadtest.run
+    working_dir: /app
+    env_file: .env
+    environment:
+      <<: *loadtest-env
+      LOADTEST_SERVICE_LOG: loadtest-inprocess
+      # без эха SQL в выводе скрипта (DEBUG из .env включает echo движка)
+      DEBUG: "false"
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-tg_studio}:${POSTGRES_PASSWORD:-secret}@postgres:5432/${POSTGRES_DB:-tg_studio}
+      API_URL: http://api:8000
+      MOCK_URL: http://apipay-mock:9100
+      REPORT_DIR: /reports
+      ROUNDS: ${ROUNDS:-10}
+      BURST: ${BURST:-10}
+      SEATS: ${SEATS:-20}
+      LOAD_STAGES: ${LOAD_STAGES:-5,10,20,40}
+      LOAD_STAGE_SECONDS: ${LOAD_STAGE_SECONDS:-45}
+      SEED: ${SEED:-1}
+    volumes: *loadtest-volumes
+    depends_on:
+      api:
+        condition: service_started
+      apipay-mock:
+        condition: service_started

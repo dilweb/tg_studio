@@ -114,7 +114,11 @@ class MasterReportRow(BaseModel):
     revenue: float
     booking_revenue: float
     sales_revenue: float
+    refunds: float = 0
     balance: float
+    # Присутствие (аналитика владельца): брони, уже начавшиеся в периоде, и из них подтверждённые мастером
+    presence_expected: int = 0
+    presence_confirmed: int = 0
 
 
 class MastersReport(Period):
@@ -122,6 +126,8 @@ class MastersReport(Period):
     new: int
     active: int
     masters: list[MasterReportRow]
+    presence_expected: int = 0
+    presence_confirmed: int = 0
 
 
 class UpsellReportRow(BaseModel):
@@ -131,6 +137,8 @@ class UpsellReportRow(BaseModel):
     amount: float
     product_amount: float
     manual_amount: float
+    master_amount: float
+    client_amount: float
     payout_accrued: float
     payout_paid: float
 
@@ -138,6 +146,8 @@ class UpsellReportRow(BaseModel):
 class UpsellsReport(Period):
     currency: str
     amount: float
+    master_amount: float
+    client_amount: float
     admins: list[UpsellReportRow]
 
 
@@ -148,6 +158,8 @@ class DashboardBooking(BaseModel):
     start: datetime
     end: datetime
     status: str | None = None
+    # для «идут сейчас»: мастер подтвердил присутствие кнопкой в напоминании
+    presence_confirmed: bool | None = None
 
 
 class DashboardSeat(BaseModel):
@@ -170,6 +182,7 @@ class LowStock(BaseModel):
 
 class Dashboard(Period):
     generated_at: datetime
+    period: str
     currency: str
     revenue: RevenueReport
     money: MoneyReport
@@ -177,7 +190,6 @@ class Dashboard(Period):
     master_balances: float
     bookings_created: int
     cancellations: int
-    no_shows: int
     onsite: list[DashboardBooking]
     upcoming: list[DashboardBooking]
     seats_now: list[DashboardSeat]

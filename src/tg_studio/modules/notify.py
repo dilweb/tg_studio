@@ -7,6 +7,7 @@ import asyncio
 import logging
 
 from aiogram import Bot
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from aiogram.exceptions import (
     TelegramAPIError,
     TelegramNetworkError,
@@ -61,6 +62,39 @@ async def send_text_to_telegram(telegram_id: int, text: str) -> int:
         raise TelegramSendError(str(exc)) from exc
     finally:
         await bot.session.close()  # иначе aiohttp-коннекторы текут
+
+
+async def send_text_with_button(telegram_id: int, text: str, button_text: str, callback_data: str) -> int:
+    """Текст + одна inline-кнопка (нажатие придёт callback_query на вебхук
+    /api/telegram/webhook). Возвращает telegram message_id."""
+    markup = InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text=button_text, callback_data=callback_data)]]
+    )
+    bot = Bot(token=settings.bot_token)
+    try:
+        msg = await _send_with_retry(lambda: bot.send_message(telegram_id, text, reply_markup=markup))
+        return msg.message_id
+    except TelegramAPIError as exc:
+        raise TelegramSendError(str(exc)) from exc
+    finally:
+        await bot.session.close()
+
+
+async def answer_callback(callback_query_id: str, text: str, *, replace_message: tuple[int, int, str] | None = None) -> None:
+    """Ответ на нажатие inline-кнопки (всплывашка у пользователя) и, если задан
+    replace_message=(chat_id, message_id, text), замена текста сообщения без кнопок."""
+    bot = Bot(token=settings.bot_token)
+    try:
+        await _send_with_retry(lambda: bot.answer_callback_query(callback_query_id, text=text))
+        if replace_message is not None:
+            chat_id, message_id, new_text = replace_message
+            await _send_with_retry(
+                lambda: bot.edit_message_text(new_text, chat_id=chat_id, message_id=message_id)
+            )
+    except TelegramAPIError as exc:
+        raise TelegramSendError(str(exc)) from exc
+    finally:
+        await bot.session.close()
 
 
 async def resolve_owner_telegram_id(session: AsyncSession) -> int | None:

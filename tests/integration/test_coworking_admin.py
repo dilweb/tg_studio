@@ -38,7 +38,6 @@ from ..conftest import (
     make_business,
     make_init_data_headers,
     make_master,
-    move_booking_to_past,
     make_user,
 )
 
@@ -260,66 +259,16 @@ async def test_admin_creates_booking_for_master_and_marks_lifecycle(
     )
     assert resp.status_code == 200
 
-    # Админ отмечает начало → визиты → завершение
-    resp = await api_client.post(f"/api/bookings/{b['id']}/start", headers=ADMIN_HEADERS)
-    assert resp.status_code == 200
-    assert resp.json()["status"] == BookingStatus.started.value
-    assert resp.json()["started_at"]
-
-    resp = await api_client.post(f"/api/bookings/{b['id']}/visit/start", headers=ADMIN_HEADERS)
-    assert resp.status_code == 200
-    assert resp.json()["visit_started_at"]
-    # Повторный приход — 409
-    resp = await api_client.post(f"/api/bookings/{b['id']}/visit/start", headers=ADMIN_HEADERS)
-    assert resp.status_code == 409
-
-    resp = await api_client.post(f"/api/bookings/{b['id']}/visit/end", headers=ADMIN_HEADERS)
-    assert resp.status_code == 200
-    assert resp.json()["visit_ended_at"]
-
-    resp = await api_client.post(f"/api/bookings/{b['id']}/complete", headers=ADMIN_HEADERS)
-    assert resp.status_code == 200
-    assert resp.json()["status"] == BookingStatus.completed.value
-
-    # История: события визитов с автором-админом
-    events = (
-        await api_client.get(f"/api/bookings/{b['id']}/history", headers=ADMIN_HEADERS)
-    ).json()["events"]
-    kinds = [e["kind"] for e in events]
-    assert "пришёл" in kinds and "ушёл" in kinds and "начата" in kinds and "завершена" in kinds
-    visit_events = [e for e in events if e["kind"] == "пришёл"]
-    assert visit_events[0]["actor_user_id"] == admin.user_id
+    assert resp.json()["status"] == BookingStatus.confirmed.value
 
 
 @pytest.mark.asyncio
-async def test_visit_marks_validation(api_client, db_session, business, seats, master, admin):
-    resp = await api_client.post(
-        "/api/bookings",
-        json={
-            "seat_id": seats[0]["id"],
-            "start": _at(1, 12),
-            "end": _at(1, 14),
-            "master_id": master.id,
-        },
-        headers=OWNER_HEADERS,
-    )
-    b = resp.json()
-    # Приход по неоплаченной брони — 409
-    resp = await api_client.post(f"/api/bookings/{b['id']}/visit/start", headers=ADMIN_HEADERS)
-    assert resp.status_code == 409
-
-    # уход без прихода — 409 (на другой подтверждённой брони, другое место и время)
-    b2 = await _make_confirmed_booking(
-        api_client, seats, master, seat_idx=1, start=_at(1, 16), end=_at(1, 18)
-    )
-    resp = await api_client.post(f"/api/bookings/{b2['id']}/visit/end", headers=ADMIN_HEADERS)
-    assert resp.status_code == 409
-
-    # Неявка админом
-    await move_booking_to_past(db_session, b2["id"])
-    resp = await api_client.post(f"/api/bookings/{b2['id']}/no-show", headers=ADMIN_HEADERS)
-    assert resp.status_code == 200
-    assert resp.json()["status"] == BookingStatus.no_show.value
+async def test_manual_visit_marks_removed(api_client, seats, master, admin):
+    """Ручных отметок админа нет: присутствие мастер подтверждает в Telegram."""
+    b = await _make_confirmed_booking(api_client, seats, master)
+    for action in ("start", "complete", "no-show", "visit/start", "visit/end"):
+        resp = await api_client.post(f"/api/bookings/{b['id']}/{action}", headers=ADMIN_HEADERS)
+        assert resp.status_code in (404, 405), action
 
 
 # ---------------------------------------------------------------------------
@@ -650,12 +599,13 @@ async def test_admin_marks_booking_invoice_paid(api_client, db_session, business
 
 
 @pytest.mark.asyncio
-async def test_ops_exceptions_lists_no_show(api_client, db_session, business, seats, master, admin):
+async def test_ops_exceptions_lists_expired_hold(api_client, db_session, business, seats, master, admin):
+    from tg_studio.db.models import Booking
+
     b = await _make_confirmed_booking(api_client, seats, master)
-    await move_booking_to_past(db_session, b["id"])
-    resp = await api_client.post(f"/api/bookings/{b['id']}/no-show", headers=ADMIN_HEADERS)
-    assert resp.status_code == 200
+    (await db_session.get(Booking, b["id"])).status = BookingStatus.payment_expired.value
+    await db_session.commit()
     ex = (await api_client.get("/api/ops/exceptions", headers=ADMIN_HEADERS)).json()["exceptions"]
-    assert any(x["kind"] == "no_show" and x["booking_id"] == b["id"] for x in ex)
+    assert any(x["kind"] == "payment_expired" and x["booking_id"] == b["id"] for x in ex)
     # Мастер не видит ops-исключения
     assert (await api_client.get("/api/ops/exceptions", headers=MASTER_HEADERS)).status_code == 403

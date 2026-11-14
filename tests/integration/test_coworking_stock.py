@@ -108,10 +108,8 @@ async def test_products_crud_and_roles(api_client, db_session, business, master,
     assert p["sale_price"] == 500
     assert p["quantity"] == 100
 
-    # Мастер читает каталог, но не создаёт/правит
-    r = await api_client.get("/api/products", headers=MASTER_HEADERS)
-    assert r.status_code == 200
-    assert len(r.json()["products"]) == 1
+    # Мастер склад не видит вовсе
+    assert (await api_client.get("/api/products", headers=MASTER_HEADERS)).status_code == 403
     assert (await api_client.post("/api/products", json={"name": "x", "category": "c", "unit": "шт"}, headers=MASTER_HEADERS)).status_code == 403
     assert (await api_client.patch(f"/api/products/{p['id']}", json={"sale_price": 1}, headers=MASTER_HEADERS)).status_code == 403
 
@@ -367,36 +365,98 @@ async def test_sale_to_walkin_cash(api_client, db_session, business, admin):
 
 
 @pytest.mark.asyncio
-async def test_master_buys_for_self_balance_only(api_client, db_session, business, master, admin):
+async def test_master_has_no_access_to_stock(api_client, db_session, business, master, admin):
     p = await _product(api_client, qty=10, sale_price=500)
-    await _topup(api_client, master.id, amount=10000)
+    items = {"items": [{"supply_id": p["id"], "qty": 1}], "payment_method": "balance"}
+    assert (await api_client.post("/api/sales", json=items, headers=MASTER_HEADERS)).status_code == 403
+    for url in ("/api/sales", f"/api/sales/1", "/api/stock/movements"):
+        assert (await api_client.get(url, headers=MASTER_HEADERS)).status_code == 403
 
-    # Мастер покупает себе
+
+@pytest.mark.asyncio
+async def test_cash_sale_to_master_is_recorded_in_ledger(api_client, db_session, business, master, admin):
+    p = await _product(api_client, qty=10, sale_price=500)
     resp = await api_client.post(
         "/api/sales",
-        json={"items": [{"supply_id": p["id"], "qty": 1}], "payment_method": "balance"},
-        headers=MASTER_HEADERS,
+        json={"items": [{"supply_id": p["id"], "qty": 2}], "master_id": master.id, "payment_method": "cash"},
+        headers=ADMIN_HEADERS,
     )
     assert resp.status_code == 201, resp.text
     sale = resp.json()
-    assert sale["master_id"] == master.id
-    assert sale["admin_id"] is None  # не апсейл — сам покупал
-    upsell = (
-        await db_session.execute(select(Upsell).where(Upsell.sale_id == sale["id"]))
-    ).scalar_one_or_none()
-    assert upsell is None
+    entries = (
+        await db_session.execute(select(LedgerEntry).where(LedgerEntry.master_id == master.id))
+    ).scalars().all()
+    assert sorted((e.kind, float(e.amount)) for e in entries) == [("charge", -1000), ("topup", 1000)]
+    assert (await api_client.get(f"/api/masters/{master.id}/balance", headers=OWNER_HEADERS)).json()["balance"] == 0
+    # возврат — деньги на баланс мастера
+    r = await api_client.post(f"/api/sales/{sale['id']}/refund", json={"reason": "x"}, headers=ADMIN_HEADERS)
+    assert r.status_code == 200, r.text
+    assert (await api_client.get(f"/api/masters/{master.id}/balance", headers=OWNER_HEADERS)).json()["balance"] == 1000
 
-    # Мастер не может оформить наличные или на другого
-    resp = await api_client.post(
-        "/api/sales",
-        json={"items": [{"supply_id": p["id"], "qty": 1}], "payment_method": "cash", "buyer_name": "x"},
-        headers=MASTER_HEADERS,
+
+@pytest.mark.asyncio
+async def test_sale_validation_booking_phone_zero_price(api_client, db_session, business, master, admin):
+    p = await _product(api_client, qty=10, sale_price=500)
+    master_id = master.id  # после rollback fixture истекает
+    base = {"items": [{"supply_id": p["id"], "qty": 1}], "payment_method": "cash", "buyer_name": "Гость"}
+    r = await api_client.post("/api/sales", json={**base, "booking_id": 99999}, headers=ADMIN_HEADERS)
+    assert r.status_code == 404
+    r = await api_client.post("/api/sales", json={**base, "buyer_phone": "123"}, headers=ADMIN_HEADERS)
+    assert r.status_code == 422
+    r = await api_client.post("/api/sales", json={**base, "master_id": master_id}, headers=ADMIN_HEADERS)
+    assert r.status_code == 422
+    r = await api_client.post(
+        "/api/products",
+        json={"name": "x", "category": "c", "unit": "шт", "sale_price": 0},
+        headers=OWNER_HEADERS,
     )
-    assert resp.status_code == 403
+    assert r.status_code == 422
 
-    # Мастер видит свои покупки
-    r = await api_client.get("/api/sales", headers=MASTER_HEADERS)
-    assert len(r.json()["sales"]) == 1
+
+@pytest.mark.asyncio
+async def test_purchase_without_prior_cost_and_consume_zero(api_client, db_session, business, admin):
+    r = await api_client.post(
+        "/api/products", json={"name": "Без цены", "category": "c", "unit": "шт", "quantity": 10}, headers=OWNER_HEADERS
+    )
+    pid = r.json()["id"]
+    r = await api_client.post(
+        "/api/stock/purchase", json={"supply_id": pid, "qty": 10, "unit_cost": 100}, headers=ADMIN_HEADERS
+    )
+    assert r.json()["purchase_price"] == 100
+    r = await api_client.post(
+        "/api/stock/consume", json={"supply_id": pid, "qty": 0.001, "reason": "x"}, headers=ADMIN_HEADERS
+    )
+    assert r.status_code == 400
+    r = await api_client.get("/api/stock/movements?from=bad", headers=ADMIN_HEADERS)
+    assert r.status_code == 422
+    r = await api_client.get("/api/stock/movements?limit=1", headers=ADMIN_HEADERS)
+    assert len(r.json()["movements"]) == 1 and r.json()["total"] == 2
+
+
+@pytest.mark.asyncio
+async def test_refund_rest_after_partial_and_upsell_reduced(api_client, db_session, business, master, admin):
+    p = await _product(api_client, qty=10, sale_price=1000)
+    await _topup(api_client, master.id, amount=10000)
+    sale = (
+        await api_client.post(
+            "/api/sales",
+            json={"items": [{"supply_id": p["id"], "qty": 4}], "master_id": master.id, "payment_method": "balance"},
+            headers=ADMIN_HEADERS,
+        )
+    ).json()
+    await api_client.post(
+        f"/api/sales/{sale['id']}/refund",
+        json={"items": [{"supply_id": p["id"], "qty": 1}], "reason": "одна"},
+        headers=ADMIN_HEADERS,
+    )
+    upsell = (await db_session.execute(select(Upsell).where(Upsell.sale_id == sale["id"]))).scalar_one()
+    await db_session.refresh(upsell)
+    assert float(upsell.amount) == 3000
+    r = await api_client.post(f"/api/sales/{sale['id']}/refund", json={"reason": "остальное"}, headers=ADMIN_HEADERS)
+    assert r.status_code == 200, r.text
+    assert r.json()["status"] == SaleStatus.refunded.value
+    await db_session.refresh(upsell)
+    assert float(upsell.amount) == 0
 
 
 # ---------------------------------------------------------------------------
@@ -487,3 +547,31 @@ async def test_refund_partial(api_client, db_session, business, master, admin):
     assert resp.json()["status"] == SaleStatus.refunded.value
     supply = (await db_session.execute(select(Supply).where(Supply.id == p["id"]))).scalar_one()
     assert float(supply.quantity) == 10
+
+
+@pytest.mark.asyncio
+async def test_upsells_split_master_vs_client(api_client, db_session, business, master, admin):
+    p = await _product(api_client, qty=20, sale_price=100)
+    await _topup(api_client, master.id, amount=10000)
+    for body in (
+        {"master_id": master.id, "payment_method": "balance", "qty": 3},
+        {"buyer_name": "Гость", "payment_method": "cash", "qty": 2},
+    ):
+        qty = body.pop("qty")
+        r = await api_client.post(
+            "/api/sales", json={**body, "items": [{"supply_id": p["id"], "qty": qty}]}, headers=ADMIN_HEADERS
+        )
+        assert r.status_code == 201, r.text
+    r = await api_client.get("/api/upsells?buyer_type=master", headers=OWNER_HEADERS)
+    assert [(u["buyer_type"], u["amount"]) for u in r.json()["upsells"]] == [("master", 300)]
+    r = await api_client.get("/api/upsells?buyer_type=client", headers=OWNER_HEADERS)
+    assert [(u["buyer_type"], u["amount"]) for u in r.json()["upsells"]] == [("client", 200)]
+    now = datetime.now(UTC)
+    r = await api_client.get(
+        "/api/reports/upsells",
+        params={"from": (now - timedelta(days=1)).isoformat(), "to": (now + timedelta(days=1)).isoformat()},
+        headers=OWNER_HEADERS,
+    )
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert (data["master_amount"], data["client_amount"]) == (300, 200)

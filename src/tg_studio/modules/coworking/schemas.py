@@ -75,6 +75,14 @@ class StudioHoursResponse(BaseModel):
 # ---------------------------------------------------------------------------
 
 
+class RefundTier(BaseModel):
+    """Ступень возврата при отмене мастером: отмена не позже чем за hours_before
+    часов до начала → percent % возврата."""
+
+    hours_before: int = Field(..., ge=0, le=720)
+    percent: int = Field(..., ge=0, le=100)
+
+
 class CoworkingSettingsOut(BaseModel):
     """Эффективные настройки (дефолты смешаны с переопределениями из БД)."""
 
@@ -83,11 +91,12 @@ class CoworkingSettingsOut(BaseModel):
     step_minutes: int
     buffer_minutes: int
     hold_ttl_hours: int
-    # Правило отмены: раньше чем за cancel_full_refund_hours до начала — 100%
-    # возврат; позже — удержание no_show_hold_percent %
-    cancel_full_refund_hours: int
-    no_show_hold_percent: int
-    no_show_grace_minutes: int
+    # Ступени возврата при отмене мастером (от большей к меньшей); ни одна не
+    # подошла → 0%. Отмена площадкой — всегда 100%.
+    refund_tiers: list[RefundTier]
+    # Напоминания в Telegram: «скоро бронь» и «оплатите до …» — за N минут
+    booking_reminder_minutes: int
+    payment_reminder_minutes: int
 
 
 class CoworkingSettingsUpdate(BaseModel):
@@ -96,9 +105,23 @@ class CoworkingSettingsUpdate(BaseModel):
     step_minutes: int | None = Field(None, ge=5, le=120)
     buffer_minutes: int | None = Field(None, ge=0, le=240)
     hold_ttl_hours: int | None = Field(None, ge=1, le=168)
-    cancel_full_refund_hours: int | None = Field(None, ge=0, le=720)
-    no_show_hold_percent: int | None = Field(None, ge=0, le=100)
-    no_show_grace_minutes: int | None = Field(None, ge=0, le=240)
+    refund_tiers: list[RefundTier] | None = Field(None, max_length=10)
+    booking_reminder_minutes: int | None = Field(None, ge=5, le=1440)
+    payment_reminder_minutes: int | None = Field(None, ge=5, le=1440)
+
+    @field_validator("refund_tiers")
+    @classmethod
+    def _tiers_consistent(cls, tiers: list[RefundTier] | None) -> list[RefundTier] | None:
+        """Часы ступеней разные; чем раньше отмена, тем возврат не меньше."""
+        if tiers is None:
+            return None
+        ordered = sorted(tiers, key=lambda t: t.hours_before, reverse=True)
+        if len({t.hours_before for t in ordered}) != len(ordered):
+            raise ValueError("У ступеней возврата часы не должны повторяться")
+        for earlier, later in zip(ordered, ordered[1:]):
+            if earlier.percent < later.percent:
+                raise ValueError("Чем раньше отмена, тем возврат должен быть не меньше")
+        return ordered
 
 
 # ---------------------------------------------------------------------------
@@ -322,7 +345,7 @@ class BlockListResponse(BaseModel):
 
 class BookingCreate(BaseModel):
     seat_id: int
-    # Наивное время — время студии (Asia/Almaty), как в tattoo-модуле
+    # Наивное время — время студии (Asia/Almaty)
     start: datetime
     end: datetime
     note: str | None = Field(None, max_length=2000)
@@ -376,13 +399,11 @@ class BookingOut(BaseModel):
     paid_amount: float
     # Счёт на предоплату (04) — для экрана оплаты брони
     payment: BookingPaymentOut | None = None
-    started_at: datetime | None
-    completed_at: datetime | None
-    # Бронь вне покрытия (05) + факт посещения
+    # Бронь вне покрытия (05)
     requires_confirmation: bool = False
     confirmed_by_user_id: int | None = None
-    visit_started_at: datetime | None = None
-    visit_ended_at: datetime | None = None
+    # Мастер подтвердил присутствие кнопкой в напоминании Telegram
+    presence_confirmed_at: datetime | None = None
     created_at: datetime
     updated_at: datetime
 
@@ -647,6 +668,7 @@ class UpsellOut(BaseModel):
     admin_name: str | None = None
     sale_id: int | None
     master_id: int | None
+    buyer_type: str  # master — мастеру (расходники для работы) | client — клиенту мастера
     buyer_name: str | None
     buyer_phone: str | None
     amount: float
@@ -732,7 +754,7 @@ class PayoutListResponse(BaseModel):
 
 
 class OpsExceptionOut(BaseModel):
-    kind: str  # no_show | payment_expired | out_of_coverage_unconfirmed | unclosed_past_booking
+    kind: str  # payment_expired | out_of_coverage_unconfirmed
     booking_id: int
     seat_name: str | None
     master_name: str | None

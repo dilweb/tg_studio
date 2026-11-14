@@ -12,8 +12,8 @@ export const SECTIONS = [
   { name: 'seats', path: '/app/seats', title: 'Настройка мест', roles: ['owner'], icon: 'grid' },
   { name: 'masters', path: '/app/masters', title: 'Мастера', roles: ['owner'], icon: 'users' },
   { name: 'admins', path: '/app/admins', title: 'Администраторы', roles: ['owner'], icon: 'users' },
-  { name: 'stock', path: '/app/stock', title: 'Склад', roles: ['owner', 'master', 'admin'], icon: 'box' },
-  { name: 'checkout', path: '/app/checkout', title: 'Касса', roles: ['owner', 'master', 'admin'], icon: 'wallet' },
+  { name: 'stock', path: '/app/stock', title: 'Склад', roles: ['owner', 'admin'], icon: 'box' },
+  { name: 'checkout', path: '/app/checkout', title: 'Касса', roles: ['owner', 'admin'], icon: 'wallet' },
   { name: 'business', path: '/app/business', title: 'Бизнес', roles: ['owner'], icon: 'briefcase' },
 ]
 

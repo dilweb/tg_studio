@@ -1,8 +1,9 @@
 """API коворкинга: места, часы студии, блокировки, брони, календари.
 
 Роли: мастер — читает места/календари, создаёт и правит только СВОИ брони;
-владелец — всё + настройка мест/часов/блокировки + отметки start/complete/no-show
-(админ подключится в 05). Все изменения броней пишутся в booking_events.
+владелец — всё + настройка мест/часов/блокировки. Ручных отметок посещения
+нет: прошедшая подтверждённая бронь состоялась, присутствие мастер
+подтверждает кнопкой в напоминании Telegram (modules/telegram_api.py). Все изменения броней пишутся в booking_events.
 
 Защита от гонок: создание/перенос брони идёт через сервис в одной транзакции
 с advisory lock по seat_id (Postgres) — параллельные запросы не плодят дублей.
@@ -186,12 +187,9 @@ async def _booking_out(session, booking: Booking, *, with_payment: bool = False)
         price_snapshot=booking.price_snapshot,
         paid_amount=float(booking.paid_amount),
         payment=await _booking_payment_out(session, booking) if with_payment else None,
-        started_at=booking.started_at,
-        completed_at=booking.completed_at,
         requires_confirmation=booking.requires_confirmation,
         confirmed_by_user_id=booking.confirmed_by_user_id,
-        visit_started_at=booking.visit_started_at,
-        visit_ended_at=booking.visit_ended_at,
+        presence_confirmed_at=booking.presence_confirmed_at,
         created_at=booking.created_at,
         updated_at=booking.updated_at,
     )
@@ -649,6 +647,8 @@ async def create_booking(
         allow_master_overlap=self_master is None,
     )
     await session.commit()
+    # внешний счёт Kaspi — после commit, вне блокировок места/мастера
+    await money.run_provider_ops(session)
     await session.refresh(booking)
     # 04: вместе с бронью вернём и счёт на предоплату (экран оплаты)
     return await _booking_out(session, booking, with_payment=True)
@@ -676,20 +676,12 @@ async def reschedule_booking(
     booking = await _get_booking(session, business.id, booking_id)
     if self_master is not None and booking.master_id != self_master.id:
         raise HTTPException(status_code=403, detail="Мастер правит только свои брони")
-    if booking.status not in ACTIVE_BOOKING_STATUSES:
-        raise HTTPException(status_code=409, detail=f"Бронь в терминальном статусе: {booking.status}")
-    if booking.status != "ожидает_оплаты":
-        # 04: оплаченную бронь переносить нельзя — цена уже зафиксирована
-        # и оплачена (инвариант «подтверждена ⇒ оплачена 100%»); перенос —
-        # через отмену (с возвратом по правилу) + новую бронь
-        raise HTTPException(
-            status_code=409,
-            detail="Оплаченную бронь перенести нельзя — отмените её (с возвратом по правилу) и создайте новую",
-        )
+    # статус (только неоплаченную) проверяет сервис после блокировки брони
     await cw.reschedule_booking(
         session, business, booking, body.start, body.end, user.id, note=body.note
     )
     await session.commit()
+    await money.run_provider_ops(session)
     await session.refresh(booking)
     return await _booking_out(session, booking)
 
@@ -710,6 +702,7 @@ async def extend_booking(
         raise HTTPException(status_code=403, detail="Мастер продлевает только свои брони")
     await cw.extend_booking(session, business, booking, body.hours, user.id, note=body.note)
     await session.commit()
+    await money.run_provider_ops(session)
     await session.refresh(booking)
     return await _booking_out(session, booking)
 
@@ -732,66 +725,7 @@ async def cancel_booking(
         session, business, booking, user.id, body.reason, by_studio=self_master is None
     )
     await session.commit()
-    await session.refresh(booking)
-    return await _booking_out(session, booking)
-
-
-@router.post("/bookings/{booking_id}/start", response_model=BookingOut)
-async def start_booking(booking_id: int, session: SessionDep, actor: AdminBusinessAndSelfDep, user: CurrentUserDep):
-    """Отметка «начата» — владелец или администратор (05)."""
-    business, _ = actor
-    booking = await _get_booking(session, business.id, booking_id)
-    await cw.start_booking(session, business, booking, user.id)
-    await session.commit()
-    await session.refresh(booking)
-    return await _booking_out(session, booking)
-
-
-@router.post("/bookings/{booking_id}/complete", response_model=BookingOut)
-async def complete_booking(booking_id: int, session: SessionDep, actor: AdminBusinessAndSelfDep, user: CurrentUserDep):
-    """Отметка «завершена» — владелец или администратор (05)."""
-    business, _ = actor
-    booking = await _get_booking(session, business.id, booking_id)
-    await cw.complete_booking(session, business, booking, user.id)
-    await session.commit()
-    await session.refresh(booking)
-    return await _booking_out(session, booking)
-
-
-@router.post("/bookings/{booking_id}/no-show", response_model=BookingOut)
-async def no_show_booking(booking_id: int, session: SessionDep, actor: AdminBusinessAndSelfDep, user: CurrentUserDep):
-    """Неявка — владелец или администратор (05)."""
-    business, _ = actor
-    booking = await _get_booking(session, business.id, booking_id)
-    await cw.mark_no_show(session, business, booking, user.id)
-    await session.commit()
-    await session.refresh(booking)
-    return await _booking_out(session, booking)
-
-
-# ---------------------------------------------------------------------------
-# Посещения по броням — админ/владелец (05)
-# ---------------------------------------------------------------------------
-
-
-@router.post("/bookings/{booking_id}/visit/start", response_model=BookingOut)
-async def visit_start(booking_id: int, session: SessionDep, actor: AdminBusinessAndSelfDep, user: CurrentUserDep):
-    """Отметка прихода по брони (фактическое время; автор — в booking_events)."""
-    business, _ = actor
-    booking = await _get_booking(session, business.id, booking_id)
-    await cw.mark_visit_start(session, business, booking, user.id)
-    await session.commit()
-    await session.refresh(booking)
-    return await _booking_out(session, booking)
-
-
-@router.post("/bookings/{booking_id}/visit/end", response_model=BookingOut)
-async def visit_end(booking_id: int, session: SessionDep, actor: AdminBusinessAndSelfDep, user: CurrentUserDep):
-    """Отметка ухода по брони."""
-    business, _ = actor
-    booking = await _get_booking(session, business.id, booking_id)
-    await cw.mark_visit_end(session, business, booking, user.id)
-    await session.commit()
+    await money.run_provider_ops(session)
     await session.refresh(booking)
     return await _booking_out(session, booking)
 
@@ -1159,6 +1093,7 @@ async def pay_booking(
     if body.method == "balance":
         await money.pay_booking_from_balance(session, business, booking, user.id)
         await session.commit()
+        await money.run_provider_ops(session)
         await session.refresh(booking)
         balance = await money.master_balance(session, booking.master_id)
         return BookingPayResponse(
@@ -1718,6 +1653,7 @@ async def _upsell_out(session, upsell: Upsell) -> UpsellOut:
         admin_name=admin.full_name if admin else None,
         sale_id=upsell.sale_id,
         master_id=upsell.master_id,
+        buyer_type="master" if upsell.master_id is not None else "client",
         buyer_name=upsell.buyer_name,
         buyer_phone=upsell.buyer_phone,
         amount=float(upsell.amount),
@@ -1734,6 +1670,7 @@ async def list_upsells(
     session: SessionDep,
     actor: AdminBusinessAndSelfDep,
     admin_id: int | None = Query(None),
+    buyer_type: str | None = Query(None, pattern="^(master|client)$"),
     from_: datetime | None = Query(None, alias="from"),
     to: datetime | None = Query(None),
     limit: int = Query(200, ge=1, le=1000),
@@ -1745,6 +1682,10 @@ async def list_upsells(
         stmt = stmt.where(Upsell.admin_id == self_admin.id)
     elif admin_id is not None:
         stmt = stmt.where(Upsell.admin_id == admin_id)
+    if buyer_type == "master":
+        stmt = stmt.where(Upsell.master_id.is_not(None))
+    elif buyer_type == "client":
+        stmt = stmt.where(Upsell.master_id.is_(None))
     if from_ is not None:
         stmt = stmt.where(Upsell.created_at >= cw.ensure_tz(from_))
     if to is not None:

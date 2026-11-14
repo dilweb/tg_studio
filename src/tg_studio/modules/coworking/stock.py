@@ -19,6 +19,7 @@ from sqlalchemy import select
 
 from tg_studio.db.locks import for_update, lock_master_slot, lock_sale, lock_supply
 from tg_studio.db.models import (
+    Booking,
     BookingEventKind,
     Business,
     LedgerEntry,
@@ -37,6 +38,7 @@ from tg_studio.db.models import (
     SupplyMovementKind,
     Upsell,
 )
+from tg_studio.modules.payments.providers import normalize_phone
 from tg_studio.modules.coworking import money
 from tg_studio.modules.coworking.pricing import CURRENCY
 from tg_studio.modules.coworking.service import add_booking_event
@@ -144,6 +146,7 @@ def _add_movement(
     actor_user_id: int | None = None,
     sale_id: int | None = None,
     booking_id: int | None = None,
+    master_id: int | None = None,
     note: str | None = None,
 ) -> SupplyMovement:
     movement = SupplyMovement(
@@ -154,6 +157,7 @@ def _add_movement(
         actor_user_id=actor_user_id,
         sale_id=sale_id,
         booking_id=booking_id,
+        master_id=master_id,
         note=note,
     )
     session.add(movement)
@@ -178,7 +182,8 @@ async def purchase(
     old_qty = _dec(supply.quantity)
     new_qty = old_qty + qty
     if unit_cost is not None:
-        old_cost = _dec(supply.purchase_price or 0)
+        # цены закупки у позиции ещё не было — старый остаток оцениваем по новой
+        old_cost = _dec(supply.purchase_price) if supply.purchase_price is not None else _dec(unit_cost)
         total_cost = old_qty * old_cost + qty * _dec(unit_cost)
         supply.purchase_price = float(_round2(total_cost / new_qty)) if new_qty > 0 else 0
     supply.quantity = float(new_qty)
@@ -207,6 +212,8 @@ async def consume(
     await lock_supply(session, supply.id)
     await session.refresh(supply)
     qty = _round2(qty)
+    if qty <= 0:
+        raise HTTPException(status_code=400, detail="Количество должно быть положительным")
     new_qty = _dec(supply.quantity) - qty
     if new_qty < 0:
         raise HTTPException(
@@ -273,6 +280,21 @@ async def create_sale(
         raise HTTPException(status_code=422, detail="Для оплаты с баланса выберите мастера")
     if body.master_id is None and not (body.buyer_name or "").strip():
         raise HTTPException(status_code=422, detail="Укажите покупателя")
+    buyer_name = buyer_phone = None
+    if body.master_id is None:
+        buyer_name = body.buyer_name.strip()
+        if (body.buyer_phone or "").strip():
+            buyer_phone = normalize_phone(body.buyer_phone)
+            if buyer_phone is None:
+                raise HTTPException(status_code=422, detail="Телефон должен быть вида 8XXXXXXXXXX")
+    if body.booking_id is not None:
+        booking = (
+            await session.execute(
+                select(Booking).where(Booking.id == body.booking_id, Booking.business_id == business.id)
+            )
+        ).scalar_one_or_none()
+        if booking is None:
+            raise HTTPException(status_code=404, detail="Бронь не найдена")
     master = None
     if body.master_id is not None:
         master = (
@@ -301,7 +323,7 @@ async def create_sale(
     total = Decimal("0")
     for supply_id, qty in sorted(quantities.items()):
         supply = await locked_supply(session, business.id, supply_id)
-        if supply.sale_price is None:
+        if not supply.sale_price:
             raise HTTPException(status_code=409, detail=f"Товар «{supply.name}» не продаётся (нет цены)")
         new_qty = _dec(supply.quantity) - qty
         if new_qty < 0:
@@ -330,8 +352,8 @@ async def create_sale(
     sale = Sale(
         business_id=business.id,
         master_id=master.id if master else None,
-        buyer_name=body.buyer_name.strip() if body.buyer_name else None,
-        buyer_phone=body.buyer_phone,
+        buyer_name=buyer_name,
+        buyer_phone=buyer_phone,
         total_amount=float(total),
         currency=CURRENCY,
         payment_method=body.payment_method,
@@ -356,6 +378,7 @@ async def create_sale(
             actor_user_id=actor_user_id,
             sale_id=sale.id,
             booking_id=body.booking_id,
+            master_id=master.id if master else None,
             note=body.note,
         )
 
@@ -402,8 +425,28 @@ async def create_sale(
         )
         session.add(payment)
         await session.flush()
-        # Продажа мастеру за наличные/карту — это пополнение и списание его
-        # счёта? Нет: деньги прошли мимо баланса, ledger не трогаем.
+        # Продажа мастеру за наличные/карту: учёт как у брони (04) — topup на
+        # принятую сумму + charge за товар, баланс не меняется, а возврат
+        # (refund на баланс) вернёт деньги туда же, откуда они учтены.
+        if master is not None:
+            how = "наличные" if body.payment_method == "cash" else "карта"
+            for kind, amount, note, payment_id, sale_id in (
+                (LedgerEntryKind.topup, total, f"Оплата продажи #{sale.id} ({how})", payment.id, None),
+                (LedgerEntryKind.charge, -total, f"Оплата продажи #{sale.id} ({how})", None, sale.id),
+            ):
+                session.add(
+                    LedgerEntry(
+                        business_id=business.id,
+                        master_id=master.id,
+                        kind=kind.value,
+                        amount=float(amount),
+                        currency=CURRENCY,
+                        payment_id=payment_id,
+                        sale_id=sale_id,
+                        actor_user_id=actor_user_id,
+                        note=note,
+                    )
+                )
 
     # Апсейл (05): автор — админ
     if self_admin is not None:
@@ -458,16 +501,6 @@ async def refund_sale(
         )
     ).scalar_one()
 
-    quantities: dict[int, Decimal] = {}
-    if body.items is None:
-        quantities = {i.supply_id: _dec(i.qty) for i in sale.items}
-    else:
-        for item in body.items:
-            qty = _round2(_dec(item.qty))
-            if qty <= 0:
-                raise HTTPException(status_code=400, detail="Количество возврата должно быть положительным")
-            quantities[item.supply_id] = quantities.get(item.supply_id, Decimal("0")) + qty
-
     previous = (
         await session.execute(
             select(SupplyMovement.supply_id, SupplyMovement.delta).where(
@@ -479,6 +512,21 @@ async def refund_sale(
     returned: dict[int, Decimal] = {}
     for supply_id, delta in previous:
         returned[supply_id] = returned.get(supply_id, Decimal("0")) + _dec(delta)
+
+    quantities: dict[int, Decimal] = {}
+    if body.items is None:
+        # полный возврат = всё, что ещё не возвращено
+        quantities = {
+            i.supply_id: _dec(i.qty) - returned.get(i.supply_id, Decimal("0"))
+            for i in sale.items
+            if _dec(i.qty) > returned.get(i.supply_id, Decimal("0"))
+        }
+    else:
+        for item in body.items:
+            qty = _round2(_dec(item.qty))
+            if qty <= 0:
+                raise HTTPException(status_code=400, detail="Количество возврата должно быть положительным")
+            quantities[item.supply_id] = quantities.get(item.supply_id, Decimal("0")) + qty
 
     refund_total = Decimal("0")
     low_stock: list[Supply] = []
@@ -505,6 +553,7 @@ async def refund_sale(
             actor_user_id=actor_user_id,
             sale_id=sale.id,
             booking_id=sale.booking_id,
+            master_id=sale.master_id,
             note=f"Возврат по продаже #{sale.id}: {body.reason}",
         )
 
@@ -538,6 +587,13 @@ async def refund_sale(
     )
     if full:
         sale.status = SaleStatus.refunded.value
+
+    # Апсейл (05) уменьшается на возвращённую сумму: админу не засчитываем вернувшуюся продажу
+    upsell = (
+        await session.execute(select(Upsell).where(Upsell.sale_id == sale.id))
+    ).scalar_one_or_none()
+    if upsell is not None:
+        upsell.amount = float(max(_dec(upsell.amount) - refund_total, Decimal("0")))
 
     # Факт возврата нужен отчётности 07 в том числе для гостевой наличной
     # продажи, где нет ledger. Событие связано с исходной бронью (если она

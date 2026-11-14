@@ -193,7 +193,7 @@ class Payment(Base):
     created_by_user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False)
     master_id: Mapped[int | None] = mapped_column(ForeignKey("masters.id"), nullable=True)
     confirmed_by_user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
-    paid_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    paid_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
 
     note: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
@@ -412,6 +412,8 @@ class BookingEventKind(str, enum.Enum):
     visit_ended = "ушёл"
     # Подтверждение брони вне покрытия владельцем (05)
     confirmed = "подтверждена_владельцем"
+    # Мастер подтвердил присутствие кнопкой в напоминании Telegram
+    presence_confirmed = "присутствие_подтверждено"
 
 
 class Seat(Base):
@@ -476,9 +478,12 @@ class SeatBlock(Base):
 class Booking(Base):
     """Бронь места мастером на интервал [start, end).
 
-    Жизненный цикл: ожидает_оплаты → (оплата в 04) → подтверждена → начата →
-    завершена; ветки отменена_мастером / отменена_площадкой / неявка /
-    истекла_оплата. Активные статусы занимают место: пересекаться не могут.
+    Жизненный цикл: ожидает_оплаты → (оплата в 04) → подтверждена; ветки
+    отменена_мастером / отменена_площадкой / истекла_оплата. Прошедшая
+    подтверждённая бронь отдельным статусом не отмечается (время вышло —
+    бронь состоялась). начата/завершена/неявка — устаревшие статусы ручных
+    отметок админа, новыми бронями не используются. Активные статусы занимают
+    место: пересекаться не могут.
 
     price_snapshot (JSON, заполняется в 03) фиксирует расчёт цены на момент
     брони — смена тарифов не трогает подтверждённые брони. paid_amount —
@@ -511,6 +516,11 @@ class Booking(Base):
     # Факт посещения по брони (05): отметки прихода/ухода (автор — в booking_events)
     visit_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     visit_ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Мастер подтвердил присутствие кнопкой в напоминании Telegram (аналитика владельца)
+    presence_confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Напоминания в Telegram отправлены (не слать повторно): «оплатите до …» и «скоро бронь»
+    payment_reminder_sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    booking_reminder_sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_by_user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False)
 
     created_at: Mapped[datetime] = mapped_column(UTCDateTime, server_default=func.now())

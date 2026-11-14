@@ -14,7 +14,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 # Первый ключ pg_advisory_xact_lock(key1, key2) — пространство имён, чтобы не
-# пересекаться с другими блокировками приложения ("ts" = tattoo slots,
+# пересекаться с другими блокировками приложения ("ts" — исторический ключ слотов,
 # "st" = seat slots — коворкинг)
 SLOT_LOCK_NAMESPACE = 0x7473
 SEAT_LOCK_NAMESPACE = 0x7374
