@@ -3,6 +3,7 @@ import { computed, onMounted, reactive, ref } from 'vue'
 
 import { api } from '../api/client'
 import { authStore } from '../store/auth'
+import { formatDateTime as fmt } from '../utils/format'
 
 // Раздел «Смены» (05): админ видит свои смены и ведёт факт; владелец — все + утверждает часы.
 const isOwner = computed(() => authStore.me?.role === 'owner')
@@ -19,12 +20,6 @@ const form = reactive({ admin_id: '', planned_start: '', planned_end: '', note: 
 
 const showApprove = ref(false)
 const approveForm = reactive({ shift_id: null, approved_hours: '' })
-
-function fmt(iso) {
-  return new Date(iso).toLocaleString('ru-RU', {
-    day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit',
-  })
-}
 
 function todayStr() {
   const d = new Date()
@@ -254,4 +249,15 @@ onMounted(load)
 .field.span-2 {
   grid-column: span 2;
 }
+/* Мобильные: одна колонка — datetime-local в ~170px обрезается */
+@media (max-width: 767px) {
+  .form-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .field.span-2 {
+    grid-column: auto;
+  }
+}
+
 </style>

@@ -1,7 +1,7 @@
 // Форматирование значений для интерфейса.
 
 export function formatMoney(value) {
-  return Number(value).toLocaleString('ru-RU')
+  return `${Number(value).toLocaleString('ru-RU', { maximumFractionDigits: 2 })} ₸`
 }
 
 /** "2026-09-05T10:00:00" → "05.09, 10:00" */

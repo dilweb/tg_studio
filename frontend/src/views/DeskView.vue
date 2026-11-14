@@ -3,6 +3,7 @@ import { computed, onMounted, ref } from 'vue'
 
 import { api } from '../api/client'
 import { authStore } from '../store/auth'
+import { formatDateTime as fmt, formatMoney as fmtMoney } from '../utils/format'
 
 // Раздел «Админ» (05): текущие брони студии и операционные исключения.
 // Ручных отметок посещения нет: присутствие мастер подтверждает кнопкой в напоминании Telegram.
@@ -29,16 +30,6 @@ const STATUS_LABELS = {
 const EXCEPTION_LABELS = {
   payment_expired: 'Истёк hold оплаты',
   out_of_coverage_unconfirmed: 'Вне покрытия, не подтверждена',
-}
-
-function fmt(iso) {
-  return new Date(iso).toLocaleString('ru-RU', {
-    day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit',
-  })
-}
-
-function fmtMoney(v) {
-  return `${Number(v).toLocaleString('ru-RU', { maximumFractionDigits: 2 })} ₸`
 }
 
 async function load() {

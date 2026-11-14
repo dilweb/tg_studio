@@ -23,9 +23,9 @@ def run_expire_booking_holds() -> int:
     from tg_studio.modules.coworking.service import expire_booking_holds
 
     async def _run() -> int:
-        from tg_studio.db.session import async_session_factory
+        from tg_studio.db.session import task_session
 
-        async with async_session_factory() as db_session:
+        async with task_session() as db_session:
             # транзакция на каждую бронь — сервис коммитит сам
             return await expire_booking_holds(db_session)
 

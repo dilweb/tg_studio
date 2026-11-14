@@ -170,11 +170,21 @@ class Settings(BaseSettings):
     @property
     def trusted_hosts(self) -> list[str]:
         """Host-заголовки, которые принимает API (Host-header poisoning).
-        Пустой список = без ограничений (локальная разработка)."""
+        Пустой список = без ограничений (локальная разработка).
+
+        Starlette TrustedHostMiddleware сравнивает с host БЕЗ порта
+        (parse_host_header режет :port) — поэтому hostname, а не netloc:
+        с netloc=http://localhost:8000 API отвергал вообще все запросы.
+        miniapp_url тоже в списке: браузер мини-аппа приходит через nginx
+        с Host именно этого домена."""
         if not self.require_https:
             return []
-        hosts = {urlsplit(u).netloc for u in (self.public_url, self.api_public_url) if u}
-        hosts = {h for h in hosts if h}
+        hosts = set()
+        for url in (self.public_url, self.miniapp_url, self.api_public_url):
+            if url:
+                host = urlsplit(url).hostname
+                if host:
+                    hosts.add(host.lower())
         return sorted(hosts)
 
     @property

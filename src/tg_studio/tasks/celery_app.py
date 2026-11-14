@@ -11,6 +11,7 @@ celery_app = Celery(
         "tg_studio.tasks.email_verification",
         "tg_studio.tasks.booking_holds",
         "tg_studio.tasks.booking_reminders",
+        "tg_studio.tasks.payment_sync",
     ],
 )
 
@@ -29,6 +30,12 @@ celery_app.conf.update(
         # Напоминания мастерам: «оплатите до …» и «скоро бронь» с кнопкой «Подтвердить»
         "send-booking-reminders": {
             "task": "send_booking_reminders",
+            "schedule": crontab(minute="*/5"),
+        },
+        # Страховка вебхуков ApiPay: вебхук не дошёл или пришёл раньше, чем
+        # сохранился external_invoice_id → опрос ApiPay по pending-счетам
+        "sync-pending-payments": {
+            "task": "sync_pending_payments",
             "schedule": crontab(minute="*/5"),
         },
     },

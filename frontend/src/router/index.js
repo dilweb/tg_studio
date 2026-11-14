@@ -1,6 +1,5 @@
 import { createRouter, createWebHistory } from 'vue-router'
 
-import PlaceholderSection from '../components/PlaceholderSection.vue'
 import { firstSectionPath } from '../nav'
 import { authStore } from '../store/auth'
 import AdminsView from '../views/AdminsView.vue'

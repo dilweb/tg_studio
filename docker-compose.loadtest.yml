@@ -10,6 +10,10 @@
 #   ROUNDS=20 LOAD_STAGES=10,20,40,80 docker compose ... run --rm loadtest
 
 x-loadtest-env: &loadtest-env
+  # стенд локальный и весь трафик по http между контейнерами: гасим require_https,
+  # иначе MINIAPP_URL=https://...ngrok... из .env включает TrustedHost, и запросы
+  # с Host: api:8000 от loadtest отваливаются с 400 "Invalid host header"
+  REQUIRE_HTTPS: "false"
   APIPAY_BASE_URL: http://apipay-mock:9100
   APIPAY_API_KEY: loadtest-apipay-key
   APIPAY_WEBHOOK_SECRET: loadtest-apipay-webhook-secret
@@ -76,7 +80,7 @@ services:
       REPORT_DIR: /reports
       ROUNDS: ${ROUNDS:-10}
       BURST: ${BURST:-10}
-      SEATS: ${SEATS:-20}
+      SEATS: ${SEATS:-30}
       LOAD_STAGES: ${LOAD_STAGES:-5,10,20,40}
       LOAD_STAGE_SECONDS: ${LOAD_STAGE_SECONDS:-45}
       SEED: ${SEED:-1}

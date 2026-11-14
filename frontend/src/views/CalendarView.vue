@@ -3,6 +3,8 @@ import { computed, onMounted, reactive, ref } from 'vue'
 
 import { api } from '../api/client'
 import { authStore } from '../store/auth'
+import { openLink } from '../telegram'
+import { formatDateTime as fmt, formatMoney as fmtMoney } from '../utils/format'
 
 const isOwner = computed(() => authStore.me?.role === 'owner')
 // Админ (05) действует за студию: создаёт брони за мастера, отмечает визиты/начало/неявку
@@ -61,12 +63,6 @@ const weekRange = computed(() => {
 function toIsoLocal(d) {
   const p = (n) => String(n).padStart(2, '0')
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}:00`
-}
-
-function fmt(iso) {
-  return new Date(iso).toLocaleString('ru-RU', {
-    day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit',
-  })
 }
 
 function fmtDay(iso) {
@@ -136,10 +132,6 @@ function openCreate(seatId = null) {
   error.value = ''
   showForm.value = true
   loadMasters()
-}
-
-function fmtMoney(v) {
-  return `${Number(v).toLocaleString('ru-RU', { maximumFractionDigits: 2 })} ₸`
 }
 
 async function runQuote() {
@@ -237,7 +229,8 @@ async function payBooking(b, method) {
   try {
     const res = await api.post(`/api/bookings/${b.id}/pay`, { method })
     if (method === 'card' && res.payment_url) {
-      window.open(res.payment_url, '_blank')
+      // window.open в мобильном WebView блокируется как popup — только openLink
+      openLink(res.payment_url)
       notice.value = 'Счёт открыт в Kaspi — после оплаты бронь подтвердится автоматически'
     } else {
       notice.value = 'Бронь оплачена и подтверждена'
@@ -594,4 +587,15 @@ onMounted(load)
   margin-top: 6px;
   font-size: 15px;
 }
+/* Мобильные: одна колонка — datetime-local в ~170px обрезается */
+@media (max-width: 767px) {
+  .form-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .field.span-2 {
+    grid-column: auto;
+  }
+}
+
 </style>

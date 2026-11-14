@@ -142,4 +142,15 @@ onMounted(load)
 .badge-ok {
   background: rgba(46, 204, 113, 0.15);
 }
+/* Мобильные: одна колонка — datetime-local в ~170px обрезается */
+@media (max-width: 767px) {
+  .form-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .field.span-2 {
+    grid-column: auto;
+  }
+}
+
 </style>

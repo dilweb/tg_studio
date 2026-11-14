@@ -281,4 +281,15 @@ onMounted(async () => {
 .field.span-2 {
   grid-column: span 2;
 }
+/* Мобильные: одна колонка — datetime-local в ~170px обрезается */
+@media (max-width: 767px) {
+  .form-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .field.span-2 {
+    grid-column: auto;
+  }
+}
+
 </style>

@@ -96,15 +96,17 @@ services:
     depends_on:
       - redis
 
+  # Фронт запечён в образ (frontend/Dockerfile: node build → nginx + dist).
+  # НЕ монтируем ./frontend/dist с хоста: он собирался только вручную и
+  # молча устаревал. Обновление фронта = docker compose build nginx.
   nginx:
-    image: nginx:alpine
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
     restart: unless-stopped
     ports:
       - "80:80"
       - "443:443"
-    volumes:
-      - ./docker/nginx.conf:/etc/nginx/conf.d/default.conf:ro
-      - ./frontend/dist:/usr/share/nginx/html:ro
     depends_on:
       - api
 

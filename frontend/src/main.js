@@ -3,6 +3,7 @@ import { createApp } from 'vue'
 import App from './App.vue'
 import router from './router'
 import { showFatalError } from './errors'
+import { watchTelegramTheme } from './telegram'
 import './styles/main.css'
 
 // Любая непойманная ошибка — текстом на экране, а не чёрным фоном.
@@ -28,6 +29,9 @@ if (tg) {
   tg.ready()
   tg.expand()
 }
+
+// Тема Telegram → CSS-переменные (+ подписка на смену темы клиентом)
+watchTelegramTheme()
 
 const app = createApp(App)
 // Ошибки рендера/lifecycle Vue по умолчанию глотаются — показываем и их

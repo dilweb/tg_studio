@@ -240,6 +240,11 @@ class Api:
                 body = r.json()
             except ValueError:
                 body = r.text
+            # Set-Cookie (JWT доступа) не копим: клиент общий на всех акторов, и кука
+            # владельца утекла бы в запросы мастеров — get_current_user проверяет куку
+            # раньше initData, и все «мастерские» вызовы уходили бы от владельца.
+            # Авторизация в скрипте всегда в заголовках (Bearer / initData).
+            self.http.cookies.clear()
         except httpx.HTTPError as exc:
             status, body, error = None, None, f"{type(exc).__name__}: {exc}"
         t_recv = time.time()
@@ -949,13 +954,20 @@ async def c5_gateway_faults(ctx: Ctx) -> None:
         bk = await ctx.book(m, seat0, ctx.slot(), cat=cat, sc=sc)
         if bk.status != 201:
             return
+        # Сервис обязан сам донажать рано пришедший вебхук (ретрай через 1/3/10 с)
+        # или вылечить beat-синком за ≤5 мин; даём 15 с и опрашиваем, прежде чем
+        # считать это находкой «деньги в банке, сервис не узнает».
+        deadline = time.time() + 15
         state = await ctx.booking(m, bk.body["id"], cat=cat, sc=sc)
+        while state["status"] == S_PENDING and time.time() < deadline:
+            await asyncio.sleep(2)
+            state = await ctx.booking(m, bk.body["id"], cat=cat, sc=sc)
         payment = state.get("payment") or bk.body.get("payment") or {}
         if state["status"] == S_CONFIRMED:
             return
-        ctx.rec.finding(cat, sc, "Kaspi сообщил об оплате раньше, чем сервис сохранил id счёта: вебхук "
-                                 "отброшен как «неизвестный счёт», бронь не подтверждена — деньги в банке, "
-                                 "сервис узнает о них только по ручному sync", booking=bk.body["id"],
+        ctx.rec.finding(cat, sc, "вебхук об оплате пришёл раньше создания счёта и не был "
+                                 "применён ни ретраем (1/3/10 с), ни beat-синком за 15 с — "
+                                 "бронь не подтверждена, деньги в банке", booking=bk.body["id"],
                         payment=payment.get("id"))
         if payment.get("id"):
             await ctx.sync(m, payment["id"], cat=cat, sc=sc)

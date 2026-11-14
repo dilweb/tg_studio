@@ -13,9 +13,9 @@ def run_send_booking_reminders() -> dict[str, int]:
     from tg_studio.modules.coworking.reminders import send_due_reminders
 
     async def _run() -> dict[str, int]:
-        from tg_studio.db.session import async_session_factory
+        from tg_studio.db.session import task_session
 
-        async with async_session_factory() as db_session:
+        async with task_session() as db_session:
             return await send_due_reminders(db_session)
 
     return asyncio.run(_run())

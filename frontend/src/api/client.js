@@ -20,8 +20,6 @@ function authHeaders() {
   return {}
 }
 
-export { authHeaders }
-
 /**
  * Запрос к API. Бросает Error с полями status/detail при не-2xx.
  */

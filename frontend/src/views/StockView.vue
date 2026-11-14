@@ -3,6 +3,8 @@ import { computed, onMounted, reactive, ref } from 'vue'
 
 import { api } from '../api/client'
 import { authStore } from '../store/auth'
+// свой fmtMoney: цены закупки бывают null → «—», поэтому не из utils/format
+import { formatDateTime as fmtTime } from '../utils/format'
 
 // «Склад» коворкинга (06): товары, закупка, обеспечение площадки, ревизия, журнал.
 const isMaster = computed(() => authStore.me?.role === 'master')
@@ -149,12 +151,6 @@ async function showHistory(p) {
   }
 }
 
-function fmtTime(iso) {
-  return new Date(iso).toLocaleString('ru-RU', {
-    day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit',
-  })
-}
-
 onMounted(load)
 </script>
 
@@ -289,4 +285,15 @@ onMounted(load)
 .field.span-2 { grid-column: span 2; }
 .row-low { background: rgba(231, 76, 60, 0.06); }
 .badge-low { background: rgba(231, 76, 60, 0.2); margin-left: 6px; }
+/* Мобильные: одна колонка — datetime-local в ~170px обрезается */
+@media (max-width: 767px) {
+  .form-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .field.span-2 {
+    grid-column: auto;
+  }
+}
+
 </style>

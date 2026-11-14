@@ -315,4 +315,15 @@ onMounted(load)
 .form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
 .receipt { display: flex; flex-direction: column; gap: 8px; }
 .small { font-size: 0.85em; }
+/* Мобильные: одна колонка — datetime-local в ~170px обрезается */
+@media (max-width: 767px) {
+  .form-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .field.span-2 {
+    grid-column: auto;
+  }
+}
+
 </style>

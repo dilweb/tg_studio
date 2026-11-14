@@ -108,8 +108,8 @@ onBeforeUnmount(() => clearInterval(timer))
 </template>
 
 <style scoped>
-.period-tabs { display: flex; gap: 6px; }
-.period-tabs .btn.active { background: var(--primary, #2563eb); color: #fff; }
+.period-tabs { display: flex; gap: 6px; flex-wrap: wrap; }
+.period-tabs .btn.active { background: var(--accent); color: #fff; }
 .section-head p { margin: 4px 0 0; font-size: 12px; }
 .stats-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; margin-bottom: 16px; }
 .stat-card { display: flex; flex-direction: column; gap: 8px; }
@@ -126,11 +126,12 @@ a { color: var(--accent); font-size: 13px; text-decoration: none; }
 .booking-row small { color: var(--muted); }
 .booking-row time { min-width: 44px; font-weight: 700; }
 .booking-row > span:last-child { font-size: 12px; }
-.badge.live { color: #258d60; background: #e3f6ed; }
+.badge.live { color: #4ade80; background: rgba(34, 197, 94, 0.12); }
 .simple-row, .alert-row { display: flex; justify-content: space-between; gap: 10px; padding: 10px 0; border-bottom: 1px solid var(--border); }
 .simple-row small, .alert-row small { color: var(--muted); }
 .alert-row { flex-direction: column; gap: 4px; }
 @media (max-width: 1000px) { .stats-grid { grid-template-columns: repeat(2, 1fr); } }
 @media (max-width: 700px) { .dashboard-grid { grid-template-columns: 1fr; } .seat-row { grid-template-columns: 10px 1fr 1fr; } .seat-row small { grid-column: 2 / -1; } }
 @media (max-width: 500px) { .stats-grid { grid-template-columns: 1fr; } }
+@media (max-width: 767px) { .section-head { flex-wrap: wrap; } }
 </style>

@@ -3,6 +3,7 @@ import { computed, onMounted, reactive, ref } from 'vue'
 
 import { api } from '../api/client'
 import { authStore } from '../store/auth'
+import { formatMoney as fmtMoney } from '../utils/format'
 
 const isOwner = computed(() => authStore.me?.role === 'owner')
 
@@ -94,10 +95,6 @@ const quoteResult = ref(null)
 const quoting = ref(false)
 
 const seatName = (id) => (id == null ? 'Все места' : seats.value.find((s) => s.id === id)?.name ?? `#${id}`)
-
-function fmtMoney(v) {
-  return `${Number(v).toLocaleString('ru-RU', { maximumFractionDigits: 2 })} ₸`
-}
 
 function fmtTime(t) {
   return String(t).slice(0, 5)
@@ -928,4 +925,15 @@ onMounted(() => {
   font-size: 16px;
   margin-top: 8px;
 }
+/* Мобильные: одна колонка — datetime-local в ~170px обрезается */
+@media (max-width: 767px) {
+  .form-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .field.span-2 {
+    grid-column: auto;
+  }
+}
+
 </style>

@@ -23,10 +23,33 @@
   box-sizing: border-box;
 }
 
+/* Заголовки: раньше только reset — h2/h3 рендерились UA-дефолтом
+   и «плавали» между разделами */
+h1,
+h2,
+h3 {
+  font-weight: 600;
+  line-height: 1.25;
+}
+
+h3 {
+  font-size: 15px;
+}
+
 html,
 body,
 #app {
   height: 100%;
+}
+
+/* В Telegram WebView 100vh выше видимой области (нижняя панель Telegram):
+dvh держит высоту по фактическому вьюпорту */
+@supports (height: 100dvh) {
+  html,
+  body,
+  #app {
+    height: 100dvh;
+  }
 }
 
 body {
@@ -317,45 +340,10 @@ a {
   border: 1px solid rgba(245, 158, 11, 0.35);
 }
 
-.badge-red {
-  background: rgba(239, 68, 68, 0.1);
-  color: #fca5a5;
-  border: 1px solid rgba(239, 68, 68, 0.35);
-}
-
-.badge-blue {
-  background: rgba(59, 130, 246, 0.12);
-  color: #60a5fa;
-  border: 1px solid rgba(59, 130, 246, 0.35);
-}
-
-.badge-accent {
-  background: rgba(108, 99, 255, 0.12);
-  color: #b0aaff;
-  border: 1px solid rgba(108, 99, 255, 0.4);
-}
-
 .badge-muted {
   background: var(--surface2);
   color: var(--muted);
   border: 1px solid var(--border);
-}
-
-/* --- Чипы (услуги мастера) --- */
-
-.chips {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-}
-
-.chip {
-  font-size: 12px;
-  background: var(--surface2);
-  border: 1px solid var(--border);
-  border-radius: 999px;
-  padding: 3px 10px;
-  color: var(--text);
 }
 
 /* --- Формы в несколько колонок --- */
@@ -400,4 +388,67 @@ a {
 
 .link-box .link-text {
   flex: 1;
+}
+
+/* --- Кнопочные группы в таблицах/карточках ---
+Используются в 9+ views, но раньше не были определены: кнопки липли
+друг к другу без gap и переносились хаотично */
+
+.row-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.actions-col {
+  white-space: nowrap;
+}
+
+/* --- Мобильные устройства: Telegram WebView ~390px --- */
+
+@media (max-width: 767px) {
+  /* iOS-зум: авто-зум при фокусе на инпутах <16px — экран «прыгает» */
+  .field input,
+  .field select,
+  .field textarea,
+  .toolbar input,
+  .toolbar select {
+    font-size: 16px;
+    padding: 10px 12px;
+  }
+
+  /* Тач-таргеты: минимум 44px (HIG); btn-sm — компромисс 40px в плотных таблицах */
+  .btn {
+    min-height: 44px;
+  }
+
+  .btn-sm {
+    min-height: 40px;
+    padding: 8px 14px;
+    font-size: 14px;
+  }
+
+  .checkbox-row {
+    font-size: 14px;
+    gap: 10px;
+  }
+
+  .checkbox-row input {
+    width: 20px;
+    height: 20px;
+  }
+
+  .toolbar {
+    gap: 8px;
+  }
+
+  /* datetime-local в узкой колонке обрезается — даём инпутам гибкую ширину
+  с минимумом, чтобы переносились на новую строку, а не обрезались.
+  Чекбоксы исключены: иначе растягиваются на 140px+ */
+  .toolbar input:not([type='checkbox']),
+  .toolbar select {
+    flex: 1 1 auto;
+    min-width: 140px;
+  }
 }

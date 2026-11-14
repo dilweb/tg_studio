@@ -3,6 +3,7 @@ import { computed, onMounted, reactive, ref } from 'vue'
 
 import { api } from '../api/client'
 import { authStore } from '../store/auth'
+import { formatDateTime as fmt, formatMoney as fmtMoney } from '../utils/format'
 
 // «Апсейлы» (05): админ — свои продажи + свои выплаты; владелец — все апсейлы,
 // сводка по админам, начисление доначислений и отметка выплаты.
@@ -30,21 +31,6 @@ const upsellForm = reactive({ amount: '', master_id: '', buyer_name: '', buyer_p
 // форма доначисления (владелец)
 const showPayout = ref(false)
 const payoutForm = reactive({ admin_id: '', mode: 'amount', amount: '', percent: '', from: '', to: '', reason: '' })
-
-function fmt(iso) {
-  return new Date(iso).toLocaleString('ru-RU', {
-    day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit',
-  })
-}
-
-function fmtMoney(v) {
-  return `${Number(v).toLocaleString('ru-RU', { maximumFractionDigits: 2 })} ₸`
-}
-
-function toIsoLocal(d) {
-  const p = (n) => String(n).padStart(2, '0')
-  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}:00`
-}
 
 async function load() {
   loading.value = true
@@ -387,4 +373,15 @@ onMounted(load)
 .badge-ok {
   background: rgba(46, 204, 113, 0.15);
 }
+/* Мобильные: одна колонка — datetime-local в ~170px обрезается */
+@media (max-width: 767px) {
+  .form-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .field.span-2 {
+    grid-column: auto;
+  }
+}
+
 </style>

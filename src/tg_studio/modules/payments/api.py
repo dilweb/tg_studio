@@ -7,6 +7,7 @@
 страховка, если вебхук не дошёл.
 """
 
+import asyncio
 import hashlib
 import hmac
 import json
@@ -16,6 +17,7 @@ from decimal import Decimal
 
 from fastapi import APIRouter, HTTPException, Query, Request
 from sqlalchemy import func, select
+from sqlalchemy.exc import MultipleResultsFound
 
 from tg_studio.api.admin_deps import AdminBusinessAndSelfDep, MasterBusinessAndSelfDep
 from tg_studio.api.auth import CurrentUserDep
@@ -151,52 +153,51 @@ def _parse_iso(value: str | None) -> datetime | None:
         return None
 
 
-@router.post("/webhook/apipay", include_in_schema=False)
-async def apipay_webhook(request: Request, session: SessionDep):
-    """Уведомление ApiPay об оплате (event=invoice.status_changed).
+# Ретрай вебхуков для «неизвестных» счетов (см. apipay_webhook): гонка «вебхук
+# пришёл раньше, чем create-ответ сохранил external_invoice_id». Живут в памяти
+# процесса, ссылки держим, чтобы GC не убил таску; если процесс умер до ретрая —
+# долг страховка: beat-задача sync_pending_payments (каждые 5 минут).
+_WEBHOOK_RETRY_DELAYS = (1.0, 3.0, 10.0)
+_webhook_retry_tasks: set = set()
 
-    Подпись X-Webhook-Signature: sha256=<hex> — HMAC-SHA256 от СЫРОГО тела
-    (до парсинга), сравнение за константное время. Отвечаем 2xx быстро:
-    не дергаем внешних API. Неизвестный счёт не 404 (не провоцируем ретраи) —
-    лог и ok; повтор по (invoice.id, status) безвреден: применение статуса
-    идемпотентно, «paid» липкий (cancelled→paid разрешён, paid→cancelled нет).
+
+async def _apply_invoice_event(session, payload: dict) -> tuple[str, dict]:
+    """Применить событие invoice.status_changed. Коммитит сам при изменениях.
+
+    Возвращает (токен исхода, тело ответа). Повтор по (invoice.id, status)
+    безвреден: применение идемпотентно, «paid» липкий (cancelled→paid
+    разрешён, paid→cancelled нет).
     """
-    secret = settings.apipay_webhook_secret
-    if not secret:
-        raise HTTPException(status_code=503, detail="Вебхук не настроен")
-    raw = await request.body()
-    expected = "sha256=" + hmac.new(secret.encode(), raw, hashlib.sha256).hexdigest()
-    provided = request.headers.get("X-Webhook-Signature", "")
-    if not hmac.compare_digest(expected, provided):
-        raise HTTPException(status_code=403, detail="Подпись не совпала")
-
-    try:
-        payload = json.loads(raw)
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Невалидный JSON") from None
-
     event = payload.get("event")
     if event != "invoice.status_changed":
         logger.info("Ignoring apipay webhook event %r", event)
-        return {"ok": True, "ignored": event}
+        return "ignored", {"ok": True, "ignored": event}
 
     invoice = payload.get("invoice") or {}
     external_id = str(invoice.get("id") or "")
     provider_status = invoice.get("status") or ""
     if not external_id or not provider_status:
-        raise HTTPException(status_code=400, detail="Нет invoice.id или status")
+        return "bad_payload", {"ok": False, "detail": "Нет invoice.id или status"}
 
-    payment_id = (
-        await session.execute(
-            select(Payment.id).where(
-                Payment.external_invoice_id == external_id,
-                Payment.provider == PaymentProvider.apipay.value,
+    try:
+        payment_id = (
+            await session.execute(
+                select(Payment.id).where(
+                    Payment.external_invoice_id == external_id,
+                    Payment.provider == PaymentProvider.apipay.value,
+                )
             )
-        )
-    ).scalar_one_or_none()
+        ).scalar_one_or_none()
+    except MultipleResultsFound:
+        # external_invoice_id должен быть уникален; дубли = порча данных.
+        # Применять статус в такой ситуации нельзя (чужому платежу), а 500
+        # превращает вебхук в ретрай-шторм — лог и ok, разбор вручную.
+        logger.error("Apipay webhook: multiple payments with invoice %s — data issue, not applying", external_id)
+        return "ambiguous", {"ok": True, "ambiguous": external_id}
     if payment_id is None:
         logger.warning("Apipay webhook for unknown invoice %s", external_id)
-        return {"ok": True, "unknown": external_id}
+        return "unknown", {"ok": True, "unknown": external_id}
+
     from tg_studio.modules.coworking import money
 
     # FOR UPDATE в общем порядке «бронь → счёт»: вебхук, sync, отмена брони и
@@ -222,7 +223,7 @@ async def apipay_webhook(request: Request, session: SessionDep):
             invoice_amount,
             payment.amount,
         )
-        return {"ok": True, "ignored": "amount_mismatch", "payment_id": payment.id}
+        return "amount_mismatch", {"ok": True, "ignored": "amount_mismatch", "payment_id": payment.id}
 
     paid_at = _parse_iso(invoice.get("paid_at"))
     if paid_at is None and provider_status == "paid":
@@ -235,7 +236,68 @@ async def apipay_webhook(request: Request, session: SessionDep):
     if changed:
         await session.commit()
         await money.run_provider_ops(session)
-    return {"ok": True, "changed": changed}
+    return "processed", {"ok": True, "changed": changed}
+
+
+def _schedule_webhook_retry(payload: dict, external_id: str) -> None:
+    """Донажать «неизвестный» вебхук позже: в момент создания счёта вебхук
+    мог прийти раньше, чем сервис сохранил external_invoice_id (мок ApiPay
+    отвечает об оплате, не дожидаясь ответа на create). Через секунду счёт
+    уже сохранён — применяем событие как ни в чём не бывало."""
+
+    async def _retry() -> None:
+        from tg_studio.db.session import async_session_factory
+
+        for delay in _WEBHOOK_RETRY_DELAYS:
+            await asyncio.sleep(delay)
+            try:
+                async with async_session_factory() as session:
+                    token, _ = await _apply_invoice_event(session, payload)
+            except Exception:
+                logger.exception("Apipay webhook retry for invoice %s failed", external_id)
+                continue
+            if token != "unknown":
+                logger.info("Apipay webhook retry for invoice %s resolved: %s", external_id, token)
+                return
+        logger.warning(
+            "Apipay webhook retries exhausted for unknown invoice %s — beat sync_pending_payments heals",
+            external_id,
+        )
+
+    task = asyncio.get_running_loop().create_task(_retry())
+    _webhook_retry_tasks.add(task)
+    task.add_done_callback(_webhook_retry_tasks.discard)
+
+
+@router.post("/webhook/apipay", include_in_schema=False)
+async def apipay_webhook(request: Request, session: SessionDep):
+    """Уведомление ApiPay об оплате (event=invoice.status_changed).
+
+    Подпись X-Webhook-Signature: sha256=<hex> — HMAC-SHA256 от СЫРОГО тела
+    (до парсинга), сравнение за константное время. Отвечаем 2xx быстро:
+    не дергаем внешних API. Неизвестный счёт не 404 (не провоцируем ретраи) —
+    лог, ok и отложенный ретрай (счёт мог ещё не сохраниться).
+    """
+    secret = settings.apipay_webhook_secret
+    if not secret:
+        raise HTTPException(status_code=503, detail="Вебхук не настроен")
+    raw = await request.body()
+    expected = "sha256=" + hmac.new(secret.encode(), raw, hashlib.sha256).hexdigest()
+    provided = request.headers.get("X-Webhook-Signature", "")
+    if not hmac.compare_digest(expected, provided):
+        raise HTTPException(status_code=403, detail="Подпись не совпала")
+
+    try:
+        payload = json.loads(raw)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Невалидный JSON") from None
+
+    token, response = await _apply_invoice_event(session, payload)
+    if token == "bad_payload":
+        raise HTTPException(status_code=400, detail=response["detail"])
+    if token == "unknown":
+        _schedule_webhook_retry(payload, str((payload.get("invoice") or {}).get("id") or ""))
+    return response
 
 
 # ---------------------------------------------------------------------------

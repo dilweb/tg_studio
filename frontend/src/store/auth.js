@@ -22,11 +22,6 @@ function loadMe() {
 // Простой reactive-store без pinia: сессия живёт в localStorage — F5 не выкидывает.
 export const authStore = reactive({
   me: loadMe(),
-  loading: false,
-
-  get user() {
-    return this.me
-  },
 
   setMe(me) {
     this.me = me
@@ -44,14 +39,9 @@ export const authStore = reactive({
  * Возвращает me или бросает ошибку из apiFetch.
  */
 export async function login() {
-  authStore.loading = true
-  try {
-    const me = await fetchMe()
-    authStore.setMe(me)
-    return me
-  } finally {
-    authStore.loading = false
-  }
+  const me = await fetchMe()
+  authStore.setMe(me)
+  return me
 }
 
 /**

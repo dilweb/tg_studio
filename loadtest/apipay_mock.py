@@ -24,6 +24,7 @@ import hmac
 import json
 import logging
 import os
+import uuid
 from datetime import UTC, datetime
 from urllib.parse import urlsplit
 
@@ -44,6 +45,11 @@ _lock = asyncio.Lock()
 _invoices: dict[str, dict] = {}  # id → счёт
 _by_idempotency: dict[str, str] = {}  # ключ идемпотентности → id
 _behaviour: dict[str, dict] = {}  # телефон → поведение
+# Id счетов уникальны между рестартами мока: БД сервиса персистентна, а мок
+# держит счета в памяти. Плотный счётчик (1,2,3…) после рестарта наезжал на
+# номера прошлого инстанса — вебхук находил две строки платежа и не применялся.
+# Случайный префикс инстанса + счётчик внутри = коллизий нет.
+_INSTANCE = uuid.uuid4().hex[:8]
 _seq = 0
 
 
@@ -116,7 +122,7 @@ async def create_invoice(request: Request):
             inv = _invoices[existing]
         else:
             _seq += 1
-            inv_id = f"mock-{_seq}"
+            inv_id = f"mock-{_INSTANCE}-{_seq}"
             inv = {
                 "id": inv_id,
                 "external_order_id": data.get("external_order_id"),

@@ -49,7 +49,9 @@ async function download() {
     link.href = url
     link.download = `revenue_${range.from.slice(0, 10)}_${range.to.slice(0, 10)}.xlsx`
     link.click()
-    URL.revokeObjectURL(url)
+    // revoke сразу после click() убивает загрузку в WebView, который начинает
+    // качать асинхронно — даём фору
+    setTimeout(() => URL.revokeObjectURL(url), 30_000)
   } catch (err) { error.value = err.detail ?? err.message } finally { exporting.value = false }
 }
 onMounted(load)

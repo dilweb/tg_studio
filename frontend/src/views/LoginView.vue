@@ -14,8 +14,8 @@ const busy = ref(false)
 // удалена: бэкенд больше не принимает X-Debug-User-Id)
 const telegramMode = ref(hasInitData())
 
-onMounted(async () => {
-  if (!telegramMode.value) return
+async function tryLogin() {
+  error.value = ''
   busy.value = true
   try {
     await login()
@@ -28,6 +28,10 @@ onMounted(async () => {
   } finally {
     busy.value = false
   }
+}
+
+onMounted(() => {
+  if (telegramMode.value) tryLogin()
 })
 </script>
 
@@ -44,6 +48,9 @@ onMounted(async () => {
 
       <div v-if="telegramMode" class="telegram-state">
         <template v-if="busy">Входим через Telegram…</template>
+        <button v-else-if="error" class="btn btn-primary" type="button" @click="tryLogin">
+          Повторить вход
+        </button>
       </div>
       <p v-else class="telegram-state">Вход только через Telegram — откройте приложение в боте студии.</p>
     </div>
